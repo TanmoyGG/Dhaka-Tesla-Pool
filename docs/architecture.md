@@ -65,30 +65,41 @@ flowchart LR
 
 ## 3. Component Responsibilities
 
+> Phase-1 note: the sections below describe the **target** architecture. As of
+> Phase 1 the implemented surface is: minimal Next.js App Router app, Fastify
+> app with `GET /health`, env config, Pino logging, JSON error envelope, and a
+> Drizzle client + migration tooling. Everything not yet implemented is marked.
+
 ### 3.1 Frontend (`apps/web`)
-- Renders passenger and driver flows (sign-in, request ride, status tracking,
-  driver accept/arrive/start/complete).
+- Phase 1: minimal App Router scaffold (`app/layout.tsx`, `app/page.tsx`
+  status page), dev server, production build, tsc type check, ESLint.
+- Later phases: passenger and driver flows (sign-in, request ride, status
+  tracking, driver accept/arrive/start/complete).
 - **Runs client-side form validation with Zod (via React Hook Form) but never
-  relies on it** — it is UX-only.
-- Uses TanStack Query for data fetching, caching, and loading/error/empty states.
+  relies on it** — it is UX-only (Phase 9).
+- Uses TanStack Query for data fetching, caching, and loading/error/empty states
+  (Phase 9).
 - Leaflet renders predefined Dhaka zones and route polylines on OpenStreetMap —
-  **visualization only**, no routing.
+  **visualization only**, no routing (Phase 9).
 - Communicates with the API only through the API client layer using
   `NEXT_PUBLIC_API_URL`.
 
 ### 3.2 Backend (`apps/api`)
 - Fastify REST API. Owns **all validation, authorization, and business logic**.
-- Implements the ride state machine and rejects invalid transitions.
-- Enforces pool capacity with transactional seat allocation
-  (`SELECT … FOR UPDATE` + constraint checks).
-- Computes individual passenger fares (integer paisa/poysha).
-- Application-owned cookie sessions, Argon2id password hashing, role-based
-  authorization (passenger/driver).
-- Structured logging with Pino; consistent error envelope.
+- Phase 1: application bootstrap (`src/app.ts`), server entry (`src/server.ts`),
+  environment configuration (`src/config.ts`), Pino logging, JSON error
+  envelope, `GET /health` liveness endpoint, and a Drizzle foundation
+  (`src/db/`): client, `db:check`, `db:migrate`, empty schema.
+- Later phases: ride state machine, capacity enforcement via transactional seat
+  allocation (`SELECT … FOR UPDATE` + constraint checks), individual passenger
+  fares (integer paisa/poysha), application-owned cookie sessions with Argon2id
+  and role-based authorization (passenger/driver).
 
 ### 3.3 Database (PostgreSQL)
-- Single source of truth for users, vehicles, ride requests, pools, pool
-  membership, ride status history, fares, sessions, zones.
+- Phase 1: PostgreSQL 16 in Docker Compose (healthcheck + persistent named
+  volume); Drizzle migration runner verified against it.
+- Later phases: single source of truth for users, vehicles, ride requests,
+  pools, pool membership, ride status history, fares, sessions, zones.
 - Enforces invariants with schema constraints (see `docs/database.md`):
   capacity bounds, explicit membership, state-transition validity, per-passenger
   fare preservation.
@@ -134,3 +145,19 @@ Vercel (Next.js frontend)  →  Render (Fastify API)  →  Neon (PostgreSQL)
 
 - Free tier only. If free backend hosting is unavailable, fall back to a
   reproducible Docker deployment (documented at that time).
+
+## 8. Implementation Status (Phase 1)
+
+Implemented and verified:
+
+- Monorepo npm workspaces: `@dhaka-tesla-pool/api`, `@dhaka-tesla-pool/web`.
+- Docker Compose full stack (web + api + db) with healthchecks, built and
+  started via `docker compose up --build` on Windows.
+- API `GET /health` (local and in-container), Pino logging, JSON errors.
+- Drizzle/postgres.js client, `db:check` (`SELECT 1` -> ok), `db:migrate`
+  (creates `drizzle.__drizzle_migrations`), `drizzle-kit generate` (empty schema).
+- CI workflow: install → lint → typecheck → test → build.
+
+Not yet implemented (later phases): auth, validation on routes, ride state
+machine, pooling, fares, concurrency, map visualization, database schema,
+deployment to Vercel/Render/Neon.

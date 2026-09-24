@@ -27,6 +27,10 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 
 ## Phase 1 — Project infrastructure
 
+> **Status: COMPLETE.** Scaffolds, full compose stack (web+api+db, healthchecks),
+> Drizzle tooling, CI, and docs all verified on Windows (Docker Desktop 29.8.0,
+> Docker Compose v5.5.1, Node 24.14.1).
+
 - **Objective:** Reproducible scaffolding for both apps and CI.
 - **Deliverables:** `apps/api` + `apps/web` real scaffolds (package.json, tsconfig,
   entrypoints with a health route/screen), `docker-compose.yml` full app stack,
@@ -36,6 +40,11 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 - **Risks:** workspace hoisting quirks; Docker availability on machines.
 - **Tests:** `GET /health` returns ok; `docker compose up` reaches the
   "everything up" state.
+- **Verified commands:** `npm install`, `npm run typecheck`, `npm run lint`,
+  `npm test`, `npm run build`, `npm run db:check`, `npm run db:migrate`,
+  `docker compose up --build` (db/api/web all healthy).
+- **Known follow-ups:** `drizzle-kit generate` currently yields 0 tables
+  (schema arrives in Phase 2); `db:migrate` runs against an empty journal.
 
 ## Phase 2 — Database
 
