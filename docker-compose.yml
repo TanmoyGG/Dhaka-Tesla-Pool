@@ -1,15 +1,16 @@
-# Dhaka Tesla Pool — Docker Compose foundation.
+# Dhaka Tesla Pool — Docker Compose (local development stack).
 #
-# Currently runnable:
-#   docker compose up            -> starts PostgreSQL only (with healthcheck + persistent volume)
-#   docker compose down -v       -> removes containers AND the DB volume (destructive)
+# Reproduction (PRD-required reproducible run):
+#   docker compose up --build     -> builds and starts web + api + db
+#   docker compose down           -> stops containers (keeps the db volume)
+#   docker compose down -v        -> stops and REMOVES the db volume (destructive)
 #
-# Pending (Phase 1+, when apps/web and apps/api are scaffolded):
-#   The `api` and `web` services are placeholders. They are assigned the "app"
-#   profile so they are excluded from a plain `docker compose up` until a real
-#   Dockerfile exists in each app. Do not "complete" them with fake containers.
-#   Once the apps build, remove the `profiles` lines and `docker compose up`
-#   will run app containers + DB as the PRD requires.
+# Recommended local development workflow (hot reload on Windows):
+#   Run the API and web locally with npm (see README "Local development"),
+#   and only PostgreSQL in Docker:
+#     docker compose up db
+#   Full `docker compose up` is for reproducing/running the whole stack; it runs
+#   production builds of web/api, so file changes require a rebuild.
 #
 # Required read: docs/development-plan.md (Phase 1, Phase 11).
 
@@ -18,6 +19,7 @@ name: dhaka-tesla-pool
 services:
   db:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
@@ -34,33 +36,47 @@ services:
       start_period: 5s
 
   api:
-    # PLACEHOLDER — pending apps/api scaffolding (Phase 1, Phase 11).
-    profiles: ["app"]
     build:
-      context: ./apps/api
+      context: .
+      dockerfile: apps/api/Dockerfile
     environment:
+      NODE_ENV: production
+      API_HOST: 0.0.0.0
+      API_PORT: 3001
       DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-dhaka_tesla_pool}
-      SESSION_SECRET: ${SESSION_SECRET}
-      API_PORT: ${API_PORT:-3001}
+      SESSION_SECRET: ${SESSION_SECRET:-dev-only-session-secret-change-me}
       WEB_URL: ${WEB_URL:-http://localhost:3000}
     ports:
-      - "${API_PORT:-3001}:3001"
+      - "3001:3001"
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   web:
-    # PLACEHOLDER — pending apps/web scaffolding (Phase 1, Phase 11).
-    profiles: ["app"]
     build:
-      context: ./apps/web
+      context: .
+      dockerfile: apps/web/Dockerfile
     environment:
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
+      NODE_ENV: production
       WEB_URL: ${WEB_URL:-http://localhost:3000}
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
     ports:
       - "3000:3000"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
 volumes:
   pgdata:
