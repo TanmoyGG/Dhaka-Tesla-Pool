@@ -179,3 +179,61 @@ above; documents *which version lines* were chosen and why.
   → esbuild < 0.24.3 (dev-time only, `npm audit` moderate). `npm audit fix
   --force` would downgrade drizzle-kit (breaking), so the risk is accepted and
   re-evaluated as tooling moves on.
+
+## ADR-012: Phase 2 — database schema decisions
+
+Decisions made while designing the implemented schema (`apps/api/src/db/schema.ts`
+and `apps/api/drizzle/0000_*.sql`). Recorded so every table/constraint is
+explainable; `docs/database.md` mirrors this in prose.
+
+- **UUID PKs via `gen_random_uuid()`** over serial/BIGSERIAL: opaque
+  identifiers never leak row counts or insertion order; PG >= 13 has the
+  function built-in (no pgcrypto extension). Drizzle's `defaultRandom()` maps
+  to it.
+- **PostgreSQL-native enums** over `text` + app-level validation: invalid
+  states are rejected by the DB itself and the lifecycle reads plainly in SQL.
+  Cost: adding a value later requires `ALTER TYPE ... ADD VALUE` (migration),
+  which is fine at this scale.
+- **"MATCHED/ACCEPTED" → single enum value `MATCHED`**: the PRD's slash is one
+  state; one name keeps history unambiguous (see `docs/database.md` §5.2).
+- **`pool_members` is the membership source of truth; `ride_requests.pool_id`
+  is a denormalized convenience** for passenger status views. Preserves history
+  (a request can tell its whole pooling story from membership rows) while
+  keeping the common reads cheap. App keeps them consistent.
+- **No cached `available_seats` counter** — occupancy is always
+  `SUM(seats) WHERE status = 'ACTIVE'` over `pool_members`. Avoids
+  cache-counter divergence entirely; the concurrency phase adds `FOR UPDATE`
+  + the derived sum inside one transaction (`docs/database.md` §7).
+- **`pools.capacity_snapshot`** denormalizes vehicle capacity at creation so
+  history survives vehicle reconfiguration. `docs/requirements.md` §21.I.
+- **Two partial unique indexes** — `pools_single_active_per_vehicle` (one
+  active pool per Tesla) and `pool_members_one_active_per_request` (one active
+  membership per request): these are capacity/concurrency invariants the DB can
+  express cheaply and must own.
+- **Delete policy: RESTRICT for the ride domain, CASCADE for user
+  infrastructure** (`sessions`, `vehicles`). Ride history is not deletable
+  (`docs/requirements.md` §21.I); sessions/vehicles are disposable with their
+  user. See `docs/database.md` §5.7.
+- **Enforced fare formula as a CHECK** (`final = base + distance − discount`,
+  all non-negative): stored history can never contradict the documented model.
+  The *computation* is still a later phase — this only guards stored values.
+- **One final fare per request (`UNIQUE ride_request_id`)**: matches the
+  PRD's "each passenger gets an individual fare" snapshot model.
+- **Lowercase-only email CHECK + unique index** instead of `citext`/functional
+  index: no extension, one obvious convention, app normalizes on write.
+- **Timestamp semantics as CHECKs** (e.g. `COMPLETED ⇔ completed_at IS NOT
+  NULL`, pool can't complete without starting): impossible values rejected at
+  the boundary, not silently normalized.
+- **No generic audit table**: `ride_status_history` + fare snapshots already
+  make every ride explainable; a second journal has no consumer (`docs/database.md` §5.9).
+- **Deterministic seed IDs + idempotent `ON CONFLICT DO NOTHING`**: stable
+  UUIDs for Jashim/Bullet/zones keep tests and demos reproducible; reseeding is
+  a no-op. Placeholder `password_hash` values until the auth phase.
+- **Migration files are generated, reviewed, committed unmodified.** No manual
+  SQL edits without a documented reason.
+
+**What is deliberately app-enforced (documented, not DB triggers):** driver-only
+vehicle ownership, pool driver = vehicle driver, occupancy vs capacity (multi-row
+transaction), and state-transition legality (state machine). Rationale:
+CHECK constraints can't reference other tables, and triggers would duplicate the
+service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.

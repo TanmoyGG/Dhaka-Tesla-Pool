@@ -10,6 +10,24 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      # Runs the database integration tests (apps/api test/database.test.ts)
+      # against a real PostgreSQL; they reset a dedicated *_test database.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dhaka_tesla_pool
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d dhaka_tesla_pool"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/dhaka_tesla_pool
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
