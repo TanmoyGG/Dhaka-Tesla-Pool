@@ -147,3 +147,35 @@
 - **Switch later if:** The build graph grows and we need a message-passing /
   caching tool (then Turborepo or move package manager), or apps really must
   diverge repositories.
+
+## ADR-011: Version pinning for the Phase 1 toolchain (additions)
+
+Decisions made while scaffolding the API/web workspaces. Supersedes none of the
+above; documents *which version lines* were chosen and why.
+
+- **TypeScript ^5.9** over TypeScript 7 (`tsgo`): TS 7 is the brand-new native
+  compiler; its ecosystem/tooling support is still settling. 5.9 is fully
+  supported by eslint plugins, tsx, drizzle-kit, and vitest. Upgrade TS 7 is a
+  tracked later-phase task.
+- **ESLint ^9 (flat config)** over ESLint 10: the 9.x maintenance line pairs
+  cleanly with `typescript-eslint` 8 and `eslint-config-next` 15. ESLint 10 is
+  new; upgrade later in one coordinated change.
+- **Next.js 15.5.x + React 19** over Next 16: 15.5 is the maintained 15 line
+  (dist-tag `backport`). Next 16's breaking changes (e.g., `next lint`
+  removal, ESLint-10 pairing) are deliberately deferred so app scaffolding
+  stays boring and explainable.
+- **Vitest ^4** over Vitest 5: 4.x is well documented and stable; upgrade is a
+  low-risk later change.
+- **postgres.js (`postgres` pkg) as the Drizzle driver** over `pg`: promise-
+  based, typed, lazy-connecting (API boots without DB), no separate @types
+  package. `pg` is the alternative if connection-pool tuning demands it.
+- **Node 24-alpine base images** to match the local dev runtime (Node 24);
+  engines are `>=20`. Container base image is revisited at deployment.
+- **PostCSS pin via root `overrides`** (`^8.5.28`): Next 15.5 declares a
+  vulnerable `postcss@8.4.31`; the override surfaces a patched 8.5.x without
+  moving to Next 16. API-compatible for Next's CSS pipeline (verified by
+  `next build`).
+- **Accepted risk:** `drizzle-kit` transitively pulls `@esbuild-kit/esm-loader`
+  → esbuild < 0.24.3 (dev-time only, `npm audit` moderate). `npm audit fix
+  --force` would downgrade drizzle-kit (breaking), so the risk is accepted and
+  re-evaluated as tooling moves on.

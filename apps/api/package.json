@@ -1,0 +1,35 @@
+{
+  "name": "@dhaka-tesla-pool/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Dhaka Tesla Pool API (Fastify)",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "db:check": "tsx src/db/check.ts"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.45.3",
+    "fastify": "^5.12.5",
+    "postgres": "^3.4.9"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "drizzle-kit": "^0.31.11",
+    "eslint": "^9.39.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.70.1",
+    "vitest": "^4.1.11"
+  }
+}

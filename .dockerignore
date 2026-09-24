@@ -1,0 +1,29 @@
+# Repository root .dockerignore — blocks the Docker build context (root) from
+# shipping local artifacts/secrets into images. Patterns used by both app
+# Dockerfiles (build context is the repository root).
+
+node_modules
+.git
+.github
+docs
+.vscode
+.idea
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local runtime/artifacts
+apps/*/dist
+apps/*/.next
+apps/*/coverage
+apps/*/test-results
+apps/*/playwright-report
+apps/*/node_modules
+
+# Local Postgres data
+pgdata
+
+*.log
+npm-debug.log*

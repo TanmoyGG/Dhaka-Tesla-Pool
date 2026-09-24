@@ -1,6 +1,5 @@
-# CI skeleton — real jobs (lint / typecheck / test) are wired in Phase 1
-# once apps/api and apps/web are scaffolded. Until then this only verifies the
-# committed toolchain, so the workflow is honest about what it checks.
+# CI — verify the monorepo on push/PR.
+# Runs install + lint + typecheck + test + build for both workspaces.
 name: CI
 
 on:
@@ -9,20 +8,21 @@ on:
   pull_request:
 
 jobs:
-  toolchain:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-      - name: Check Node/npm availability
-        run: |
-          node --version
-          npm --version
-      # TODO(Phase 1): replace the step above with
-      #   npm ci
-      #   npm run lint
-      #   npm run typecheck
-      #   npm test
-      # (add `cache: npm` to setup-node once package-lock.json exists)
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
