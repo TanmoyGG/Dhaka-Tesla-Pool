@@ -1,0 +1,28 @@
+# CI skeleton — real jobs (lint / typecheck / test) are wired in Phase 1
+# once apps/api and apps/web are scaffolded. Until then this only verifies the
+# committed toolchain, so the workflow is honest about what it checks.
+name: CI
+
+on:
+  push:
+    branches: [master, pre-release]
+  pull_request:
+
+jobs:
+  toolchain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Check Node/npm availability
+        run: |
+          node --version
+          npm --version
+      # TODO(Phase 1): replace the step above with
+      #   npm ci
+      #   npm run lint
+      #   npm run typecheck
+      #   npm test
+      # (add `cache: npm` to setup-node once package-lock.json exists)
