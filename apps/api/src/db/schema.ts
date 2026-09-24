@@ -1,9 +1,434 @@
-// Drizzle schema definitions.
+// Drizzle schema for Dhaka Tesla Pool — Phase 2 (database design).
 //
-// Intentionally EMPTY in Phase 1. This file exists so that `drizzle-kit
-// generate` (./migration tooling) has a valid schema path.
+// Conventions:
+// - All primary keys are UUIDs (default gen_random_uuid(), PG >= 13 built-in).
+// - All timestamps are timezone-aware (`timestamptz`) UTC.
+// - All money is integer paisa/poysha (never floating point).
+// - Domain enums are PostgreSQL-native enum types for integrity + readability.
+// - Ride-domain tables use ON DELETE RESTRICT: ride data is history and must
+//   stay explainable (docs/requirements.md §21.I). Sessions and vehicles are
+//   infrastructure owned by a user and use ON DELETE CASCADE.
+// - One naming for the PRD's lifecycle: "MATCHED/ACCEPTED" is stored as the
+//   single enum value MATCHED (see docs/database.md §5.2).
 //
-// The application schema (users, vehicles/Teslas, ride requests, pools, pool
-// members, fares, ride status history, sessions, zones) is designed and added
-// in the database phase — see docs/database.md.
-export {};
+// What cannot be expressed as a simple SQL CHECK (documented, enforced by the
+// application in later phases):
+// - "only a USER with role=DRIVER owns a vehicle" — requires a cross-table
+//   lookup; CHECK constraints cannot reference other tables.
+// - "pools.driver_id equals vehicles.driver_id" — cross-table equality.
+// - "pool occupancy never exceeds capacity_snapshot" — aggregate row overlap;
+//   enforced transactionally (SELECT ... FOR UPDATE) in the pooling phase.
+// - "valid ride-state transitions" — depends on the previous row; enforced by
+//   the state machine (Phase 8) and recorded in ride_status_history.
+
+import { sql } from "drizzle-orm";
+import {
+  boolean,
+  char,
+  check,
+  doublePrecision,
+  index,
+  integer,
+  pgEnum,
+  pgTable,
+  timestamp,
+  unique,
+  uniqueIndex,
+  uuid,
+  text,
+} from "drizzle-orm/pg-core";
+
+export const userRoleEnum = pgEnum("user_role", ["PASSENGER", "DRIVER"]);
+
+export const rideStatusEnum = pgEnum("ride_status", [
+  "REQUESTED",
+  "MATCHED",
+  "DRIVER_ARRIVED",
+  "STARTED",
+  "COMPLETED",
+  "CANCELLED",
+]);
+
+export const poolMemberStatusEnum = pgEnum("pool_member_status", [
+  "ACTIVE",
+  "LEFT",
+]);
+
+// ---------------------------------------------------------------------------
+// users
+// ---------------------------------------------------------------------------
+export const users = pgTable(
+  "users",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    name: text("name").notNull(),
+    email: text("email").notNull(),
+    // Argon2id hash; hashing is implemented in the auth phase (Phase 3).
+    passwordHash: text("password_hash").notNull(),
+    role: userRoleEnum("role").notNull().default("PASSENGER"),
+    active: boolean("active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    // name cannot be empty (btrim covers whitespace-only names).
+    check("users_name_not_empty", sql`length(btrim(${table.name})) > 0`),
+    // Emails are stored lowercase so the unique index is case-insensitive by
+    // construction; the app normalizes on write.
+    check("users_email_lowercase", sql`${table.email} = lower(${table.email})`),
+    unique("users_email_unique").on(table.email),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// sessions — application-owned cookie sessions (Phase 3 auth).
+// ---------------------------------------------------------------------------
+export const sessions = pgTable(
+  "sessions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    // Hash of the opaque session token (SHA-256 hex) — never store the raw token.
+    tokenHash: text("token_hash").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique("sessions_token_hash_unique").on(table.tokenHash),
+    // look up a session by user (logout-all, user session list).
+    index("sessions_user_id_idx").on(table.userId),
+    // purge/query expired sessions efficiently.
+    index("sessions_expires_at_idx").on(table.expiresAt),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// vehicles — the driver-owned, fixed-capacity Tesla.
+// ---------------------------------------------------------------------------
+export const vehicles = pgTable(
+  "vehicles",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    driverId: uuid("driver_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    // Vehicle name/identifier, e.g. "Bullet".
+    name: text("name").notNull(),
+    // MVP Teslas are fixed-capacity (3 seats). Only "positive" is enforced here;
+    // per the PRD "capacity must be positive" (a later phase reads it to build
+    // the capacity_snapshot on pool creation).
+    capacity: integer("capacity").notNull(),
+    isOnline: boolean("is_online").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    check("vehicles_name_not_empty", sql`length(btrim(${table.name})) > 0`),
+    check("vehicles_capacity_positive", sql`${table.capacity} > 0`),
+    // driver's vehicle list (FK + "vehicles I own").
+    index("vehicles_driver_id_idx").on(table.driverId),
+    // matching: only consider Teslas that are online.
+    index("vehicles_is_online_idx")
+      .on(table.isOnline)
+      .where(sql`${table.isOnline}`),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// zones — predefined Dhaka geography (plain lat/long points, no routing).
+// ---------------------------------------------------------------------------
+export const zones = pgTable(
+  "zones",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    name: text("name").notNull(),
+    latitude: doublePrecision("latitude").notNull(),
+    longitude: doublePrecision("longitude").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    check("zones_name_not_empty", sql`length(btrim(${table.name})) > 0`),
+    check("zones_latitude_range", sql`${table.latitude} between -90 and 90`),
+    check(
+      "zones_longitude_range",
+      sql`${table.longitude} between -180 and 180`,
+    ),
+    unique("zones_name_unique").on(table.name),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// pools — one Tesla serving a set of matched ride requests.
+// ---------------------------------------------------------------------------
+export const pools = pgTable(
+  "pools",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    vehicleId: uuid("vehicle_id")
+      .notNull()
+      .references(() => vehicles.id, { onDelete: "restrict" }),
+    driverId: uuid("driver_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    // Carries the full PRD lifecycle REQUESTED → ... → COMPLETED/+CANCELLED.
+    status: rideStatusEnum("status").notNull().default("REQUESTED"),
+    // Snapshot of the vehicle capacity when the pool was created, so history
+    // stays understandable even if the vehicle is reconfigured later.
+    capacitySnapshot: integer("capacity_snapshot").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (table) => [
+    check(
+      "pools_capacity_snapshot_positive",
+      sql`${table.capacitySnapshot} > 0`,
+    ),
+    // started_at is only ever set once the trip actually started.
+    check(
+      "pools_started_timestamp",
+      sql`${table.startedAt} is null or ${table.status} in ('STARTED', 'COMPLETED')`,
+    ),
+    // COMPLETED must always carry its completion timestamp.
+    check(
+      "pools_complete_timestamp",
+      sql`(${table.status} = 'COMPLETED') = (${table.completedAt} is not null)`,
+    ),
+    // A pool cannot complete without having started.
+    check(
+      "pools_complete_requires_started",
+      sql`${table.status} <> 'COMPLETED' or ${table.startedAt} is not null`,
+    ),
+    // One active (non-terminal) pool per vehicle: exactly the integrity rule
+    // that makes "occupied seats" a per-pool aggregate meaningful. See
+    // docs/database.md §5.5 (concurrency) for how this composes with locking.
+    uniqueIndex("pools_single_active_per_vehicle")
+      .on(table.vehicleId)
+      .where(sql`${table.status} not in ('COMPLETED', 'CANCELLED')`),
+    index("pools_vehicle_idx").on(table.vehicleId),
+    index("pools_driver_idx").on(table.driverId),
+    index("pools_status_idx").on(table.status),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// ride_requests — a passenger's request: pickup, destination, seats.
+// ---------------------------------------------------------------------------
+export const rideRequests = pgTable(
+  "ride_requests",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    passengerId: uuid("passenger_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    pickupZoneId: uuid("pickup_zone_id")
+      .notNull()
+      .references(() => zones.id, { onDelete: "restrict" }),
+    destinationZoneId: uuid("destination_zone_id")
+      .notNull()
+      .references(() => zones.id, { onDelete: "restrict" }),
+    requestedSeats: integer("requested_seats").notNull(),
+    status: rideStatusEnum("status").notNull().default("REQUESTED"),
+    // Null while the request is unassigned; set when it joins a pool.
+    poolId: uuid("pool_id").references(() => pools.id, {
+      onDelete: "restrict",
+    }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (table) => [
+    check(
+      "ride_requests_seats_positive",
+      sql`${table.requestedSeats} > 0`,
+    ),
+    // A pickup that equals its destination is a meaningless request.
+    check(
+      "ride_requests_pickup_ne_destination",
+      sql`${table.pickupZoneId} <> ${table.destinationZoneId}`,
+    ),
+    // Terminal timestamps must not conflict: CANCELLED carries cancelled_at,
+    // COMPLETED carries completed_at; a request cannot be both.
+    check(
+      "ride_requests_cancel_timestamp",
+      sql`(${table.status} = 'CANCELLED') = (${table.cancelledAt} is not null)`,
+    ),
+    check(
+      "ride_requests_complete_timestamp",
+      sql`(${table.status} = 'COMPLETED') = (${table.completedAt} is not null)`,
+    ),
+    check(
+      "ride_requests_single_terminal",
+      sql`${table.cancelledAt} is null or ${table.completedAt} is null`,
+    ),
+    // A request assigned to a pool has moved past REQUESTED (membership is
+    // only ever created at matching time, docs/requirements.md §21.C).
+    check(
+      "ride_requests_pool_requires_matched",
+      sql`${table.poolId} is null or ${table.status} <> 'REQUESTED'`,
+    ),
+    // passenger history/recent-first and ownership scope.
+    index("ride_requests_passenger_history_idx").on(
+      table.passengerId,
+      table.createdAt,
+    ),
+    // matching: scan for requests awaiting a driver.
+    index("ride_requests_status_idx").on(table.status),
+    // reverse lookup: which requests ride in this pool (FK support too).
+    index("ride_requests_pool_idx").on(table.poolId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// pool_members — the explicit join between a passenger's ride request and a
+// pool. Occupied seats are derived ONLY from ACTIVE memberships here; there is
+// no cached "available seats" column (docs/database.md §5.5).
+// ---------------------------------------------------------------------------
+export const poolMembers = pgTable(
+  "pool_members",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    poolId: uuid("pool_id")
+      .notNull()
+      .references(() => pools.id, { onDelete: "restrict" }),
+    rideRequestId: uuid("ride_request_id")
+      .notNull()
+      .references(() => rideRequests.id, { onDelete: "restrict" }),
+    passengerId: uuid("passenger_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    seats: integer("seats").notNull(),
+    status: poolMemberStatusEnum("status").notNull().default("ACTIVE"),
+    joinedAt: timestamp("joined_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    leftAt: timestamp("left_at", { withTimezone: true }),
+  },
+  (table) => [
+    check("pool_members_seats_positive", sql`${table.seats} > 0`),
+    // A member that left must carry its departure timestamp.
+    check(
+      "pool_members_left_timestamp",
+      sql`(${table.status} = 'LEFT') = (${table.leftAt} is not null)`,
+    ),
+    // Invariant: a ride request cannot be added to the same pool twice.
+    unique("pool_members_pool_request_unique").on(
+      table.poolId,
+      table.rideRequestId,
+    ),
+    // Invariant: at most ONE active pool membership per ride request.
+    uniqueIndex("pool_members_one_active_per_request")
+      .on(table.rideRequestId)
+      .where(sql`${table.status} = 'ACTIVE'`),
+    // occupancy aggregates: WHERE pool_id = ? AND status = 'ACTIVE'.
+    index("pool_members_pool_status_idx").on(table.poolId, table.status),
+    // FK support + reverse lookup from a request to its membership.
+    index("pool_members_ride_request_idx").on(table.rideRequestId),
+    // passenger's ride history joins.
+    index("pool_members_passenger_idx").on(table.passengerId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// fares — individual per-request fare snapshot (integer paisa/poysha).
+// The formula passengerFare = baseFare + distanceCharge − poolDiscount is
+// enforced here so stored history can never contradict the documented model;
+// the service that computes these values arrives in later phases.
+// ---------------------------------------------------------------------------
+export const fares = pgTable(
+  "fares",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    rideRequestId: uuid("ride_request_id")
+      .notNull()
+      .references(() => rideRequests.id, { onDelete: "restrict" }),
+    baseFarePaisa: integer("base_fare_paisa").notNull(),
+    distanceChargePaisa: integer("distance_charge_paisa").notNull(),
+    poolDiscountPaisa: integer("pool_discount_paisa").notNull(),
+    finalFarePaisa: integer("final_fare_paisa").notNull(),
+    currency: char("currency", { length: 3 }).notNull().default("BDT"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    // No negative money anywhere in the fare row.
+    check(
+      "fares_monetary_non_negative",
+      sql`${table.baseFarePaisa} >= 0 and ${table.distanceChargePaisa} >= 0 and ${table.poolDiscountPaisa} >= 0 and ${table.finalFarePaisa} >= 0`,
+    ),
+    // finalFare must always equal the documented formula.
+    check(
+      "fares_final_equals_formula",
+      sql`${table.finalFarePaisa} = ${table.baseFarePaisa} + ${table.distanceChargePaisa} - ${table.poolDiscountPaisa}`,
+    ),
+    check(
+      "fares_currency_format",
+      sql`length(${table.currency}) = 3 and ${table.currency} = upper(${table.currency})`,
+    ),
+    // One final fare per ride request.
+    unique("fares_one_per_ride_request").on(table.rideRequestId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// ride_status_history — append-only journal of a request's lifecycle so the
+// history of any ride can be audited. Populated by the state machine later;
+// the DB alone cannot derive transitions, so write-then-move is an application
+// control (documented, not duplicated in a trigger).
+// ---------------------------------------------------------------------------
+export const rideStatusHistory = pgTable(
+  "ride_status_history",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    rideRequestId: uuid("ride_request_id")
+      .notNull()
+      .references(() => rideRequests.id, { onDelete: "restrict" }),
+    // Null on the first recorded transition.
+    fromStatus: rideStatusEnum("from_status"),
+    status: rideStatusEnum("status").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    // A transition to the same state is meaningless noise.
+    check(
+      "ride_status_history_no_same_transition",
+      sql`${table.fromStatus} is null or ${table.fromStatus} <> ${table.status}`,
+    ),
+    // chronological audit trail (composite index also backs the FK).
+    index("ride_status_history_transitions_idx").on(
+      table.rideRequestId,
+      table.createdAt,
+    ),
+  ],
+);
+
+// Re-exported convenience type of every table's row type (used by tests).
+export type User = typeof users.$inferSelect;
+export type RideRequest = typeof rideRequests.$inferSelect;
