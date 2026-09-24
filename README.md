@@ -4,11 +4,13 @@
 
 ## Status
 
-**Phase 1 — Project infrastructure: complete.** The API and web applications
-are scaffolded and runnable (installed, linted, type-checked, tested, built).
-PostgreSQL runs via Docker Compose, and the full stack starts with
-`docker compose up --build`. **No business features are implemented yet** —
-auth, rides, pools, and fares arrive in later phases per
+**Phase 2 — Database schema, migrations, and seed: complete.** The full
+relational schema is implemented and migrated (users, sessions, vehicles,
+zones, ride requests, pools, memberships, fares, ride-status history), seeded
+with the PRD cast (Jashim + Bullet, Nusrat, Rafiq, Shirin and 8 Dhaka zones),
+and covered by 21 schema-integration tests. See
+[docs/database.md](docs/database.md). **No business features are implemented
+yet** — auth, rides, pools, and fares arrive in later phases per
 [docs/development-plan.md](docs/development-plan.md).
 
 ## Project Description
@@ -57,7 +59,8 @@ Proposed choices, recorded as ADRs in [docs/decisions.md](docs/decisions.md).
 - **Backend:** Node.js, Fastify 5, TypeScript, REST, Pino. Zod validation is
   added with the auth/rides phases.
 - **Database:** PostgreSQL 16 (Docker), Drizzle ORM (`postgres.js` driver),
-  integer paisa/poysha money.
+  integer paisa/poysha money. Schema, enums, constraints and indexes are
+  implemented; see [docs/database.md](docs/database.md).
 - **Auth:** application-owned cookie sessions, Argon2id, role-based
   (passenger/driver) — later phase.
 - **Testing:** Vitest (API unit/integration), Playwright E2E (later phase).
@@ -77,11 +80,15 @@ Proposed choices, recorded as ADRs in [docs/decisions.md](docs/decisions.md).
 apps/
   web/        Next.js 15 App Router frontend (Phase 1 scaffold)
   api/        Fastify 5 + Drizzle REST API (Phase 1 scaffold)
+              src/db/schema.ts        schema (Phase 2)
+              src/db/seed.ts          idempotent cast seed (Phase 2)
+              drizzle/                generated migrations (Phase 2)
+              test/database.test.ts   schema-integration tests (Phase 2)
 docs/
   reference/PRD.pdf   primary source of truth (unmodified)
   requirements.md     implementation-oriented PRD interpretation
   architecture.md     architecture (updated as implemented)
-  database.md         proposed entities/invariants
+  database.md         schema + invariants + concurrency strategy
   decisions.md        ADR-style technology decisions
   development-plan.md phased implementation plan
 .github/workflows/    CI workflow
@@ -121,7 +128,19 @@ docker compose up db
 npm run db:check -w @dhaka-tesla-pool/api
 ```
 
-### 4. Start the API
+### 4. Schema, migrations, seed
+
+```bash
+npm run db:migrate -w @dhaka-tesla-pool/api   # apply pending migrations
+npm run db:seed   -w @dhaka-tesla-pool/api    # idempotent cast seed
+npm run db:generate -w @dhaka-tesla-pool/api  # regenerate after schema edits
+```
+
+`db:seed` is safe to run any number of times (inserts with
+`ON CONFLICT DO NOTHING`; never deletes). The seeded `password_hash` values are
+documented development-only placeholders until the auth phase.
+
+### 5. Start the API
 
 ```bash
 npm run dev -w @dhaka-tesla-pool/api
@@ -134,7 +153,7 @@ curl http://localhost:3001/health
 # {"status":"ok","service":"dhaka-tesla-pool-api",...}
 ```
 
-### 5. Start the web app
+### 6. Start the web app
 
 ```bash
 npm run dev -w @dhaka-tesla-pool/web
@@ -142,7 +161,7 @@ npm run dev -w @dhaka-tesla-pool/web
 
 Starts on `http://localhost:3000`.
 
-### 6. Run checks / tests
+### 7. Run checks / tests
 
 From the repository root (runs every workspace):
 
@@ -152,6 +171,10 @@ npm run lint
 npm test
 npm run build
 ```
+
+The API test suite runs its database-integration tests against a disposable
+`dhaka_tesla_pool_test` database when PostgreSQL is reachable (`DATABASE_URL`
+or the `.env` default), and skips cleanly when it is not.
 
 ## Docker (full stack, reproducible)
 

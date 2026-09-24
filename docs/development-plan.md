@@ -48,18 +48,30 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 
 ## Phase 2 — Database
 
+> **Status: COMPLETE.** Full schema (9 tables, 3 enums), reviewed + committed
+> migration, deterministic idempotent seed (cast: Jashim/Bullet/Nusrat/Rafiq/
+> Shirin + 8 zones), and 21 schema-integration tests — all verified against the
+> Docker PostgreSQL container on Windows. See `docs/database.md`.
+
 - **Objective:** Schema, migrations, and seed data for the entities in
   `docs/database.md`.
 - **Deliverables:** Drizzle schema for User, Session, Vehicle/Tesla, Zone,
-  Ride Request, Pool, Pool Member, Fare, Ride Status History (audit optional);
-  initial migration; seed script using **Jashim/Bullet/Nusrat/Rafiq/Shirin**;
-  DB-level constraints for capacity and state.
+  Ride Request, Pool, Pool Member, Fare, Ride Status History; initial migration;
+  seed script using **Jashim/Bullet/Nusrat/Rafiq/Shirin**; DB-level constraints
+  for capacity and state.
 - **Dependencies:** Phase 1; DB protocol questions (docs/database.md §5)
-  resolved.
+  resolved (recorded in ADR-012).
 - **Risks:** locking semantics for seat counts; constraints too loose to
   actually block overbooking.
 - **Tests:** migration applies cleanly; seed runnable both in compose and
   locally; capacity/state constraints reject bad rows.
+- **Verified commands:** `db:check`, `db:generate` (no schema drift),
+  `db:migrate`, `db:seed` (twice — idempotent), `npm test` (21/21, against a
+  disposable `_test` database), root `lint`/`typecheck`/`build`; `docker
+  compose up` full-stack + config.
+- **Concurrency note:** DB refuses a second active pool per vehicle already;
+  the seat-claim transaction (`SELECT … FOR UPDATE` + derived occupancy) is
+  implemented and tested in the pooling phase (`docs/database.md` §7).
 
 ## Phase 3 — Authentication
 
