@@ -1,12 +1,25 @@
-# apps/web — Next.js frontend (placeholder)
+# apps/web — Dhaka Tesla Pool frontend
 
-This directory is reserved for the **Dhaka Tesla Pool** web application
-(Next.js App Router, React, TypeScript, Tailwind CSS, shadcn/ui, TanStack Query,
-React Hook Form, Zod, Leaflet + OpenStreetMap).
+Next.js 15 (App Router) + React 19 + TypeScript (npm workspace
+`@dhaka-tesla-pool/web`).
 
-**Nothing has been scaffolded yet.** Implemented in **Phase 1 / Phase 9** of
-[docs/development-plan.md](../../docs/development-plan.md) on the
-`feature/...` branch workflow described in [AGENTS.md](../../AGENTS.md).
+## Current state (Phase 1)
 
-Do not start implementing frontend features before the backend API contracts
-exist (Phases 3–6).
+- Minimal App Router foundation: `app/layout.tsx`, `app/page.tsx` (a phase-1
+  status page — no business features), `app/globals.css`.
+- Development server, production build, type check, and lint all work.
+
+## Scripts
+
+```bash
+npm run dev           # next dev (http://localhost:3000)
+npm run build         # next build
+npm run start         # next start
+npm run typecheck     # tsc --noEmit
+npm run lint          # eslint (next/core-web-vitals)
+```
+
+Frontend tests (Vitest unit + Playwright E2E) arrive with the frontend
+implementation phase, as planned in docs/development-plan.md.
+
+See root [README.md](../../README.md) for full setup instructions.
