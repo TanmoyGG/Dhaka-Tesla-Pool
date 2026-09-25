@@ -297,3 +297,64 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
 - **Switch later if:** the product needs self-hosted identity, costs exceed
   budget, or we want full auth in-house — ADR-006's design remains the
   documented fallback.
+## ADR-014: First-request user provisioning (Phase 3.5)
+
+- **Status:** Implemented in `apps/api/src/auth/provision.ts`,
+  `user-resolver.ts` (`upsertLocalUser`), `install.ts`, and covered in
+  `test/auth.test.ts` + `test/database.test.ts`. Complements ADR-013.
+- **Decision:** When a **verified** Clerk identity has no local application
+  user (no `users.clerk_user_id` match), provision one atomically **on the
+  first authenticated request** instead of requiring a manual mapping step.
+  The Clerk profile is loaded **server-side** through the existing Clerk
+  backend client (`getClerkClient().users.getUser`), and the application
+  user is created from it:
+
+  ```
+  Clerk user ID     -> users.clerk_user_id   (identity key; never the username)
+  Clerk username    -> users.name            (display value only)
+  Clerk primary email -> users.email         (lowercased)
+  new users         -> role PASSENGER, active true
+  ```
+
+  `DRIVER`/`ADMIN` stay database-only assignments; provisioning can never
+  self-assign a privileged role.
+- **Why on first request (not webhooks):** there is no external signup
+  pipeline here for a webhook to wait on, no event bus to go stale, and no
+  way for the API to fall behind a user who signs up and immediately hits the
+  API. The user row materializes transactionally at the moment it is actually
+  needed. The MVP has one synchronous request path and a single PostgreSQL
+  writer; a webhook adds infrastructure without adding correctness.
+- **Why not "bind seed email on signup":** auto-binding a Clerk account to a
+  seeded character by *email* would let anyone self-assign a seeded identity
+  (and with a specially chosen email, a DRIVER role). Provisioning creates
+  NEW rows only; mapping a demo character to a real Clerk ID remains an
+  explicit `users` UPDATE.
+- **Concurrency & idempotency (required):** the write relies on the
+  `users_clerk_user_id` unique index with
+  `INSERT ... ON CONFLICT (clerk_user_id) DO NOTHING RETURNING`. Two
+  concurrent first requests for the same identity yield **exactly one** row;
+  the loser's empty `RETURNING` re-reads the winner. No explicit transaction
+  or `SELECT FOR UPDATE` is needed - the single INSERT is the one atomic
+  commit.
+- **Email uniqueness (`users_email_unique`):** if the new identity's email
+  belongs to another user, the INSERT hits a *different* unique constraint and
+  aborts with `AUTH_PROVISION_FAILED` (500). Provisioning never rebinds or
+  overwrites an existing row.
+- **Failure semantics:** any provisioning failure (Clerk profile load, missing
+  username/email, email conflict, lost race) surfaces as `AUTH_PROVISION_FAILED`
+  (500) with **no partial row**; the request fails closed. Reserved
+  `dev-only::seed::` placeholders are never provisioned (installation rejects
+  them before provisioning; `upsertLocalUser` also guards). `AUTH_USER_NOT_FOUND`
+  remains only as a defensive backstop for a provisionLocalUser that
+  explicitly returns null.
+- **Alternatives rejected:** Clerk/svix webhooks (event system + delivery
+  retries, no consumer need yet, adds latency/ops surface); email-binding of
+  seed rows (self-assignment/privilege escalation, above); provisioning via
+  the management API on signup from Next.js (client-visible profile handling,
+  split-brain between web and API). These remain documented fallbacks if
+  signup-time hooks are ever required at larger scale.
+- **Testability:** provisioning is the third injectable boundary
+  (`AuthDependencies.provisionLocalUser`, `identity.ts`), so the auth suite
+  tests behavior without Clerk or a network; the database suite injects the
+  disposable `_test` database through `createUserResolver` to test the real
+  upsert, race, email-conflict, and reserved-id paths against the schema.

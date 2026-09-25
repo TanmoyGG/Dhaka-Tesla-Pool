@@ -8,8 +8,10 @@
 
 import type { FastifyInstance, preHandlerHookHandler } from "fastify";
 import {
+  AUTH_PROVISION_FAILED,
   AuthConfigurationError,
   isReservedClerkUserId,
+  ProvisioningError,
   type AppUserRole,
   type AuthDependencies,
   type AuthUser,
@@ -126,19 +128,38 @@ export function installAuthContext(
         );
     }
 
-    const user = await deps.resolveLocalUser(clerkUserId);
+    let user = await deps.resolveLocalUser(clerkUserId);
     if (!user) {
-      // Valid Clerk identity, but no local application user. We do NOT create
-      // one (no silent user provisioning with an arbitrary role): the
-      // application explicitly registers users.
-      return reply
-        .code(403)
-        .send(
-          authError(
-            "AUTH_USER_NOT_FOUND",
-            "The authenticated Clerk identity has no application user record.",
-          ),
-        );
+      // Valid real Clerk identity with no local user yet: provision one from
+      // the verified Clerk profile (first-request provisioning, ADR-014).
+      // Provisioning is atomic — a failure must not leave a partial row.
+      try {
+        user = await deps.provisionLocalUser(clerkUserId);
+      } catch (error) {
+        if (error instanceof ProvisioningError) {
+          request.log.warn(
+            { code: AUTH_PROVISION_FAILED },
+            error.message,
+          );
+          return reply
+            .code(500)
+            .send(authError(AUTH_PROVISION_FAILED, error.message));
+        }
+        throw error;
+      }
+      if (!user) {
+        // Defensive backstop: a provisionLocalUser that deliberately returns
+        // null (real but explicitly not-provisionable identity) keeps the
+        // original contract — a valid identity with no application user.
+        return reply
+          .code(403)
+          .send(
+            authError(
+              "AUTH_USER_NOT_FOUND",
+              "The authenticated Clerk identity has no application user record.",
+            ),
+          );
+      }
     }
     if (!user.active) {
       return reply

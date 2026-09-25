@@ -17,6 +17,10 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { config } from "../src/config.js";
 import { isReservedClerkUserId, seedClerkUserId } from "../src/auth/identity.js";
+import {
+  createUserResolver,
+  type UpsertLocalUser,
+} from "../src/auth/user-resolver.js";
 import { SEED_IDS, SEED_ZONE_IDS, runSeed } from "../src/db/seed.js";
 import {
   fares,
@@ -220,6 +224,136 @@ describeDb("database schema (Phases 2 + 3)", () => {
         role: "PASSENGER",
       }),
     ).rejects.toMatchObject(rejectionCode("23505"));
+  });
+
+  describe("first-request provisioning (users.clerk_user_id upsert, ADR-014)", () => {
+    // The app-facing upsertLocalUser is a factory bound to the application
+    // database. Here we inject the disposable _test database instead, so
+    // nothing touches real development data. (db is assigned by the parent
+    // suite's beforeAll, so this resolver is built lazily.)
+    let upsertLocalUser: UpsertLocalUser;
+    beforeAll(() => {
+      upsertLocalUser = createUserResolver(db).upsertLocalUser;
+    });
+
+    it("provisions a PASSENGER/active user from a verified Clerk profile", async () => {
+      const clerkUserId = "user_2provisionTest000000000001";
+      const user = await upsertLocalUser(clerkUserId, {
+        name: "Provisioned User",
+        email: "provisioned@example.com",
+      });
+      expect(user).toMatchObject({
+        clerkUserId,
+        name: "Provisioned User",
+        email: "provisioned@example.com",
+        role: "PASSENGER",
+        active: true,
+      });
+
+      const [row] = await db
+        .select()
+        .from(users)
+        .where(eq(users.clerkUserId, clerkUserId));
+      expect(row?.role).toBe("PASSENGER");
+      expect(row?.active).toBe(true);
+      expect(row?.name).toBe("Provisioned User");
+    });
+
+    it("lowercases emails on provisioning (users.email CHECK constraint)", async () => {
+      const clerkUserId = "user_2provisionTest000000000002";
+      const user = await upsertLocalUser(clerkUserId, {
+        name: "Mixed Case",
+        email: "MixedCase@Example.com",
+      });
+      expect(user.email).toBe("mixedcase@example.com");
+    });
+
+    it("is idempotent: a repeated provisioning returns the same local user", async () => {
+      const clerkUserId = "user_2provisionTest000000000003";
+      const first = await upsertLocalUser(clerkUserId, {
+        name: "Repeat User",
+        email: "repeat@example.com",
+      });
+      const second = await upsertLocalUser(clerkUserId, {
+        name: "Repeat User",
+        email: "repeat@example.com",
+      });
+      expect(second.id).toBe(first.id);
+      expect(second.role).toBe("PASSENGER");
+
+      const rows = await db
+        .select()
+        .from(users)
+        .where(eq(users.clerkUserId, clerkUserId));
+      expect(rows).toHaveLength(1);
+    });
+
+    it("keeps exactly one user row when two requests race for the same identity", async () => {
+      // Two passengers (or two tabs / a retry loop) hitting the API at the same
+      // moment for a brand-new identity: the unique index + CONFLICT DO NOTHING
+      // must yield one row, both callers succeed, and both see the same user.
+      const clerkUserId = "user_2provisionTest000000000004";
+      const [a, b] = await Promise.all([
+        upsertLocalUser(clerkUserId, {
+          name: "Racer A",
+          email: "racer-a@example.com",
+        }),
+        upsertLocalUser(clerkUserId, {
+          name: "Racer B",
+          email: "racer-b@example.com",
+        }),
+      ]);
+      expect(a.id).toBe(b.id);
+      expect(a.role).toBe("PASSENGER");
+
+      const rows = await db
+        .select()
+        .from(users)
+        .where(eq(users.clerkUserId, clerkUserId));
+      expect(rows).toHaveLength(1);
+    });
+
+    it("aborts with AUTH_PROVISION_FAILED when the email is already taken (no rebind)", async () => {
+      // Nusrat@example.com already exists (seed). A DIFFERENT Clerk identity
+      // must never silently capture that email: provisioning fails cleanly and
+      // Nusrat's row is untouched.
+      const clerkUserId = "user_2provisionTest000000000005";
+      await expect(
+        upsertLocalUser(clerkUserId, {
+          name: "Email Squatter",
+          email: "nusrat@example.com",
+        }),
+      ).rejects.toMatchObject({ code: "AUTH_PROVISION_FAILED" });
+
+      const attempted = await db
+        .select()
+        .from(users)
+        .where(eq(users.clerkUserId, clerkUserId));
+      expect(attempted).toHaveLength(0);
+
+      const nusrat = await db
+        .select()
+        .from(users)
+        .where(eq(users.email, "nusrat@example.com"));
+      expect(nusrat).toHaveLength(1);
+      expect(nusrat[0]?.clerkUserId).toBe(seedClerkUserId("nusrat@example.com"));
+    });
+
+    it("never provisions reserved seed placeholders", async () => {
+      await expect(
+        upsertLocalUser(seedClerkUserId("shirin@example.com"), {
+          name: "Impostor",
+          email: "impostor@example.com",
+        }),
+      ).rejects.toMatchObject({ code: "AUTH_PROVISION_FAILED" });
+
+      const rows = await db
+        .select()
+        .from(users)
+        .where(eq(users.clerkUserId, seedClerkUserId("shirin@example.com")));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.name).toBe("Shirin Islam");
+    });
   });
 
   it("looks up a seeded user by its verified clerk_user_id", async () => {

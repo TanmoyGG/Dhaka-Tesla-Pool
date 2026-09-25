@@ -20,6 +20,10 @@
 // demo, create the person in Clerk and map their real Clerk user ID to the
 // local row (documented in README "Authentication").
 //
+// Brand-new Clerk identities need no mapping: the API provisions them as
+// PASSENGER users on their first authenticated request (ADR-014,
+// src/auth/provision.ts) — this seed never does.
+//
 // Database schema must exist first: run `npm run db:migrate` (once) before
 // `npm run db:seed`.
 

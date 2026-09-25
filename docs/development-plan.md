@@ -81,9 +81,11 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 > (`users.clerk_user_id` unique, `sessions` dropped, `password_hash` dropped,
 > `ADMIN` role value), `@clerk/nextjs` frontend (sign-in/sign-up/account/
 > middleware), `@clerk/backend` Fastify verification + local-user resolution +
-> role guards (`requireAuth`/`requireRole`) + `GET /api/me`, 19 auth tests,
-> full-stack compose validation — see `docs/architecture.md` §3.2/§3.4/§10 and
-> `docs/decisions.md` ADR-013.
+> role guards (`requireAuth`/`requireRole`) + `GET /api/me` + first-request user
+> provisioning (**ADR-014**, `provision.ts` `upsertLocalUser`), 23 auth tests +
+> 29 database tests (incl. provisioning concurrency), full-stack compose
+> validation — see `docs/architecture.md` §3.2/§3.4/§10 and
+> `docs/decisions.md` ADR-013/ADR-014.
 
 - **Objective:** Application users authenticate through Clerk; the API verifies
   every bearer token and resolves the local user + PostgreSQL role.

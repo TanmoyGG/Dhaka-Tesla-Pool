@@ -1,7 +1,9 @@
-// The Clerk verification boundary — the ONLY place the API talks to Clerk.
+// The Clerk boundaries — the ONLY places the API talks to Clerk: verifying a
+// session token (createClerkSessionVerifier) and loading a verified user's
+// profile for first-request provisioning (getClerkClient used by provision.ts).
 //
 // Everything else in the auth flow is application logic over the result of
-// this function. Swapped for a fake in tests, so the auth suite never makes a
+// these. Swapped for fakes in tests, so the auth suite never makes a
 // Clerk/network call.
 
 import { createClerkClient, type ClerkClient } from "@clerk/backend";
@@ -10,7 +12,10 @@ import { AuthConfigurationError, type SessionVerifier } from "./identity.js";
 
 let clerkClient: ClerkClient | null = null;
 
-function getClerkClient(): ClerkClient {
+// The shared Clerk backend client (server-side, secret-key-scoped). Never
+// exposed to any route handler: only the verification and provisioning
+// boundaries may touch it.
+export function getClerkClient(): ClerkClient {
   if (!config.clerkSecretKey) {
     throw new AuthConfigurationError(
       "Clerk authentication is not configured: set CLERK_SECRET_KEY in the API environment. " +
