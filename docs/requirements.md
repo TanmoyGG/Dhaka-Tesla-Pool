@@ -67,6 +67,10 @@ REQUESTED
 
 - The PRD invites improvement **if the improvement can be explained**.
 - Invalid state transitions must be rejected.
+- **Phase 4 notes** (ADR-015): creating a ride request writes the initial
+  journal entry `NULL → REQUESTED` into `ride_status_history`; a REQUESTED ride
+  holds no pool and no seats (`REQUESTED` is a seat-hold-free state, so Phase 4
+  needs no concurrency locking — the pooling phase adds it, requirements §14).
 
 ## 5. Geography
 
@@ -83,6 +87,14 @@ REQUESTED
 
       passengerFare = baseFare + distanceCharge − poolDiscount
 
+- **Implemented in Phase 4** (`apps/api/src/fare/`, ADR-015): the deterministic
+  estimate is computed for a new ride request and stored per seat in `fares`
+  integer paisa. Nusrat `Banani → Mohakhali` = **5932 paisa (BDT 59.32)**;
+  Rafiq `Banani → Gulshan 1` = **4140 paisa (BDT 41.40)** — both pinned in
+  `test/fare.test.ts` and `test/rides.test.ts`. Formula/rounding:
+  `roundHalfUp(haversine × 1.3 × 1200)`; `final = base + distance − discount`
+  derived, never independently rounded; pool discount stays 0 until the ride
+  is pooled (later phase), then the same fare row is updated in place.
 - The evaluator must be able to **verify the calculation by hand** using Nusrat's
   and Rafiq's trip.
 - Document **how money is stored** (integer paisa/poysha vs. decimal) and why.
@@ -284,7 +296,12 @@ the ambiguity is explained, and one reasonable MVP assumption is proposed.
 ### D. Exact fare parameters
 - PRD: `passengerFare = baseFare + distanceCharge − poolDiscount`; must be hand-verifiable.
 - Ambiguity: No values for baseFare, per-km charge, or poolDiscount.
-- MVP assumption: Paisa (int) based: `baseFare = 3000 paisa (30 BDT)`, `distanceCharge = 1200 paisa/km (12 BDT/km)`, and for a pooled ride `poolDiscount = 25% of (baseFare + distanceCharge)` rounded to nearest poysha/paisa (banker's rounding documented). Parameters configurable via env/constants. Full formula and worked example published in README and docs/database.md.
+- MVP assumption (**realized in Phase 4, ADR-015**): Paisa (int) based:
+  `baseFare = 3000 paisa (30 BDT)`, `distanceCharge = 1200 paisa/km (12 BDT/km)`,
+  and for a pooled ride `poolDiscount = 25% of (baseFare + distanceCharge)`
+  rounded **round-half-up** (deterministic; exact rule documented in ADR-015).
+  Parameters are code constants (`apps/api/src/fare/constants.ts`), env-configurable
+  later. Full formula and worked example published in README and docs/database.md.
 
 ### E. Driver ownership of vehicles ("Own a Tesla with fixed capacity")
 - PRD: Driver owns a Tesla with fixed capacity.
@@ -313,7 +330,10 @@ the ambiguity is explained, and one reasonable MVP assumption is proposed.
 ### H. Route-distance approximation
 - PRD: fare needs distanceCharge; no routing.
 - Ambiguity: How to compute distance without a routing engine.
-- MVP assumption: Great-circle (haversine) distance between predefined zone lat/long points, multiplied by a documented road-factor constant (e.g., 1.3) to approximate road distance. Deterministic and hand-checkable.
+- MVP assumption (**realized in Phase 4, ADR-015**): Great-circle (haversine)
+  distance between predefined zone lat/long points, multiplied by a documented
+  road-factor constant (**1.3**) to approximate road distance. Deterministic and
+  hand-checkable; implemented in `apps/api/src/fare/calculate.ts`.
 
 ### I. Ride-history immutability
 - PRD: "hold onto enough history to explain exactly what happened."

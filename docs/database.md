@@ -109,13 +109,19 @@ The lifecycle enum is the PRD's `REQUESTED → MATCHED → DRIVER_ARRIVED → ST
 | `destination_zone_id` | uuid → `zones.id` | RESTRICT |
 | `requested_seats` | integer NOT NULL | CHECK `> 0` |
 | `status` | `ride_status` NOT NULL DEFAULT `REQUESTED` | |
+| `client_request_id` | uuid NULL | **optional** client idempotency key (ADR-015); partial-unique-scoped, see below |
 | `pool_id` | uuid → `pools.id` NULL | **nullable while unassigned**; CHECK "set ⇒ not REQUESTED" |
 | `created_at` / `updated_at` | timestamptz NOT NULL | |
 | `cancelled_at` | timestamptz NULL | CHECK: set exactly when `status = CANCELLED` |
 | `completed_at` | timestamptz NULL | CHECK: set exactly when `status = COMPLETED` |
 
 Indexed on `(passenger_id, created_at)` (history), `status` (matching), and
-`pool_id` (pool lookup + FK). `pool_id` is a **display convenience**; the
+`pool_id` (pool lookup + FK). **Partial unique index
+`ride_requests_client_request_id_key`** (migration 0003): at most one ride per
+`(passenger_id, client_request_id)` when a key is supplied — this is the
+idempotency backstop behind Phase 4's "retry replays the existing ride"
+behavior (ADR-015; request 0001/0002 without a key may create a new ride,
+documented MVP behavior). `pool_id` is a **display convenience**; the
 authoritative membership is `pool_members` (§3.7).
 
 ### 3.6 `pools`
@@ -176,8 +182,18 @@ Individual, per-request **final fare snapshot** in integer paisa.
 
 The formula `passengerFare = baseFare + distanceCharge − poolDiscount` is
 enforced by a CHECK so stored history can never contradict the documented fare
-model. **Fare calculation itself is implemented in a later phase** (the value
-parameters are defined in `docs/requirements.md` §21.D).
+model. **Implemented in Phase 4** (ADR-015, `apps/api/src/fare/`): the initial
+estimated fare is written per seat at ride creation (the `fares` row is the
+*current applied fare snapshot* — `pool_discount_paisa = 0` for a REQUESTED
+ride). When the request later joins a pool, the discount is recomputed and the
+**same row is updated in place** by the pooling-phase service — a lifecycle
+recompute, not parameter drift, so history-immutability
+(`docs/requirements.md` §21.I) is preserved. Values follow §21.D:
+`base = 3000 paisa`, `charge = roundHalfUp(haversine × 1.3 × 1200) paisa/km`.
+
+Note: `fares` has no `updated_at` column; the pooling phase should add one if
+the recompute must be audited (the `ride_status_history` journal already
+records the `REQUESTED → MATCHED` transition that accompanies it).
 
 ### 3.9 `ride_status_history`
 
@@ -194,10 +210,13 @@ Append-only journal of a request's lifecycle transitions.
 CHECK `from_status IS NULL OR from_status <> status` (no self-transitions).
 Index `(ride_request_id, created_at)` = chronological audit trail.
 
-The **state machine that writes these rows** (and validates legal transitions)
-is implemented in the ride/pooling phases (8+). The DB enforces the enum values
-and self-transition rule; it cannot derive transitions from the current row, so
-writing history atomically with state changes is an application control.
+The **state machine that validates the *remaining* transitions** (REQUESTED →
+MATCHED → DRIVER_ARRIVED → STARTED → COMPLETED/CANCELLED) is implemented in the
+ride/pooling phases (8+). **Phase 4 already writes the first entry** — `NULL →
+REQUESTED` — atomically with ride + fare creation (`src/rides/service.ts`). The DB
+enforces the enum values and self-transition rule; it cannot derive transitions
+from the current row, so writing history atomically with state changes is an
+application control.
 
 ## 4. ERD
 
@@ -443,6 +462,15 @@ them may join. This is post-auth pooling-phase work — the **service** that
 implements it does not exist yet; this section documents the planned approach
 against the schema we now have (PRD §12 and `docs/requirements.md` §14).
 
+**Phase 4 does not need locking:** a `REQUESTED` ride holds no pool and no
+seats — creation is (zone lookup + insert ride + insert fare + insert initial
+journal row) in one transaction, with no shared-mutable row to contend over.
+The only cross-request race Phase 4 must answer is a passenger retrying the
+same `client_request_id` twice — that is settled by the partial unique index
+`ride_requests_client_request_id_key` (migration 0003): the loser's INSERT
+hits the unique violation, its transaction rolls back, and the service
+replays the winner (§3.5, ADR-015).
+
 **Planned strategy — DB-backed transactional consistency, database as truth:**
 
 1. `BEGIN` (default `read committed` or `repeatable read` is acceptable).
@@ -482,9 +510,11 @@ notes in `docs/requirements.md` §15.
   CHECK/unique/index/partial-index statements). Phase 3 added
   `0001_fluffy_lethal_legion.sql` (`ADD VALUE 'ADMIN'`, `DROP TABLE sessions
   CASCADE`, `ADD COLUMN clerk_user_id NOT NULL` + unique constraint) and
-  `0002_greedy_ultimatum.sql` (`DROP COLUMN password_hash`). Generated SQL was
-  reviewed and is committed **unmodified** — no manual edits unless a
-  documented reason forces one.
+  `0002_greedy_ultimatum.sql` (`DROP COLUMN password_hash`). Phase 4 added
+  `0003_fluffy_pixie.sql` (`ADD COLUMN client_request_id uuid` + the partial
+  unique index `ride_requests_client_request_id_key` — ADR-015 idempotency).
+  Generated SQL was reviewed and is committed **unmodified** — no manual edits
+  unless a documented reason forces one.
 - Apply with `npm run db:migrate` (uses `apps/api/drizzle/meta/_journal.json`
   so it is incremental and idempotent; re-running is a no-op).
 - State: **applied successfully against the Docker PostgreSQL container**;
@@ -552,3 +582,9 @@ npm run db:seed   -w @dhaka-tesla-pool/api    # idempotent cast seed
 14. Provisioning never steals another user's email — a `users_email_unique`
     conflict aborts with `AUTH_PROVISION_FAILED` instead of rebinding rows.
     ✔ App + DB
+15. A ride request exists only together with its fare and its first status
+    journal entry — created in one transaction (Phase 4, ADR-015). ✔ App
+16. At most one ride per `(passenger, client_request_id)` when a key is
+    supplied — partial unique index `ride_requests_client_request_id_key`
+    (migration 0003); a retry replays the existing ride, never creates a new
+    one. ✔ DB + App

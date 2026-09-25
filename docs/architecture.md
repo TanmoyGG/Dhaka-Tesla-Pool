@@ -125,9 +125,17 @@ flowchart LR
   local row is provisioned as `PASSENGER` on its first authenticated request,
   atomically (`INSERT … ON CONFLICT (clerk_user_id) DO NOTHING`). Webhooks are
   not used (ADR-014).
-- Later phases: ride state machine, capacity enforcement via transactional seat
-  allocation (`SELECT … FOR UPDATE` + constraint checks), individual passenger
-  fares (integer paisa/poysha), request validation on routes (Zod).
+- Phase 4 (complete): `src/fare/` — deterministic fare estimation
+  (`calculate.ts` `computeInitialFare`, `constants.ts`), and `src/rides/`
+  (`service.ts` + `routes.ts` + `errors.ts`): `createRideRequest` inserts ride
+  + fare + initial status journal row in one transaction, with optional
+  `client_request_id` idempotent replay; a Zones reference list; PASSENGER-role
+  reads scoped to the caller. Request/params validation on routes uses **Zod**
+  (strict schemas); the JSON error envelope gains an additive `details` array
+  (ADR-015).
+- Later phases: pool creation/matching, ride state machine, capacity
+  enforcement via transactional seat allocation (`SELECT … FOR UPDATE` +
+  constraint checks), pooling-fare recompute of the existing fare row.
 
 ### 3.3 Database (PostgreSQL)
 - Phase 1: PostgreSQL 16 in Docker Compose (healthcheck + persistent named
@@ -144,25 +152,37 @@ flowchart LR
 - Phase 3 (complete): `users.clerk_user_id` (NOT NULL, unique) maps a verified
   Clerk identity to the application user; `role` and `active` remain in
   PostgreSQL; seeded users get a reserved `dev-only::seed::` placeholder.
+- Phase 4 (complete): `ride_requests.client_request_id` (uuid, nullable) with
+  the partial unique index `ride_requests_client_request_id_key` (migration
+  0003) backs idempotent ride creation; `fares` is now written at creation as
+  the per-seat initial estimate (discount 0) — a snapshot the pooling phase
+  recomputes in place when a ride joins a pool.
 - Later phases: single source of truth for ride behavior; capacity enforcement
   via transactional seat allocation (`SELECT … FOR UPDATE` + derived occupancy
-  sum), individual passenger fares.
+  sum), pooled-fare recompute.
 - Occupied seats are always **derived** from ACTIVE `pool_members` rows — there
   is no cached "available seats" counter. Concurrency approach documented in
   `docs/database.md` §7.
 
-### 3.4 Route policy (Phase 3)
+### 3.4 Route policy (Phase 3 + Phase 4 ride endpoints)
 
 | Route | Policy | Enforcement |
 |---|---|---|
 | `GET /health` (API) | **Public** | No auth (registered outside the `/api` scope) |
-| `/api/me` (API) | Signed-in user | Auth plugin preHandler (bearer token) + `requireAuth` |
+| `/api/me` (API) | Signed-in user (any role) | Auth plugin preHandler (bearer token) + `requireAuth` |
+| `POST /api/rides` (API) | `PASSENGER` | `requireAuth` + `requireRole(["PASSENGER"])` + strict Zod body |
+| `GET /api/rides` (API) | `PASSENGER` (own rides only) | `requireAuth` + `requireRole(["PASSENGER"])` |
+| `GET /api/rides/:rideId` (API) | `PASSENGER` (owner); 404 otherwise | `requireAuth` + `requireRole(["PASSENGER"])` + owner check |
+| `GET /api/zones` (API) | Signed-in user (any role) | Auth plugin preHandler (bearer token) + `requireAuth` |
 | `/` , `/sign-in`, `/sign-up` (web) | **Public** | Clerk middleware (no protection) |
 | `/account*` (web) | Signed-in user | Clerk middleware redirects to `/sign-in` |
 
 Unauthenticated API requests fail closed with `401 AUTH_UNAUTHENTICATED`.
-Role-protected routes (later phases) add `requireRole([...])`; the role comes
-from the PostgreSQL user row, never from the client.
+Role-protected routes add `requireRole([...])`; the role comes from the
+PostgreSQL user row, never from the client (ADR-013/014/015). Unknown zone ids
+on `POST /api/rides` are `400 VALIDATION_ERROR` (zone ids are form values, K8);
+a ride id that does not exist — or belongs to another user — is a single
+`404 NOT_FOUND` (no existence leak).
 
 ## 4. Boundaries
 
@@ -272,6 +292,31 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-013,
   `/sign-in`, `/health` 200); unprovisioned Clerk yields the documented
   `AUTH_CONFIGURATION` error on authenticated routes.
 
-Not yet implemented (later phases): ride request/booking UI and endpoints,
-drivers, pooling, matches, fares, ride state machine, concurrency, map
-visualization, deployment to Vercel/Render/Neon.
+Not yet implemented (later phases): ride/booking UI (web), pool matching
+(`SELECT … FOR UPDATE` seat allocation), ride state machine, pooled-fare
+recompute, drivers, map visualization, deployment to Vercel/Render/Neon.
+
+## 11. Implementation Status (Phase 4 — ride requests & fare estimation)
+
+Implemented and verified (see [docs/decisions.md](decisions.md) ADR-015,
+[docs/database.md](database.md) §3.5/§3.8/§7):
+
+- **Fare module** (`apps/api/src/fare/`): deterministic initial estimate —
+  `roundHalfUp(haversine × 1.3 × 1200)` + 3000 paisa base; stored per seat,
+  total = final × seats; pool discount 0 until pooling. Nusrat
+  Banani→Mohakhali 5932 paisa; Rafiq Banani→Gulshan 1 4140 paisa (pinned in
+  tests).
+- **Ride endpoints** (`apps/api/src/rides/`): `POST /api/rides` (201 new / 200
+  idempotent replay via optional `client_request_id`), `GET /api/rides`,
+  `GET /api/rides/:rideId`, `GET /api/zones` — all auth-aware.
+- **Validation**: Zod strict schemas; unknown keys rejected; identity/role
+  always from the verified session, never from the body.
+- **Atomicity**: ride + fare + initial status journal row in one transaction;
+  a concurrent duplicate `client_request_id` rolls back its INSERT (partial
+  unique index) and replays the winner.
+- **CORS** now permits `POST` (and preflight returns the actual allowed
+  methods). Errors carry additive `details`.
+- Tests: `test/fare.test.ts` (7) + `test/rides.test.ts` (22)
+  — full suite 83/83 with `fileParallelism: false` (shared disposable test
+  database). Migration 0003 applied to the Docker dev DB; `db:generate` reports
+  no drift.
