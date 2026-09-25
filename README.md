@@ -19,8 +19,21 @@ PostgreSQL user (`users.clerk_user_id`) for role-based authorization
 provisioned as `PASSENGER` users on their first authenticated request
 (ADR-014), atomically and race-safe. Password storage and the application
 `sessions` table are gone (migrations 0001/0002). Covered by 23 auth tests
-(deterministic fakes — no network) and 29 database tests. **No ride/pooling
-business logic is implemented yet** — those arrive in later phases per
+(deterministic fakes — no network) and 29 database tests.
+
+**Phase 4 — Passenger ride requests & fare estimation: complete.** Passengers
+can create a ride request and receive its deterministic initial fare estimate
+(`POST /api/rides`), list their own rides (`GET /api/rides`), fetch one
+(`GET /api/rides/:rideId`), and read the zone pick-list
+(`GET /api/zones`). Fare = `3000` base + `roundHalfUp(haversine × 1.3 × 1200)`
+paisa/km, stored per seat; Nusrat Banani→Mohakhali = **5932 paisa**,
+Rafiq Banani→Gulshan 1 = **4140 paisa** (pinned in tests). Ride + fare + initial
+status journal row commit in one transaction; an optional `client_request_id`
+makes creation idempotent (migration 0003, replay → HTTP 200). Zod strict
+validation on routes; PASSENGER-only; errors carry additive `details`. Covered
+by 7 fare and 22 rides integration tests — full suite 83/83. See
+[the API section](#api-phase-4) below and ADR-015.
+Pooling/matching, the ride state machine, and drivers are later phases per
 [docs/development-plan.md](docs/development-plan.md).
 
 ## Project Description
@@ -285,6 +298,62 @@ UPDATE users SET clerk_user_id = '<clerk-user-id>' WHERE email = 'nusrat@example
 
 Real Clerk IDs cannot collide with placeholders (`user_...` vs
 `dev-only::seed::...`).
+
+## API (Phase 4)
+
+All `/api` routes require a Clerk session **bearer token**
+(`Authorization: Bearer <token>`); the web client attaches it automatically
+(`apps/web/lib/api.ts`). Errors use `{ error: { code, message, details? } }`.
+
+| Endpoint | Policy | Notes |
+|---|---|---|
+| `GET /api/me` | any signed-in user | authenticated identity / role |
+| `POST /api/rides` | `PASSENGER` | create a ride request with its initial fare estimate |
+| `GET /api/rides` | `PASSENGER` | the caller's own requests, newest first |
+| `GET /api/rides/:rideId` | `PASSENGER` (owner) | 404 for unknown/another user's ride |
+| `GET /api/zones` | any signed-in user | pickup/destination pick-list (8 zones) |
+
+`POST /api/rides` body (Zod, strict — unknown keys rejected, identity/role is
+taken from the session, never from the body):
+
+```json
+{
+  "pickupZoneId": "uuid-from-/api/zones",
+  "destinationZoneId": "uuid-from-/api/zones",
+  "requestedSeats": 1,
+  "clientRequestId": "uuid" 
+}
+```
+
+- `requestedSeats` is 1–3; an unknown zone id is `400 VALIDATION_ERROR`;
+  pickup === destination is rejected.
+- HTTP **201** on creation; a repeat submission with the **same
+  `clientRequestId`** replays the existing ride and returns HTTP **200**
+  (idempotent, migration 0003). Without a `clientRequestId`, each submission
+  creates a new ride — documented MVP behavior.
+- Same-zone-partner hint: riding with Nusrat (`Banani → Mohakhali`) or Rafiq
+  (`Banani → Gulshan 1`) both use `pickupZoneId = Banani`.
+
+### Fare formula (worked examples)
+
+Integer paisa, never floating point. Per seat stored; total = final × seats.
+
+```
+roadKm = haversine(pickup, destination) × 1.3        // R = 6371 km
+distanceChargePaisa = roundHalfUp(roadKm × 1200)     // 12 BDT/km
+finalFarePaisa = 3000 + distanceChargePaisa − 0      // base 30 BDT; poolDiscount = 0 pre-pooling
+estimatedTotalPaisa = finalFarePaisa × requestedSeats
+```
+
+| Route | distance (km) | fare per seat | BDT |
+|---|---|---|---|
+| Nusrat | Banani → Mohakhali | 2.932 km × 1.3 ≈ 3.812 km | **5932 paisa** | 59.32 |
+| Rafiq | Banani → Gulshan 1 | 1.140 km × 1.3 ≈ 1.483 km | **4140 paisa** | 41.40 |
+
+A two-seat booking of Nusrat's route costs 2 × 5932 = **11864 paisa**.
+These values are pinned in `test/fare.test.ts` and `test/rides.test.ts` from
+the seed coordinates, so any drift is a test failure. See ADR-015 and
+`apps/api/src/fare/calculate.ts` for the exact code.
 
 ## Docker (full stack, reproducible)
 

@@ -358,3 +358,77 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   tests behavior without Clerk or a network; the database suite injects the
   disposable `_test` database through `createUserResolver` to test the real
   upsert, race, email-conflict, and reserved-id paths against the schema.
+
+## ADR-015: Ride requests, fare estimation, and idempotency (Phase 4)
+
+- **Status:** Implemented in `apps/api/src/fare/`, `apps/api/src/rides/`,
+  migration 0003, and covered in `test/fare.test.ts` + `test/rides.test.ts`.
+- **Decision:** passengers create a ride request and receive its **initial
+  estimated fare** together, computed deterministically from zone coordinates.
+  No routing service is used — the MVP geography is predefined Dhaka zones with
+  plain lat/long points (ADR-007).
+- **Fare model (per seat, integer paisa — never floating point):**
+
+  ```
+  distanceKm          = haversine(pickup, destination)              // R = 6371 km
+  roadKm              = distanceKm × 1.3                            // 2.4/twist factor, §21.H
+  distanceChargePaisa = roundHalfUp(roadKm × 1200)                  // 12 BDT/km
+  baseFarePaisa       = 3000                                        // 30 BDT flat
+  poolDiscountPaisa   = 0 for a new (REQUESTED) ride                // pooling, later phase
+  finalFarePaisa      = baseFare + distanceCharge − poolDiscount    // never rounded independently
+  estimatedTotal      = finalFarePaisa × requestedSeats             // the API total
+  ```
+
+  Stored components in `fares` are **per seat** (K5); the total a passenger
+  pays is derived in the API response. Rounding is deterministic
+  **round-half-up** (K6) — banker's rounding only differs at exact .5
+  boundaries and half-up is simpler to pin in tests. The database CHECK
+  `final = base + distance − discount` is satisfied by construction because
+  the final is derived, never independently rounded.
+- **Fare row semantics (estimate now, final later):** the `fares` row is the
+  *current applied fare snapshot*. At creation it holds the initial estimate
+  with `pool_discount_paisa = 0`. When the request later joins a pool (pooling
+  phase), the pool discount is computed and the **same row is updated in
+  place** — one fare per request stays true, and this is a lifecycle recompute,
+  not a reaction to parameter drift, so history-immutability (requirements
+  §21.I) is preserved. No schema change was needed for this.
+- **Worked examples (pinned in tests, from seed coordinates):**
+  `Banani → Mohakhali` = **5932 paisa** (BDT 59.32, Nusrat);
+  `Banani → Gulshan 1` = **4140 paisa** (BDT 41.40, Rafiq).
+- **Atomicity:** ride request + fare + the initial status-history journal entry
+  (`NULL → REQUESTED`, requirements §4) commit in **one PostgreSQL
+  transaction** (`createRideRequest` in `src/rides/service.ts`). A ride can
+  never exist without its fare or vice-versa; the test suite proves the
+  rollback by injecting a failing fare computation after the ride insert.
+  A REQUESTED ride holds **no seats** and has no pool, so no concurrency
+  locking is needed in this phase — seat-claim concurrency belongs to the
+  pooling phase (database.md §7).
+- **Idempotency (K2):** an **optional** client-generated
+  `client_request_id` lets a passenger retry "create ride" safely. At most one
+  ride per `(passenger, client_request_id)` via a partial unique index
+  (migration 0003). A retry with the same key replays the existing ride
+  (HTTP 200 vs 201), including a concurrent race — the loser's INSERT hits the
+  unique index, rolls back, and re-reads the winner. **No broader idempotency
+  framework** was built; requests WITHOUT a key may create a new ride on a
+  repeated submission — documented MVP behavior.
+- **Validation (K1):** added **Zod** (aligned with the AGENTS.md proposed
+  stack) for request-body and params validation on the API. Unknown body keys
+  are rejected (`.strict()`) so a client cannot smuggle
+  `passengerId`/`role`/`name`/`email` — identity always comes from the
+  verified session (ADR-013/014). The error envelope gains an **additive**
+  `details` array: `{ error: { code, message, details? } }`; all existing
+  `{ code, message }` consumers are unaffected.
+- **Zone ids are form values (K8):** an unknown zone id is a validation error
+  (400 `VALIDATION_ERROR`, not 404) because the client must pick from the
+  `GET /api/zones` list. A ride id that does not exist — or belongs to someone
+  else — is a single 404 `NOT_FOUND` so observers cannot distinguish.
+- **Authorization (K7):** Phase 4 ride-request and ride-read endpoints are
+  **PASSENGER-only** (`requireRole(["PASSENGER"])`); DRIVER/ADMIN management of
+  rides/pools is later-phase work. `GET /api/zones` requires a session (any
+  role). CORS now permits `POST` for the future web form.
+- **Alternatives rejected:** persisting the estimate only at pooling time
+  (breaks "ride and fare are atomic" and the always-explainable fare);
+  a separate estimate/final fare table or `is_final` flag (schema churn with no
+  MVP gain); a full idempotency-key framework (keys on rides are the only
+  retry-prone write today); storing total instead of per-seat components
+  (would contradict the per-seat fare model, §21.K).

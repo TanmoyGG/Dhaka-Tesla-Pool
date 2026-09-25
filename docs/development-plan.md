@@ -113,13 +113,29 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 
 ## Phase 4 — Passenger ride requests
 
+> **Status: COMPLETE** (branch `feature/passenger-ride-request`). Ride request
+> creation, reads, and the zones pick-list are implemented at `/api/rides`,
+> `/api/rides/:rideId`, `/api/zones`. **Fare estimation was pulled forward into
+> this phase** (from Phase 7) because the request's initial fare must be
+> returned in the same response (ADR-015). The initial per-seat estimate now
+> lands in `fares` at creation (discount 0); Phase 7 becomes the **pooled-fare
+> recompute** of that same row. Scope note: passenger-only — driver/ride
+> management is Phase 6.
+
 - **Objective:** Passenger can request a ride and see estimated fare/status.
-- **Deliverables:** `POST /rides` (pickup, destination, seats), status view,
-  estimated fare computed by the fare module, REQUESTED state only.
+- **Deliverables:** `POST /api/rides` (pickup, destination, seats, optional
+  `clientRequestId`), `GET /api/rides`, `GET /api/rides/:rideId`,
+  `GET /api/zones`; deterministic fare module (`final = 3000 + roundHalfUp(km ×
+  1.3 × 1200) − 0` per seat); REQUESTED state only; idempotent replay (migration
+  0003); one-transaction ride + fare + initial status journal row; Zod strict
+  validation (K1); CORS POST; additive `details` on the error envelope.
 - **Dependencies:** Phases 2, 3.
-- **Risks:** fare formula drift vs. docs; zone validation.
-- **Tests:** request creation validates zones/seats; estimated fare matches by-hand
-  calculation.
+- **Risks:** fare formula drift vs. docs (mitigated by pinning Nusrat **5932** /
+  Rafiq **4140** paisa in tests); zone validation (unknown zone id → 400).
+- **Tests (implemented):** fare unit suite (7, `test/fare.test.ts`) + rides
+  integration suite (22, `test/rides.test.ts`) — creation 201 / replay 200,
+  per-seat × seats total, concurrent same-key replay, validation 400s, DRIVER
+  403, cross-user 404, list isolation, atomic rollback on injected fare failure.
 
 ## Phase 5 — Pool matching
 
@@ -147,14 +163,22 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 
 ## Phase 7 — Fare calculation
 
+> **Status: mostly superseded by Phase 4.** The initial per-seat estimate
+> (`final = 3000 + roundHalfUp(haversine × 1.3 × 1200) − 0`) is already
+> implemented, unit-tested, and persisted at ride creation (ADR-015, K4/K5).
+> Remaining: the **pooled-fare recompute** — when a REQUESTED ride joins a pool,
+> the pooling service recomputes the discount and **updates the same `fares` row
+> in place** (`final = base + distance − poolDiscount`, 25% discount); the total
+> a passenger pays remains per-seat × seats. Worked pooled example (Nusrat +
+> Rafiq) lands here and in the README.
+
 - **Objective:** Correct, documented, hand-verifiable per-passenger fares.
-- **Deliverables:** fare module implementing
-  `passengerFare = baseFare + distanceCharge − poolDiscount` in integer
-  paisa/poysha; fare snapshots persisted per passenger; worked example (Nusrat,
-  Rafiq pooled) in README.
+- **Deliverables:** pooled-fare recompute service updating the existing fare
+  row; worked example (Nusrat, Rafiq pooled) in README; the one-row-one-fare
+  invariant (updated in place, never duplicated).
 - **Dependencies:** Phases 4, 5 (pooled trip needed).
-- **Risks:** rounding choice; distance approximation constant (requirements
-  §21.D/H).
+- **Risks:** rounding choice (settled: **round-half-up**, ADR-015);
+  distance-approximation constant (requirements §21.D/H, = 1.3).
 - **Tests:** Nusrat and Rafiq's pooled fares match the published by-hand example;
   precision is integer-based; snapshots are stable.
 

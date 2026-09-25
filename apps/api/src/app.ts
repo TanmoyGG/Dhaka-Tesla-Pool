@@ -7,6 +7,9 @@ import { createClerkSessionVerifier } from "./auth/provider.js";
 import { provisionLocalUser } from "./auth/provision.js";
 import { resolveLocalUser } from "./auth/user-resolver.js";
 import type { AuthDependencies } from "./auth/identity.js";
+import { db } from "./db/index.js";
+import { ridesRoutes } from "./rides/routes.js";
+import { createRideService, type RideService } from "./rides/service.js";
 import { healthRoutes } from "./routes/health.js";
 
 export interface BuildAppOptions {
@@ -15,6 +18,9 @@ export interface BuildAppOptions {
   // calls Clerk or the database). Defaults to the real Clerk + PostgreSQL
   // implementations.
   auth?: Partial<AuthDependencies>;
+  // Injectable ride service (tests bind it to the disposable test database).
+  // Defaults to the real PostgreSQL-backed service.
+  rides?: RideService;
 }
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
@@ -26,12 +32,25 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
 
   app.setErrorHandler((error: FastifyError, request, reply) => {
     request.log.error({ err: error }, "request failed");
-    reply.status(error.statusCode ?? 500).send({
+    const body: {
+      error: {
+        code: string;
+        message: string;
+        details?: Array<{ field: string; message: string }>;
+      };
+    } = {
       error: {
         code: error.code ?? "INTERNAL_ERROR",
         message: error.message,
       },
-    });
+    };
+    // Additive envelope extension: validation errors carry per-field details.
+    // { code, message } consumers are unaffected (docs/decisions.md ADR-015).
+    const details = (error as { details?: unknown }).details;
+    if (Array.isArray(details)) {
+      body.error.details = details as Array<{ field: string; message: string }>;
+    }
+    reply.status(error.statusCode ?? 500).send(body);
   });
 
   app.setNotFoundHandler((request, reply) => {
@@ -49,7 +68,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   // only the headers/methods the MVP actually uses.
   app.register(cors, {
     origin: config.clerkAuthorizedParties,
-    methods: ["GET", "OPTIONS"],
+    methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Authorization", "Content-Type"],
   });
 
@@ -64,6 +83,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     provisionLocalUser: options.auth?.provisionLocalUser ?? provisionLocalUser,
   };
   app.register(authRoutes, { deps: authDeps });
+  app.register(ridesRoutes, {
+    deps: authDeps,
+    rides: options.rides ?? createRideService(db),
+  });
 
   return app;
 }
