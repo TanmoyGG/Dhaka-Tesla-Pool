@@ -104,5 +104,24 @@ export const ridesRoutes: FastifyPluginAsync<RidesRoutesOptions> = async (
         return { ride };
       },
     );
+
+    // Passenger cancels their own ride (docs/requirements.md §21.B). Only the
+    // ride's owner may cancel it; an illegal transition (e.g. cancelling a
+    // COMPLETED ride) is rejected with 409 INVALID_STATE_TRANSITION.
+    scope.post<{ Params: { rideId: string } }>(
+      "/rides/:rideId/cancel",
+      { preHandler: [scope.requireRole(["PASSENGER"])] },
+      async (request) => {
+        const parsed = rideParamsSchema.safeParse(request.params);
+        if (!parsed.success) {
+          throw new RideValidationError(zodIssues(parsed.error));
+        }
+        const ride = await options.rides.cancelRequest(
+          request.auth!.user,
+          parsed.data.rideId,
+        );
+        return { ride };
+      },
+    );
   }, { prefix: "/api" });
 };
