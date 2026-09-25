@@ -334,6 +334,55 @@ describe("route policy", () => {
   });
 });
 
+describe("CORS", () => {
+  // The web app origin: WEB_URL default, mirrored by config.clerkAuthorizedParties.
+  const webOrigin = "http://localhost:3000";
+
+  it("answers the browser preflight OPTIONS for the allowed web origin", async () => {
+    const app = buildApp({ auth: makeDeps() });
+    const res = await app.inject({
+      method: "OPTIONS",
+      url: "/api/me",
+      headers: {
+        origin: webOrigin,
+        "access-control-request-method": "GET",
+        "access-control-request-headers": "authorization",
+      },
+    });
+    expect(res.statusCode).toBe(204);
+    expect(res.headers["access-control-allow-origin"]).toBe(webOrigin);
+    expect(res.headers["access-control-allow-methods"]).toContain("GET");
+    expect(res.headers["access-control-allow-headers"]).toMatch(/authorization/i);
+  });
+
+  it("does not emit CORS headers for an unlisted origin", async () => {
+    const app = buildApp({ auth: makeDeps() });
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/me",
+      headers: { origin: "https://evil.example" },
+    });
+    expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("serves the authenticated /api/me with CORS headers for the web origin", async () => {
+    const app = buildApp({ auth: makeDeps() });
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/me",
+      headers: {
+        origin: webOrigin,
+        authorization: "Bearer tok-passenger",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["access-control-allow-origin"]).toBe(webOrigin);
+    expect(res.json()).toMatchObject({
+      user: { id: SEED_NUSRAT_ID, name: "Nusrat Haque", role: "PASSENGER" },
+    });
+  });
+});
+
 describe("auth routes standalone", () => {
   it("mounts /api/me", async () => {
     const app = Fastify();

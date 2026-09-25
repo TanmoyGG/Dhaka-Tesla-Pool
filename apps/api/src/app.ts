@@ -1,5 +1,7 @@
 import type { FastifyError, FastifyInstance } from "fastify";
 import Fastify from "fastify";
+import cors from "@fastify/cors";
+import { config } from "./config.js";
 import { authRoutes } from "./auth/routes.js";
 import { createClerkSessionVerifier } from "./auth/provider.js";
 import { resolveLocalUser } from "./auth/user-resolver.js";
@@ -38,6 +40,16 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         message: `route ${request.method} ${request.url} not found`,
       },
     });
+  });
+
+  // Browser CORS for the web app (apps/web) calling this API cross-origin.
+  // Only origins already vetted for Clerk token verification may pass: the
+  // same WEB_URL / CLERK_AUTHORIZED_PARTIES list. No wildcard origins, and
+  // only the headers/methods the MVP actually uses.
+  app.register(cors, {
+    origin: config.clerkAuthorizedParties,
+    methods: ["GET", "OPTIONS"],
+    allowedHeaders: ["Authorization", "Content-Type"],
   });
 
   // Public liveness probe — deliberately NOT behind authentication.
