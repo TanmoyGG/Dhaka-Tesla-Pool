@@ -80,21 +80,24 @@
 - **Switch later if:** Drizzle's DX blocks us, or we want Prisma's
   factories/seed ergonomics badly enough to accept its weight.
 
-## ADR-006: Application-owned auth (cookies + Argon2id)
+## ADR-006: Application-owned auth (cookies + Argon2id) — SUPERSEDED
 
-- **Decision:** Our own session auth: Argon2id password hashes, random opaque
-  session tokens stored in DB, `HttpOnly` `SameSite=Lax` cookies, role-based
-  authorization (passenger/driver).
-- **Alternatives:** Auth0/Clerk/Supabase Auth (external), JWT stateless.
-- **Why now:** PRD asks us to *design auth ourselves* and justify the choice;
-  the surface (email + password + role) is small. Server-side sessions are
-  trivially revocable and keep password/session policy in our control, with no
-  third-party dependency. Argon2id is the OWASP-recommended hash.
-- **Trade-offs:** We own security; must get CSRF/cookie flags right. JWT would
-  be stateless but adds revocation complexity. External auth adds cost/vendor
-  lock-in and another moving part — forbidden-ish for a simple MVP.
-- **Switch later if:** Product demands social login / SSO or strong MFA; then
-  consider a managed provider.
+- **Status:** Replaced by **ADR-013 (Clerk authentication)**. Kept here to
+  record that the manual auth path was fully considered and why it lost.
+- **Decision (original):** Our own session auth: Argon2id password hashes,
+  random opaque session tokens stored in DB, `HttpOnly` `SameSite=Lax` cookies,
+  role-based authorization (passenger/driver).
+- **Alternatives considered:** Auth0/Clerk/Supabase Auth (external), JWT
+  stateless.
+- **Why now (original):** PRD asks us to *design auth ourselves* and justify the
+  choice; the surface (email + password + role) is small. Server-side sessions
+  are trivially revocable and keep password/session policy in our control, with
+  no third-party dependency. Argon2id is the OWASP-recommended hash.
+- **Why superseded / trade-offs:** We own security; we must get CSRF/cookie
+  flags right; and email/password asks users to trust an MVP with credentials
+  for zero product value. The PRD also lists "social login" and "session
+  management *by a third-party identity provider*" as acceptable auth
+  mechanisms. See ADR-013 for the full comparison.
 
 ## ADR-007: Leaflet + OpenStreetMap over Google Maps/Mapbox
 
@@ -228,7 +231,9 @@ explainable; `docs/database.md` mirrors this in prose.
   make every ride explainable; a second journal has no consumer (`docs/database.md` §5.9).
 - **Deterministic seed IDs + idempotent `ON CONFLICT DO NOTHING`**: stable
   UUIDs for Jashim/Bullet/zones keep tests and demos reproducible; reseeding is
-  a no-op. Placeholder `password_hash` values until the auth phase.
+  a no-op. Seeded users carry a reserved `clerk_user_id` placeholder
+  (`dev-only::seed::<email>`); real Clerk IDs (`user_…`) can never collide, and
+  the auth resolver rejects reserved IDs outright (see ADR-013).
 - **Migration files are generated, reviewed, committed unmodified.** No manual
   SQL edits without a documented reason.
 
@@ -237,3 +242,58 @@ vehicle ownership, pool driver = vehicle driver, occupancy vs capacity (multi-ro
 transaction), and state-transition legality (state machine). Rationale:
 CHECK constraints can't reference other tables, and triggers would duplicate the
 service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
+
+## ADR-013: Clerk for authentication (Phase 3)
+
+- **Status:** Supersedes **ADR-006**. Implemented in `apps/api/src/auth/`,
+  `apps/web` (`@clerk/nextjs`, `middleware.ts`), migration 0001/0002, and
+  `test/auth.test.ts`.
+- **Decision:** Use **Clerk** as the identity provider. The application owns
+  *authorization*: the role and active flag live in PostgreSQL
+  (`users.role`), resolved per request from the verified Clerk identity via
+  `users.clerk_user_id`. There is **no** application password store, no
+  application session table, and no manual Argon2id/cookie implementation.
+- **How identity flows (bearer tokens, not browser cookies at the API):**
+  `Browser (Next.js, ClerkProvider) → Clerk (authenticates the user) → the web
+  app sends the Clerk session token as `Authorization: Bearer <token>` →
+  Fastify verifies it with `@clerk/backend` `authenticateRequest()` →
+  `users.clerk_user_id` lookup → `request.auth.user` for role-based
+  authorization. The API never trusts a `userId`/`role` from a request body —
+  identity always derives from the verified token.
+- **Alternatives:**
+  1. **ADR-006 manual auth** (Argon2id + DB sessions + cookies): zero external
+     dependency, full control, trivially revocable. Costs: we own password,
+     session, CSRF, and cookie security for an MVP; email/password friction for
+     a demo product whose PRD explicitly permits third-party session
+     management and social login.
+  2. **Auth0 / Supabase Auth / Firebase Auth**: same category as Clerk with no
+     decisive win for this MVP (Clerk's Next.js + `@clerk/backend` story is the
+     most direct fit for the chosen stack).
+  3. **Stateless JWT (manual)**: avoids sessions but reintroduces revocation
+     complexity and key management with none of Clerk's UI/session handling.
+- **Why Clerk:** the PRD *requires us to consider* third-party auth and session
+  management and to document the outcome; Clerk eliminates the highest-risk
+  security surface (credential storage, session lifecycle, CSRF) while keeping
+  authorization fully application-owned in PostgreSQL. The provider-agnostic
+  injection boundary (`SessionVerifier` / `LocalUserResolver` in
+  `src/auth/identity.ts`) keeps the auth flow testable without a network and
+  swappable later. `npm audit`: 0 vulnerabilities introduced.
+- **Trade-offs / recorded risks:** vendor dependency and dev-mode instance
+  quirks; free tier has limits (Clerk free tier includes 10k MAU — fine for an
+  MVP; revisit at scale). Server-side revocation of a Clerk session depends on
+  Clerk's session lifecycle (acceptable: `authenticateRequest` re-validates
+  every request). **Roles stay in PostgreSQL by design** — Clerk is an identity
+  provider; *what* a user may do in the product is application policy, and
+  keeping it here keeps the DB the source of truth and avoids role sync.
+- **Why the seed uses reserved placeholders:** we never invent a real Clerk ID
+  (would assume an identity that does not exist). Seeded characters get a
+  reserved `dev-only::seed::<email>` value, which `isReservedClerkUserId()`
+  rejects during auth and which cannot collide with real `user_…` IDs. Mapping
+  a real Clerk user to a seeded character is a documented owner step (README).
+- **Migration note (0001/0002, dev):** `clerk_user_id` is NOT NULL, so the
+  upgrade path for an existing populated database is: recreate, then migrate,
+  then seed (documented in README); the CI/test path always builds a fresh
+  `_test` database.
+- **Switch later if:** the product needs self-hosted identity, costs exceed
+  budget, or we want full auth in-house — ADR-006's design remains the
+  documented fallback.

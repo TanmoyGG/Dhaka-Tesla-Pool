@@ -294,7 +294,16 @@ the ambiguity is explained, and one reasonable MVP assumption is proposed.
 ### F. Session expiration policy
 - PRD: Auth required; no policy specified.
 - Ambiguity: Session lifetime and sliding vs. fixed.
-- MVP assumption: Application-owned cookie sessions persisted in DB with a fixed 7-day lifetime, invalidated on logout/password change; `HttpOnly`, `Secure` (in prod), `SameSite=Lax`.
+- MVP assumption (**superseded by the Clerk decision, ADR-013**): Clerk is the
+  identity provider and owns the session lifecycle (sign-in/sign-up UI,
+  cookie/JWT issuance, refresh, revocation, expiry). The API keeps **no**
+  session state — every authenticated request re-verifies the bearer token with
+  `authenticateRequest()` (`apps/api/src/auth/provider.ts`) and resolves the
+  local user + PostgreSQL role. Clerk's default session duration (~60 days, MSL
+  sliding) applies to the web app; the API treats tokens, not sessions, as the
+  unit of trust. Original assumption for the discarded manual auth: app-owned
+  DB cookie sessions, fixed 7-day lifetime, invalidated on logout/password
+  change, `HttpOnly`/`Secure` (prod)/`SameSite=Lax`.
 
 ### G. Map visualization behavior
 - PRD: predefined list of Dhaka areas / lat-long points / lightweight free map; do not fight map APIs.

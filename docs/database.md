@@ -1,20 +1,25 @@
 # Database Design — Dhaka Tesla Pool (MVP)
 
-> **Status:** Phase 2 complete. The schema described here is implemented in
-> `apps/api/src/db/schema.ts`, migrated by `apps/api/drizzle/0000_*.sql`, and
-> exercised by `apps/api/test/database.test.ts`. The ERD below reflects the
-> **actual** schema. Everything else here is a record of the design decisions,
-> invariants, and planned later-phase behavior (which is marked as such).
+> **Status:** Phases 2 + 3 complete. The schema described here is implemented in
+> `apps/api/src/db/schema.ts`, migrated by `apps/api/drizzle/0000_*.sql` +
+> `0001_*.sql` + `0002_*.sql`, and exercised by `apps/api/test/database.test.ts`.
+> The ERD below reflects the **actual** schema (including the Phase 3 Clerk
+> adaptation: `users.clerk_user_id`, no `sessions` table, no password hashes).
+> Everything else here is a record of the design decisions, invariants, and
+> planned later-phase behavior (which is marked as such).
 
 ## 1. Design Goals
 
 - Model the PRD's world faithfully: users, Teslas/vehicles + fixed capacity,
-  ride requests, pools, pool membership, status/history, fares, sessions.
+  ride requests, pools, pool membership, status/history, fares.
 - Enforce invariants in the database where appropriate (constraints), not only
   in application code.
 - Money as **integer paisa/poysha** (never floating-point).
 - Support the six required test behaviors, including the concurrency case.
 - `ride_status_history` + fare snapshots exist so history is **explainable**.
+- Authentication is **not** the database's job: Clerk owns identity, and the
+  app DB keeps only the mapping (`clerk_user_id`) and the authorization role
+  (ADR-013). No passwords or sessions are stored.
 
 ## 2. Implementation Overview
 
@@ -22,7 +27,7 @@
 - **Primary keys:** UUID v4, default `gen_random_uuid()` (PG >= 13 built-in).
 - **Timestamps:** `timestamptz` (timezone-aware), default `now()`, stored UTC.
 - **Enums (PostgreSQL-native):**
-  - `user_role`: `PASSENGER`, `DRIVER`
+  - `user_role`: `PASSENGER`, `DRIVER`, `ADMIN`
   - `ride_status`: `REQUESTED`, `MATCHED`, `DRIVER_ARRIVED`, `STARTED`,
     `COMPLETED`, `CANCELLED`
   - `pool_member_status`: `ACTIVE`, `LEFT`
@@ -36,28 +41,30 @@
 | column | type | notes |
 |---|---|---|
 | `id` | uuid PK | default `gen_random_uuid()` |
+| `clerk_user_id` | text NOT NULL UNIQUE | Clerk identity mapping (ADR-013); never invented/guessed |
 | `name` | text NOT NULL | CHECK non-empty |
 | `email` | text NOT NULL UNIQUE | stored lowercase (CHECK `email = lower(email)`) |
-| `password_hash` | text NOT NULL | Argon2id hash (auth in Phase 3) |
-| `role` | `user_role` NOT NULL DEFAULT `PASSENGER` | |
+| `role` | `user_role` NOT NULL DEFAULT `PASSENGER` | **authorization source of truth** — never from the client |
 | `active` | boolean NOT NULL DEFAULT `true` | |
 | `created_at` / `updated_at` | timestamptz NOT NULL DEFAULT `now()` | |
 
-One table for both passenger and driver, distinguished by `role`.
+One table for both passenger and driver, distinguished by `role`. There is **no
+password column**: Clerk stores credentials (password, OAuth, MFA) on its side;
+the application database only keeps the verified-identity mapping and the
+application role (see §6).
 
-### 3.2 `sessions`
+### 3.2 Why there is no `sessions` table
 
-Application-owned cookie session rows (auth implemented in Phase 3).
-
-| column | type | notes |
-|---|---|---|
-| `id` | uuid PK | |
-| `user_id` | uuid NOT NULL → `users.id` | ON DELETE CASCADE |
-| `token_hash` | text NOT NULL UNIQUE | hash of the opaque token; raw token never stored |
-| `expires_at` | timestamptz NOT NULL | |
-| `created_at` | timestamptz NOT NULL | |
-
-Indexed on `user_id` and `expires_at` (purge/query of expired sessions).
+Phase 2 modeled an application-owned cookie `sessions` table for the originally
+planned manual auth (Argon2id + opaque tokens). That design was replaced by
+Clerk (**ADR-013**): Clerk owns the session lifecycle (cookie/JWT issuance,
+refresh, revocation), and the API re-verifies every request with
+`authenticateRequest()`. Migration `0001_*.sql` therefore **drops** `sessions`.
+PostgreSQL is an application-data store, not an auth-session store; a second
+session table would have reintroduced exactly the manual-auth surface the
+decision removed (README "AI Usage" records the rejected suggestion).
+The story cast used the original Phase 2 `sessions` only in the discarded
+design; nothing depends on it today.
 
 ### 3.3 `vehicles`
 
@@ -196,7 +203,6 @@ writing history atomically with state changes is an application control.
 
 ```mermaid
 erDiagram
-    users ||--o{ sessions : "authenticates"
     users ||--o{ vehicles : "owns (driver)"
     users ||--o{ ride_requests : "submits (passenger)"
     users ||--o{ pools : "drives"
@@ -212,20 +218,13 @@ erDiagram
 
     users {
         uuid id PK
+        text clerk_user_id "unique, Clerk identity mapping"
         text name "not empty"
         text email "unique, lowercase"
-        text password_hash "argon2id (Phase 3)"
-        user_role role "PASSENGER | DRIVER"
+        user_role role "PASSENGER | DRIVER | ADMIN"
         boolean active
         timestamptz created_at
         timestamptz updated_at
-    }
-    sessions {
-        uuid id PK
-        uuid user_id FK
-        text token_hash "unique, opaque token hash"
-        timestamptz expires_at
-        timestamptz created_at
     }
     vehicles {
         uuid id PK
@@ -347,13 +346,13 @@ The app must set `capacity_snapshot = vehicle.capacity` when creating a pool
 Every ride-domain FK (`ride_requests`, `pools`, `pool_members`, `fares`,
 `ride_status_history`) uses `ON DELETE RESTRICT`: ride data is history and must
 stay explainable (`docs/requirements.md` §21.I); attempts to delete a user with
-rides fail loudly instead of silently destroying history. `sessions` and
-`vehicles` are user-owned infrastructure and use `ON DELETE CASCADE`.
+rides fail loudly instead of silently destroying history. `vehicles` are
+user-owned infrastructure and use `ON DELETE CASCADE`.
 
 ### 5.8 Email uniqueness is case-insensitive by construction
 Emails are stored lowercase (CHECK `email = lower(email)`) under a plain unique
 index, so `Nusrat@Example.com` and `nusrat@example.com` cannot both exist
-without a functional index. The app normalizes on write (Phase 3).
+without a functional index. The app normalizes on write (later phases).
 
 ### 5.9 No generic "audit" table
 The PRD marks audit **optional**. `ride_status_history` + fare snapshots already
@@ -376,6 +375,9 @@ express. The application enforces them in later phases; this list is the record:
   three-seat Tesla; the DB enforces positivity, matching logic enforces the cap.
 - **`status` values other than enum members** — the enum handles this one; all
   *transition* legality is app-enforced once a journal row exists.
+- **Role/authorization checks are never client-supplied** — a request
+  body/query can never set or override identity/role; the API resolves them from
+  the verified Clerk token + the `users` row (`docs/architecture.md` §3.2).
 
 ## 6. Constraints and Indexes (with rationale)
 
@@ -406,7 +408,7 @@ ones are explained inline in `src/db/schema.ts` and summarized here.
 | table | name | purpose |
 |---|---|---|
 | users | `users_email_unique` | one account per email |
-| sessions | `sessions_token_hash_unique` | token lookup is exact |
+| users | `users_clerk_user_id_unique` | **one app user per Clerk identity** (ADR-013) — prevents double registration and silent identity swaps |
 | zones | `zones_name_unique` | deterministic, named geography |
 | ride_requests | (none beyond PK) | requests are never unique by content |
 | pools | `pools_single_active_per_vehicle` (**partial**) | a Tesla runs at most one active pool — capacity + concurrency integrity |
@@ -417,7 +419,6 @@ ones are explained inline in `src/db/schema.ts` and summarized here.
 ### Plain indexes
 | table | name | purpose |
 |---|---|---|
-| sessions | `sessions_user_id_idx`, `sessions_expires_at_idx` | session lookups + expiry purge |
 | vehicles | `vehicles_driver_id_idx` | "my Teslas" |
 | vehicles | `vehicles_is_online_idx` (**partial**) | matching scans only consider online Teslas |
 | ride_requests | `ride_requests_passenger_history_idx` | passenger history (and passenger FK) |
@@ -438,9 +439,9 @@ the FK restriction.
 
 **What must hold:** Bullet has 1 seat left. Nusrat and Shirin both try to claim
 it at nearly the same instant; both may read `occupied = 2`, and exactly one of
-them may join. This is Phase 3/4+ work — the **service** that implements it does
-not exist yet; this section documents the planned approach against the schema
-we now have (PRD §12 and `docs/requirements.md` §14).
+them may join. This is post-auth pooling-phase work — the **service** that
+implements it does not exist yet; this section documents the planned approach
+against the schema we now have (PRD §12 and `docs/requirements.md` §14).
 
 **Planned strategy — DB-backed transactional consistency, database as truth:**
 
@@ -476,14 +477,21 @@ notes in `docs/requirements.md` §15.
 ## 8. Migrations and Seed
 
 ### Migration
-- Schema → migration via `drizzle-kit generate` (`npm run db:generate`),
-  produced `apps/api/drizzle/0000_whole_queen_noir.sql` (3 enums, 9 tables,
-  all CHECK/unique/index/partial-index statements). Generated SQL was reviewed
-  and is committed **unmodified** — no manual edits unless a documented reason
-  forces one.
+- Schema → migration via `drizzle-kit generate` (`npm run db:generate`).
+  `0000_whole_queen_noir.sql` created the Phase 2 schema (3 enums, 9 tables, all
+  CHECK/unique/index/partial-index statements). Phase 3 added
+  `0001_fluffy_lethal_legion.sql` (`ADD VALUE 'ADMIN'`, `DROP TABLE sessions
+  CASCADE`, `ADD COLUMN clerk_user_id NOT NULL` + unique constraint) and
+  `0002_greedy_ultimatum.sql` (`DROP COLUMN password_hash`). Generated SQL was
+  reviewed and is committed **unmodified** — no manual edits unless a
+  documented reason forces one.
 - Apply with `npm run db:migrate` (uses `apps/api/drizzle/meta/_journal.json`
   so it is incremental and idempotent; re-running is a no-op).
-- State: **applied successfully against the Docker PostgreSQL container.**
+- State: **applied successfully against the Docker PostgreSQL container**;
+  `db:generate` reports no schema drift.
+- Note: adding the Phase 3 NOT NULL column requires a fresh dev database
+  (`DROP DATABASE dhaka_tesla_pool WITH (FORCE)` + `CREATE DATABASE`, then
+  migrate + seed) — documented in the README.
 
 ### Seed (`npm run db:seed`)
 Deterministic, **idempotent** (inserts with `ON CONFLICT DO NOTHING`, never
@@ -496,9 +504,10 @@ deletes). Contents (the canonical PRD cast — see `src/db/seed.ts`):
 | zones | Banani, Gulshan 1, Mohakhali, Dhanmondi, Mirpur, Uttara, Farmgate, Bashundhara |
 
 IDs are fixed (deterministic) so tests and demos can reference Jashim/Bullet by
-a stable UUID. Seeded `password_hash` values are **documented development-only
-placeholders** (`dev-only-placeholder::...`); real Argon2id hashing and demo
-login arrive with the auth phase.
+a stable UUID. Seeded `clerk_user_id` values are **documented development-only
+placeholders** (`dev-only::seed::<email>`) — real Clerk identities start with
+`user_`, and the resolver rejects the reserved prefix (defense in depth). Demo
+logins arrive with the Clerk dashboard configuration.
 
 ## 9. Database Commands
 
@@ -520,8 +529,11 @@ npm run db:seed   -w @dhaka-tesla-pool/api    # idempotent cast seed
 5. A request cannot appear twice in the same pool — `UNIQUE(pool_id, ride_request_id)`. ✔ DB
 6. Occupied seats are derived from ACTIVE memberships — no cached counter. ✔ By design
 7. Occupied seats never exceed pool capacity — transactional `FOR UPDATE` +
-   derived sum (Phase 3/4 pooling service). ⏳ App (documented in §7)
+   derived sum (pooling phase service). ⏳ App (documented in §7)
 8. A completed/cancelled ride cannot move back to an earlier state — state
-   machine + `ride_status_history` (Phase 8). ⏳ App
+   machine + `ride_status_history` (later ride phase). ⏳ App
 9. Fare amounts cannot be negative — CHECK. ✔ DB
 10. Foreign keys always valid — FKs + restrictive delete policy. ✔ DB
+11. One app user per Clerk identity — `users.clerk_user_id` UNIQUE (ADR-013). ✔ DB
+12. Authenticated requests map to one verified local user with an app role —
+    bearer verification + `users.role` lookup (Phase 3, implemented). ✔ App + DB
