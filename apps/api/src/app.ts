@@ -4,6 +4,7 @@ import cors from "@fastify/cors";
 import { config } from "./config.js";
 import { authRoutes } from "./auth/routes.js";
 import { createClerkSessionVerifier } from "./auth/provider.js";
+import { provisionLocalUser } from "./auth/provision.js";
 import { resolveLocalUser } from "./auth/user-resolver.js";
 import type { AuthDependencies } from "./auth/identity.js";
 import { healthRoutes } from "./routes/health.js";
@@ -56,9 +57,11 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   app.register(healthRoutes, { prefix: "/" });
 
   // Everything under /api requires a verified Clerk session (bearer token).
+  // Unknown real identities are provisioned as PASSENGER users on first use.
   const authDeps: AuthDependencies = {
     verifySession: options.auth?.verifySession ?? createClerkSessionVerifier(),
     resolveLocalUser: options.auth?.resolveLocalUser ?? resolveLocalUser,
+    provisionLocalUser: options.auth?.provisionLocalUser ?? provisionLocalUser,
   };
   app.register(authRoutes, { deps: authDeps });
 
