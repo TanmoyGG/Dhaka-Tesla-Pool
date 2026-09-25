@@ -36,3 +36,17 @@ export class RideNotFoundError extends Error {
     this.name = "RideNotFoundError";
   }
 }
+
+// An explicit state-machine transition the ride is not allowed to make (e.g.
+// CANCELLING a COMPLETED ride, or a MATCHED ride with no membership). The
+// service REFUSES to make the write — the row on disk is never corrupted and a
+// passenger can never move another passenger's ride. Maps to 409.
+export class InvalidStateTransitionError extends Error {
+  readonly code = "INVALID_STATE_TRANSITION";
+  readonly statusCode = 409;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidStateTransitionError";
+  }
+}

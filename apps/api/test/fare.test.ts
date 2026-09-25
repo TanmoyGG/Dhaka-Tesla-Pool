@@ -7,9 +7,11 @@ import { describe, expect, it } from "vitest";
 import {
   computeInitialFare,
   haversineKm,
+  pooledDiscountPaisa,
   roundHalfUp,
   type ZonePoint,
 } from "../src/fare/calculate.js";
+import { POOLED_DISCOUNT_MIN_MEMBERS, POOLED_DISCOUNT_RATE } from "../src/fare/constants.js";
 import { SEED_ZONES } from "../src/db/seed.js";
 
 // Coordinates come from the seed itself (docs/database.md §2.4) so the tests
@@ -114,6 +116,46 @@ describe("fare estimate (Phase 4)", () => {
       expect(Number.isInteger(fare.distanceChargePaisa)).toBe(true);
       expect(fare.distanceChargePaisa).toBeGreaterThan(0);
       expect(fare.finalFarePaisa).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("pooled discount (Phase 5, ADR-017)", () => {
+  it("freezes the discount rule at 25% for 2+ members", () => {
+    expect(POOLED_DISCOUNT_RATE).toBe(0.25);
+    expect(POOLED_DISCOUNT_MIN_MEMBERS).toBe(2);
+  });
+
+  it("computes Nusrat's pooled fare: 5932 - 1483 = 4449 paisa", () => {
+    expect(pooledDiscountPaisa(3000, 2932)).toBe(1483);
+    expect(3000 + 2932 - pooledDiscountPaisa(3000, 2932)).toBe(4449);
+  });
+
+  it("computes Rafiq's pooled fare: 4140 - 1035 = 3105 paisa", () => {
+    expect(pooledDiscountPaisa(3000, 1140)).toBe(1035);
+    expect(3000 + 1140 - pooledDiscountPaisa(3000, 1140)).toBe(3105);
+  });
+
+it("rounds half-up to whole paisa deterministically", () => {
+    // 0.25 * 6000 = 1500; boundaries are exact.
+    expect(pooledDiscountPaisa(2000, 4000)).toBe(1500);
+    // 0.25 * 3001 = 750.25 -> 750 (a quarter-paisa remainder drops).
+    expect(pooledDiscountPaisa(2000, 1001)).toBe(750);
+    // 0.25 * (1000 + 1) = 250.25 -> 250; 0.25 * 1001 = 250.25.
+    expect(pooledDiscountPaisa(1000, 1)).toBe(250);
+  });
+
+  it("always keeps final = base + distance - discount (DB invariant)", () => {
+    for (const [base, distance] of [
+      [3000, 2932],
+      [3000, 1140],
+      [5000, 999],
+      [1, 1],
+    ] as const) {
+      const discount = pooledDiscountPaisa(base, distance);
+      expect(discount).toBeGreaterThanOrEqual(0);
+      expect(base + distance - discount).toBeGreaterThanOrEqual(0);
+      expect(Number.isInteger(discount)).toBe(true);
     }
   });
 });

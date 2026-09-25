@@ -133,9 +133,18 @@ flowchart LR
   reads scoped to the caller. Request/params validation on routes uses **Zod**
   (strict schemas); the JSON error envelope gains an additive `details` array
   (ADR-015).
-- Later phases: pool creation/matching, ride state machine, capacity
-  enforcement via transactional seat allocation (`SELECT … FOR UPDATE` +
-  constraint checks), pooling-fare recompute of the existing fare row.
+- Phase 5 (complete): `src/matching/rules.ts` — pure, deterministic matching
+  rule (same pickup zone + all-pairs drop-off spread ≤ 2.0 km + capacity;
+  fullest pool first; ADR-016). `src/rides/state.ts` — the single-source
+  transition map; invalid moves raise `409 INVALID_STATE_TRANSITION`
+  (`src/rides/errors.ts`). `src/rides/pooling/` (`service.ts` + `fare.ts`) —
+  transactional seat claims (`SELECT … FOR UPDATE` on the pool row + derived
+  occupancy), `INSERT … ON CONFLICT DO NOTHING RETURNING` pool creation with a
+  bounded re-scan, create-time auto-match (ride + membership + history commit
+  together), in-place per-member pooled-fare recompute, passenger cancel
+  (`POST /api/rides/:rideId/cancel`) and service-only forced-cancel with full
+  refund (ADR-017/018). `src/db/types.ts` — structural `DbTransaction`.
+  `fares.updated_at` added by migration 0004 (additive).
 
 ### 3.3 Database (PostgreSQL)
 - Phase 1: PostgreSQL 16 in Docker Compose (healthcheck + persistent named
@@ -157,9 +166,13 @@ flowchart LR
   0003) backs idempotent ride creation; `fares` is now written at creation as
   the per-seat initial estimate (discount 0) — a snapshot the pooling phase
   recomputes in place when a ride joins a pool.
-- Later phases: single source of truth for ride behavior; capacity enforcement
-  via transactional seat allocation (`SELECT … FOR UPDATE` + derived occupancy
-  sum), pooled-fare recompute.
+- Phase 5 (complete): `fares.updated_at` (migration `0004`, additive) audits
+  the in-place pooling recompute; pools/pool_members and their partial unique
+  indexes already existed (Phase 2, ADR-012), so pooling required **no** new
+  table.
+- Later phases: single source of truth for ride behavior; driver-flow
+  transitions (`DRIVER_ARRIVED → STARTED → COMPLETED`) on the declared state
+  map.
 - Occupied seats are always **derived** from ACTIVE `pool_members` rows — there
   is no cached "available seats" counter. Concurrency approach documented in
   `docs/database.md` §7.
@@ -173,6 +186,7 @@ flowchart LR
 | `POST /api/rides` (API) | `PASSENGER` | `requireAuth` + `requireRole(["PASSENGER"])` + strict Zod body |
 | `GET /api/rides` (API) | `PASSENGER` (own rides only) | `requireAuth` + `requireRole(["PASSENGER"])` |
 | `GET /api/rides/:rideId` (API) | `PASSENGER` (owner); 404 otherwise | `requireAuth` + `requireRole(["PASSENGER"])` + owner check |
+| `POST /api/rides/:rideId/cancel` (API) | `PASSENGER` (owner); 404 or 409 otherwise | `requireAuth` + `requireRole(["PASSENGER"])` + owner/state checks (Phase 5) |
 | `GET /api/zones` (API) | Signed-in user (any role) | Auth plugin preHandler (bearer token) + `requireAuth` |
 | `/` , `/sign-in`, `/sign-up` (web) | **Public** | Clerk middleware (no protection) |
 | `/account*` (web) | Signed-in user | Clerk middleware redirects to `/sign-in` |
@@ -292,9 +306,10 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-013,
   `/sign-in`, `/health` 200); unprovisioned Clerk yields the documented
   `AUTH_CONFIGURATION` error on authenticated routes.
 
-Not yet implemented (later phases): ride/booking UI (web), pool matching
-(`SELECT … FOR UPDATE` seat allocation), ride state machine, pooled-fare
-recompute, drivers, map visualization, deployment to Vercel/Render/Neon.
+Not yet implemented (later phases): ride/booking UI (web), driver flow
+(`DRIVER_ARRIVED → STARTED → COMPLETED`), drivers, map visualization,
+deployment to Vercel/Render/Neon. Pool matching, the ride state machine, and
+pooled-fare recompute are implemented in Phase 5 (§12).
 
 ## 11. Implementation Status (Phase 4 — ride requests & fare estimation)
 
@@ -320,3 +335,51 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-015,
   — full suite 83/83 with `fileParallelism: false` (shared disposable test
   database). Migration 0003 applied to the Docker dev DB; `db:generate` reports
   no drift.
+
+## 12. Implementation Status (Phase 5 — pool matching, lifecycle & concurrency)
+
+Implemented and verified (see [docs/decisions.md](decisions.md) ADR-016/017/018,
+[docs/database.md](database.md) §7, [docs/requirements.md](requirements.md) §21):
+
+- **Matching** (`apps/api/src/matching/rules.ts`): pure, deterministic rule —
+  same pickup zone + all-pairs drop-off spread ≤ 2.0 km + `occupied +
+  requested ≤ capacity_snapshot`; best eligible pool = fullest → newest → stable
+  id; an eligible pool always beats a new one; Tesla pick is also deterministic.
+  Nusrat + Rafiq pool (spread ≈ 1.906 km); Dhanmondi does not (≈ 4.6 km).
+- **State machine** (`apps/api/src/rides/state.ts`): single transition map for
+  the whole PRD lifecycle; every service transition goes through `canTransition`;
+  illegal moves surface as `409 INVALID_STATE_TRANSITION` (Fastify built-in
+  error envelope). `REQUESTED → MATCHED` and cancellations are Phase 5-exercised;
+  `DRIVER_ARRIVED → STARTED → COMPLETED` are declared and driver-phase-exercised.
+- **Auto-match** (`src/rides/pooling/service.ts`): `createRideRequest` runs the
+  match *inside its own transaction* — ride + fare + history + membership +
+  pool_id commit atomically; a request either joins the best pool or starts a new
+  `MATCHED` pool (no driver accept in Phase 5, ADR-016).
+- **Seat-claim concurrency (ADR-017)**: occupancy is always derived
+  (`SUM(seats) WHERE status='ACTIVE'`); a claim `SELECT … FOR UPDATE`s the pool
+  row, re-derives under the lock, and only joins when the assertion passes;
+  pool creation uses `INSERT … ON CONFLICT DO NOTHING RETURNING` plus exactly one
+  bounded re-scan, so two concurrent first-seat requests end MATCHED in the
+  **same** pool and two concurrent last-seat claims never exceed Bullet's 3
+  seats. Lock order (ride → pool) is consistent across match/cancel/force-cancel,
+  so no deadlock.
+- **In-place pooled fare** (`src/rides/pooling/fare.ts`): ≥ 2 ACTIVE members ⇒
+  every member's fare row recomputed in place (25% off base+distance, rounded
+  half-up; `fares.updated_at` from migration 0004); solo pool stays at full fare.
+  Nusrat 4449 / Rafiq 3105 paisa — pinned.
+- **Cancellation** (`POST /api/rides/:rideId/cancel`): owner-only (404
+  otherwise), legal in REQUESTED/MATCHED, else 409. MATCHED cancels flip
+  membership to `LEFT`, recompute remaining fares, cancel an emptied pool.
+  `forceCancelRide(rideId)` (service only, ADR-018) = cancel + full refund
+  through the discount term (`final = 0`), CHECKs still hold. No `cancel_reason`.
+- **Ride view** gained an additive `pool` object (id/status/vehicle/driver/
+  capacitySnapshot/occupiedSeats) computed via a correlated ACTIVE-membership
+  subquery — history of exactly the Phase 4 shape stays intact.
+- **Validation/tests**: full suite **122/122** (8 files), root lint + typecheck +
+  build (API + Next.js web) green; migration 0004 applied to the Docker dev DB;
+  `db:generate` reports no drift; `docker compose config` valid. Concurrency is
+  proven with two independent PostgreSQL connections, including the canonical
+  race — Bullet pre-filled to 2 seats, Rafiq vs Shirin both claiming the last
+  seat: exactly one MATCHED, one stays REQUESTED, occupancy always 3.
+- Pending (later phases): driver accept/arrived/started/complete, payments,
+  frontend pooling UX.

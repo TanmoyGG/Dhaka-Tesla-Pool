@@ -24,6 +24,7 @@ import {
   FARE_CURRENCY,
   FARE_PER_KM_PAISA,
   FARE_ROAD_FACTOR,
+  POOLED_DISCOUNT_RATE,
 } from "./constants.js";
 
 export interface ZonePoint {
@@ -52,6 +53,21 @@ export function roundHalfUp(value: number): number {
 }
 
 export const DEFAULT_POOL_DISCOUNT_PAISA = 0;
+
+// The pooled discount: POOLED_DISCOUNT_RATE (25%) of (base + distance),
+// rounded round-half-up. Applied per seat when a pool has >=
+// POOLED_DISCOUNT_MIN_MEMBERS ACTIVE members (ADR-017). Because 0.25 is exact
+// in binary and the inputs are integers, the result is deterministic:
+//   Nusrat Banani→Mohakhali (3000 + 2932) -> 1483,  final 4449
+//   Rafiq  Banani→Gulshan 1  (3000 + 1140) -> 1035,  final 3105
+export function pooledDiscountPaisa(
+  baseFarePaisa: number,
+  distanceChargePaisa: number,
+): number {
+  return roundHalfUp(
+    (baseFarePaisa + distanceChargePaisa) * POOLED_DISCOUNT_RATE,
+  );
+}
 
 export interface FareEstimate {
   currency: typeof FARE_CURRENCY;

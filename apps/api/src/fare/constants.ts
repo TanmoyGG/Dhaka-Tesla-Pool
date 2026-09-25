@@ -20,3 +20,11 @@ export const FARE_CURRENCY = "BDT";
 // MVP Tesla capacity: a passenger may request at most this many seats. Backed
 // by the zod schema; the database enforces only positivity.
 export const MAX_REQUESTED_SEATS = 3;
+
+// Pooled-fare discount (ADR-016/017, docs/requirements.md §21.D): when a pool
+// has at least POOLED_DISCOUNT_MIN_MEMBERS ACTIVE members, every ACTIVE
+// member's fare is reduced by POOLED_DISCOUNT_RATE of (base + distance).
+// 0.25 is exact in binary multiplication for the paisa sizes we handle, so
+// pooledDiscountPaisa stays deterministic.
+export const POOLED_DISCOUNT_RATE = 0.25;
+export const POOLED_DISCOUNT_MIN_MEMBERS = 2;

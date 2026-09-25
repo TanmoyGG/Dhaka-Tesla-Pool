@@ -387,6 +387,12 @@ export const fares = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
+    // Set by the pooling service every time the fare row is recomputed in
+    // place (join/leave/force-cancel), so the audit trail can tell WHO
+    // recomputed a snapshot and WHEN (migration 0004, ADR-017).
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
   },
   (table) => [
     // No negative money anywhere in the fare row.
