@@ -17,6 +17,7 @@ import { buildApp } from "../src/app.js";
 import { authRoutes } from "../src/auth/routes.js";
 import { installAuthContext } from "../src/auth/install.js";
 import {
+  ProvisioningError,
   seedClerkUserId,
   type AuthDependencies,
   type AuthUser,
@@ -44,9 +45,12 @@ function makeUser(overrides: Partial<AuthUser> = {}): AuthUser {
   };
 }
 
-// Deterministic fakes for the two injectable auth boundaries. Tokens are fixed
-// strings so the behavioral matrix is explicit and repeatable.
-function makeDeps(): AuthDependencies {
+// Deterministic fakes for the three injectable auth boundaries. Tokens are fixed
+// strings so the behavioral matrix is explicit and repeatable. Unknown real
+// identities are provisioned on first use (ADR-014): the fake models the
+// production contract — provisioned users are PASSENGER/active with the
+// identity's own name/email.
+function makeDeps(overrides: Partial<AuthDependencies> = {}): AuthDependencies {
   const usersByClerkId = new Map<string, AuthUser>([
     [CLERK_PASSENGER, makeUser()],
     [
@@ -90,6 +94,21 @@ function makeDeps(): AuthDependencies {
     },
     resolveLocalUser: async (clerkUserId) =>
       usersByClerkId.get(clerkUserId) ?? null,
+    provisionLocalUser: async (clerkUserId) => {
+      const existing = usersByClerkId.get(clerkUserId);
+      if (existing) {
+        return existing;
+      }
+      const provisioned = makeUser({
+        clerkUserId,
+        name: `Auto-Provisioned ${clerkUserId}`,
+        email: `${clerkUserId.toLowerCase()}@provisioned.example`,
+      });
+      // Provisioning persists the user so a later request resolves it.
+      usersByClerkId.set(clerkUserId, provisioned);
+      return provisioned;
+    },
+    ...overrides,
   };
 }
 
@@ -171,15 +190,64 @@ describe("authentication (Clerk)", () => {
     expect(JSON.stringify(res.json())).not.toContain(CLERK_PASSENGER);
   });
 
-  it("rejects a valid Clerk session with no local user (no silent provisioning)", async () => {
+  it("provisions a new local user on first request (PASSENGER, active)", async () => {
+    // ADR-014: a valid real Clerk identity with no local user is provisioned
+    // on first use, from its verified Clerk profile (default PASSENGER).
     const app = buildApp({ auth: makeDeps() });
     const res = await app.inject({
       method: "GET",
       url: "/api/me",
       headers: { authorization: "Bearer tok-unknown" },
     });
-    expect(res.statusCode).toBe(403);
-    expect(res.json()).toMatchObject({ error: { code: "AUTH_USER_NOT_FOUND" } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().user).toMatchObject({
+      name: `Auto-Provisioned ${CLERK_UNKNOWN}`,
+      email: `${CLERK_UNKNOWN.toLowerCase()}@provisioned.example`,
+      role: "PASSENGER",
+      active: true,
+    });
+    expect(res.json().user).toHaveProperty("id");
+    expect(res.json().user).not.toHaveProperty("clerkUserId");
+  });
+
+  it("provisions an identity exactly once across requests", async () => {
+    const deps = makeDeps();
+    const app = buildApp({ auth: deps });
+    const first = await app.inject({
+      method: "GET",
+      url: "/api/me",
+      headers: { authorization: "Bearer tok-unknown" },
+    });
+    const second = await app.inject({
+      method: "GET",
+      url: "/api/me",
+      headers: { authorization: "Bearer tok-unknown" },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    // The second request resolves the already-provisioned row instead of
+    // creating a duplicate.
+    expect(second.json().user.id).toBe(first.json().user.id);
+  });
+
+  it("fails closed with AUTH_PROVISION_FAILED when provisioning cannot complete", async () => {
+    // e.g. the Clerk profile fetch fails, the email is already registered, or
+    // provisioning is otherwise aborted: 500 + the provisioning error code.
+    const deps = makeDeps({
+      provisionLocalUser: async () => {
+        throw new ProvisioningError(
+          "The Clerk profile for the identity could not be loaded.",
+        );
+      },
+    });
+    const app = buildApp({ auth: deps });
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/me",
+      headers: { authorization: "Bearer tok-unknown" },
+    });
+    expect(res.statusCode).toBe(500);
+    expect(res.json()).toMatchObject({ error: { code: "AUTH_PROVISION_FAILED" } });
   });
 
   it("rejects an inactive local user with 403", async () => {
@@ -304,6 +372,46 @@ describe("identity never comes from the request body", () => {
     });
     // The session role (stored in PostgreSQL) governs; body role is inert.
     expect(res.json().authUserId).toBe(SEED_NUSRAT_ID);
+  });
+
+  it("provisions from the verified Clerk identity, never from client-supplied profile values", async () => {
+    // A brand-new identity arrives with a hostile body (a role, a display
+    // name, an email). None of it may reach the provisioned application user:
+    // the role is always the PASSENGER default... and the name/email come from
+    // the verified Clerk profile, not the request.
+    let provisioned: AuthUser | null = null;
+    const deps = makeDeps({
+      provisionLocalUser: async (clerkUserId) => {
+        provisioned = makeUser({
+          clerkUserId,
+          name: "Verified Clerk Username",
+          email: "verified@example.com",
+        });
+        return provisioned;
+      },
+    });
+    const app = buildRoleTestApp(deps);
+    const res = await app.inject({
+      method: "POST",
+      url: "/whoami",
+      headers: { authorization: "Bearer tok-unknown" },
+      payload: {
+        userId: "evil-user-id",
+        role: "ADMIN",
+        name: "Evil Name",
+        email: "evil@example.com",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().authUserId).not.toBe("evil-user-id");
+    expect(res.json().bodyUserId).toBe("evil-user-id");
+    expect(provisioned).toMatchObject({
+      clerkUserId: CLERK_UNKNOWN,
+      name: "Verified Clerk Username",
+      email: "verified@example.com",
+      role: "PASSENGER",
+      active: true,
+    });
   });
 });
 
