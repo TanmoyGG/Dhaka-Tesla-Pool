@@ -16,14 +16,18 @@
 // Without a key, repeated submissions create new rides (documented MVP
 // behavior).
 
-import { and, desc, eq, type SQL } from "drizzle-orm";
+import { and, desc, eq, sql, type SQL } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { AuthUser } from "../auth/identity.js";
 import type { AppDatabase } from "../db/index.js";
 import {
   fares,
+  poolMembers,
+  pools,
   rideRequests,
   rideStatusHistory,
+  users,
+  vehicles,
   zones,
 } from "../db/schema.js";
 import {
@@ -31,6 +35,7 @@ import {
   type ZonePoint,
 } from "../fare/calculate.js";
 import { MAX_REQUESTED_SEATS } from "../fare/constants.js";
+import { createPoolingService, type PoolingService } from "./pooling/service.js";
 import { RideNotFoundError, RideValidationError } from "./errors.js";
 
 // Zone rows carry the coordinates the fare estimate needs (plain lat/long
@@ -63,6 +68,22 @@ export interface FareView {
   estimatedTotalPaisa: number;
 }
 
+// Summary of the pool a ride belongs to (null while the request is
+// REQUESTED). Phase 5 pools are only ever MATCHED or CANCELLED.
+export interface RidePoolView {
+  id: string;
+  status: typeof pools.$inferSelect["status"];
+  capacitySnapshot: number;
+  // Derived occupancy (ACTIVE members only), recomputed per read.
+  occupiedSeats: number;
+  vehicleId: string;
+  vehicleName: string;
+  driverId: string;
+  driverName: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 export interface RideView {
   id: string;
   status: typeof rideRequests.$inferSelect["status"];
@@ -70,6 +91,7 @@ export interface RideView {
   destinationZone: ZoneView;
   requestedSeats: number;
   fare: FareView;
+  pool: RidePoolView | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -122,11 +144,48 @@ function fareView(
   };
 }
 
-interface RideJoinShape {
+interface RidePoolJoinShape {
+  // drizzle types every column of a `.leftJoin` as nullable; a full row of
+  // NULLs means the ride has no pool yet (toPoolView collapses that).
+  pool?: {
+    id: string | null;
+    status: typeof pools.$inferSelect["status"] | null;
+    capacitySnapshot: number | null;
+    createdAt: Date | null;
+    updatedAt: Date | null;
+    vehicleId: string | null;
+    vehicleName: string | null;
+    driverId: string | null;
+    driverName: string | null;
+    occupiedSeats: number | null;
+  };
+}
+
+interface RideJoinShape extends RidePoolJoinShape {
   ride: typeof rideRequests.$inferSelect;
   fare: typeof fares.$inferSelect;
   pickup: typeof zones.$inferSelect;
   destination: typeof zones.$inferSelect;
+}
+
+function toPoolView(
+  pool: RidePoolJoinShape["pool"],
+): RidePoolView | null {
+  // All fields come from the same left-joined row: id present ⇒ the rest are
+  // too (the nullable typing is drizzle's join-bookkeeping, not real data).
+  if (!pool?.id) return null;
+  return {
+    id: pool.id,
+    status: pool.status!,
+    capacitySnapshot: pool.capacitySnapshot!,
+    occupiedSeats: pool.occupiedSeats!,
+    vehicleId: pool.vehicleId!,
+    vehicleName: pool.vehicleName!,
+    driverId: pool.driverId!,
+    driverName: pool.driverName!,
+    createdAt: pool.createdAt!,
+    updatedAt: pool.updatedAt!,
+  };
 }
 
 function toRideView(row: RideJoinShape): RideView {
@@ -137,6 +196,7 @@ function toRideView(row: RideJoinShape): RideView {
     destinationZone: zoneView(row.destination),
     requestedSeats: row.ride.requestedSeats,
     fare: fareView(row.fare, row.ride.requestedSeats),
+    pool: toPoolView(row.pool),
     createdAt: row.ride.createdAt,
     updatedAt: row.ride.updatedAt,
   };
@@ -151,6 +211,9 @@ export interface RideServiceOptions {
   // failure inside the create transaction (atomicity proof). Defaults to the
   // deterministic computeInitialFare.
   computeFare?: typeof computeInitialFare;
+  // Injectable seam for the pooling behaviour (real implementation, or the
+  // throwing-recompute variant used by the rollback tests).
+  pooling?: PoolingService;
 }
 
 export function createRideService(
@@ -158,10 +221,12 @@ export function createRideService(
   options: RideServiceOptions = {},
 ) {
   const estimateFare = options.computeFare ?? computeInitialFare;
+  const pooling = options.pooling ?? createPoolingService({ database });
 
   type RideWhere = SQL<unknown> | undefined;
 
-  // Join a ride request with its fare and both zones in one query.
+  // Join a ride request with its fare, both zones, and (left) its pool. The
+  // pool occupancy is a derived read (ACTIVE members only) — no cached counter.
   function loadRideWhere(where: RideWhere) {
     return database
       .select({
@@ -169,6 +234,18 @@ export function createRideService(
         fare: fares,
         pickup: pickupZone,
         destination: destinationZone,
+        pool: {
+          id: pools.id,
+          status: pools.status,
+          capacitySnapshot: pools.capacitySnapshot,
+          createdAt: pools.createdAt,
+          updatedAt: pools.updatedAt,
+          vehicleId: vehicles.id,
+          vehicleName: vehicles.name,
+          driverId: users.id,
+          driverName: users.name,
+          occupiedSeats: sql<number>`coalesce((select sum(${poolMembers.seats}) from ${poolMembers} where ${poolMembers.poolId} = ${pools.id} and ${poolMembers.status} = 'ACTIVE'), 0)::int`,
+        },
       })
       .from(rideRequests)
       .innerJoin(fares, eq(fares.rideRequestId, rideRequests.id))
@@ -177,6 +254,9 @@ export function createRideService(
         destinationZone,
         eq(destinationZone.id, rideRequests.destinationZoneId),
       )
+      .leftJoin(pools, eq(pools.id, rideRequests.poolId))
+      .leftJoin(vehicles, eq(vehicles.id, pools.vehicleId))
+      .leftJoin(users, eq(users.id, pools.driverId))
       .where(where);
   }
 
@@ -221,9 +301,12 @@ export function createRideService(
     }
 
     try {
-      // One transaction: ride + fare + initial status-history entry commit
-      // together, or not at all.
-      const ride = await database.transaction(async (tx) => {
+      // One transaction: ride + fare + initial status-history entry + the
+      // automatch (pool membership, REQUESTED→MATCHED journal, in-place fare
+      // recompute) commit together, or not at all. A ride can never exist
+      // without its fare estimate, and a match can never leave a dangling
+      // membership if something later fails.
+      const { rideId } = await database.transaction(async (tx) => {
         const [pickup] = await tx
           .select()
           .from(zones)
@@ -278,28 +361,29 @@ export function createRideService(
           currency: estimate.currency,
         });
 
-        // First journal entry: NULL → REQUESTED. The state machine records the
-        // remaining transitions in a later phase (docs/requirements.md §4).
+        // First journal entry: NULL → REQUESTED (docs/requirements.md §4).
         await tx.insert(rideStatusHistory).values({
           rideRequestId: inserted.id,
           fromStatus: null,
           status: "REQUESTED",
         });
 
-        return toRideView({
-          ride: inserted,
-          fare: {
-            ...estimate,
-            id: "unused",
-            rideRequestId: inserted.id,
-            createdAt: new Date(0),
-          } as typeof fares.$inferSelect,
-          pickup,
-          destination,
-        });
+        // Phase 5 automatch: joins an eligible existing pool, or creates one
+        // on an available Tesla. On failure the whole transaction rolls back.
+        await pooling.matchRide(tx, inserted.id);
+
+        return { rideId: inserted.id };
       });
 
-      return { ride, created: true };
+      // Re-read AFTER commit so the response reflects the final matched state
+      // (status, pool summary, recomputed pooled fare).
+      const [row] = await loadRideWhere(
+        and(eq(rideRequests.id, rideId), eq(rideRequests.passengerId, passenger.id)),
+      );
+      if (!row) {
+        throw new RideNotFoundError();
+      }
+      return { ride: toRideView(row), created: true };
     } catch (error) {
       // Concurrent duplicate for the same (passenger, key): the partial unique
       // index (migration 0003) let exactly one row through; the loser rolls
@@ -351,11 +435,34 @@ export function createRideService(
       .map((zone) => zoneView(zone));
   }
 
+  // Passenger-initiated cancellation (docs/requirements.md §21.B). The pooling
+  // service validates the transition (409 on an illegal one) and, for a MATCHED
+  // ride, frees the seat, recomputes remaining fares, and terminates an emptied
+  // pool — all in one transaction. Returns the ride AFTER the cancellation so
+  // the client sees the final state.
+  async function cancelRequest(
+    passenger: AuthUser,
+    rideId: string,
+  ): Promise<RideView> {
+    await pooling.cancelRide(passenger.id, rideId);
+    const [row] = await loadRideWhere(
+      and(
+        eq(rideRequests.id, rideId),
+        eq(rideRequests.passengerId, passenger.id),
+      ),
+    );
+    if (!row) {
+      throw new RideNotFoundError();
+    }
+    return toRideView(row);
+  }
+
   return {
     createRequest,
     getOwnedRide,
     listOwnedRides,
     listZones,
+    cancelRequest,
   };
 }
 

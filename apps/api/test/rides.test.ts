@@ -167,7 +167,7 @@ describeDb("ride requests (Phase 4)", () => {
     );
   });
 
-  it("creates Nusrat's ride with the correct REQUESTED state and estimated fare", async () => {
+  it("creates Nusrat's ride, automatched into a new pool on Bullet (Phase 5)", async () => {
     const res = await app.inject({
       method: "POST",
       url: "/api/rides",
@@ -177,11 +177,15 @@ describeDb("ride requests (Phase 4)", () => {
     expect(res.statusCode).toBe(201);
     const { ride } = res.json();
 
-    expect(ride.status).toBe("REQUESTED");
+    // Auto-match: this FIRST request found no eligible pool and created one on
+    // Bullet (Jashim's online Tesla), so the ride is MATCHED immediately.
+    expect(ride.status).toBe("MATCHED");
     expect(ride.pickupZone.name).toBe("Banani");
     expect(ride.destinationZone.name).toBe("Mohakhali");
     expect(ride.requestedSeats).toBe(1);
-    // Hand-computed estimate (ADR-015 §C, see test/fare.test.ts): BDT 59.32.
+
+    // Single-member pool: no pooled discount (ADR-017), Nusrat keeps the
+    // hand-computed Phase 4 estimate (BDT 59.32). See test/fare.test.ts.
     expect(ride.fare).toEqual({
       currency: "BDT",
       baseFarePaisa: 3000,
@@ -192,28 +196,46 @@ describeDb("ride requests (Phase 4)", () => {
       estimatedTotalPaisa: 5932,
     });
 
-    // The DB row is a REQUESTED ride with no pool, owned by Nusrat.
+    expect(ride.pool).toMatchObject({
+      status: "MATCHED",
+      capacitySnapshot: 3,
+      occupiedSeats: 1,
+      vehicleName: "Bullet",
+      driverName: "Jashim Ahmed",
+    });
+
+    // The DB row is a MATCHED ride inside a pool, owned by Nusrat.
     const [row] = await db
       .select()
       .from(rideRequests)
       .where(eq(rideRequests.id, ride.id));
     expect(row?.passengerId).toBe(SEED_IDS.nusrat);
-    expect(row?.status).toBe("REQUESTED");
-    expect(row?.poolId).toBeNull();
+    expect(row?.status).toBe("MATCHED");
+    expect(row?.poolId).toBe(ride.pool.id);
     expect(row?.clientRequestId).toBeNull();
 
-    // Fare + first journal entry (NULL → REQUESTED) exist atomically.
+    // Fare + both journal entries (NULL → REQUESTED, REQUESTED → MATCHED).
     const [fareRow] = await db
       .select()
       .from(fares)
       .where(eq(fares.rideRequestId, ride.id));
     expect(fareRow?.finalFarePaisa).toBe(5932);
-    const [historyRow] = await db
+    const historyRows = await db
       .select()
       .from(rideStatusHistory)
-      .where(eq(rideStatusHistory.rideRequestId, ride.id));
-    expect(historyRow?.fromStatus).toBeNull();
-    expect(historyRow?.status).toBe("REQUESTED");
+      .where(eq(rideStatusHistory.rideRequestId, ride.id))
+      .orderBy(rideStatusHistory.createdAt, rideStatusHistory.id);
+    // Both journal rows are written inside ONE transaction, so they share the
+    // same created_at timestamp (Postgres now() is fixed per transaction) and
+    // the id tiebreak is a random uuid — assert the transition chain instead
+    // of relying on row order: first NULL → REQUESTED, then REQUESTED → MATCHED.
+    const historyStatuses = historyRows.map((h) => h.status);
+    expect(historyStatuses).toEqual(
+      expect.arrayContaining(["REQUESTED", "MATCHED"]),
+    );
+    expect(new Set(historyStatuses).size).toBe(2);
+    expect(historyRows.find((h) => h.status === "REQUESTED")?.fromStatus).toBeNull();
+    expect(historyRows.find((h) => h.status === "MATCHED")?.fromStatus).toBe("REQUESTED");
   });
 
   it("scales the estimated total by the requested seats (stored components per seat)", async () => {
@@ -226,8 +248,21 @@ describeDb("ride requests (Phase 4)", () => {
     expect(res.statusCode).toBe(201);
     const { ride } = res.json();
     expect(ride.requestedSeats).toBe(2);
-    expect(ride.fare.finalFarePaisa).toBe(5932);
-    expect(ride.fare.estimatedTotalPaisa).toBe(11864);
+
+    // This second ride joins the pool the previous test created, so the pool
+    // now holds TWO ACTIVE members and both rides get the 25 % pooled
+    // discount: 3000 + 2932 - round(1482.97…) = 5932 - 1483 = 4449/seat.
+    expect(ride.fare.baseFarePaisa).toBe(3000);
+    expect(ride.fare.distanceChargePaisa).toBe(2932);
+    expect(ride.fare.poolDiscountPaisa).toBe(1483);
+    expect(ride.fare.finalFarePaisa).toBe(4449);
+    expect(ride.fare.estimatedTotalPaisa).toBe(8898);
+
+    // Still fit the pool from the previous test (1 seat) without exceeding
+    // Bullet's 3-seat capacity.
+    expect(ride.status).toBe("MATCHED");
+    expect(ride.pool?.capacitySnapshot).toBe(3);
+    expect(ride.pool!.occupiedSeats).toBe(3);
   });
 
   it("replays an idempotent retry (same clientRequestId) instead of duplicating", async () => {
