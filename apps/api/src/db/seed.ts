@@ -10,9 +10,15 @@
 // No rides, pools, or memberships are seeded — those arrive with the ride
 // features.
 //
-// Passwords: the auth phase (Phase 3) is not implemented yet, so there are no
-// real Argon2id hashes. The seeded password_hash values are explicit, clearly
-// marked placeholders; demo login will be wired up in the auth phase.
+// Authentication is owned by Clerk (see docs/decisions.md ADR-013). The
+// application never stores passwords. The seeded users carry a reserved
+// development-only `clerk_user_id` placeholder (see
+// src/auth/identity.ts RESERVED_CLERK_USER_ID_PREFIX). A real Clerk identity
+// can never collide with a placeholder (real IDs start with "user_"), and the
+// auth resolver rejects reserved IDs outright, so a placeholder is never
+// treated as an authenticated identity. To use a seeded character in a live
+// demo, create the person in Clerk and map their real Clerk user ID to the
+// local row (documented in README "Authentication").
 //
 // Database schema must exist first: run `npm run db:migrate` (once) before
 // `npm run db:seed`.
@@ -21,6 +27,7 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import { pathToFileURL } from "node:url";
 import { config } from "../config.js";
+import { seedClerkUserId } from "../auth/identity.js";
 import { users, vehicles, zones } from "./schema.js";
 
 // Fixed, deterministic UUIDs (valid v4-format). Grouped by prefix for
@@ -43,11 +50,6 @@ export const SEED_ZONE_IDS = {
   farmgate: "c3000000-0000-4000-8000-000000000007",
   bashundhara: "c3000000-0000-4000-8000-000000000008",
 } as const;
-
-// Development-only placeholder. Real hashing (Argon2id) lands in Phase 3; at
-// that point login will be enabled with documented demo credentials.
-export const SEED_PLACEHOLDER_PASSWORD_HASH =
-  "dev-only-placeholder::argon2id-hash-arrives-in-auth-phase";
 
 export const SEED_USERS: Array<{
   id: string;
@@ -161,9 +163,9 @@ export async function runSeed(
     await db.insert(users).values(
       SEED_USERS.map((user) => ({
         id: user.id,
+        clerkUserId: seedClerkUserId(user.email),
         name: user.name,
         email: user.email,
-        passwordHash: SEED_PLACEHOLDER_PASSWORD_HASH,
         role: user.role,
         active: true,
       })),

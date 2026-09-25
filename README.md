@@ -5,12 +5,20 @@
 ## Status
 
 **Phase 2 — Database schema, migrations, and seed: complete.** The full
-relational schema is implemented and migrated (users, sessions, vehicles,
-zones, ride requests, pools, memberships, fares, ride-status history), seeded
-with the PRD cast (Jashim + Bullet, Nusrat, Rafiq, Shirin and 8 Dhaka zones),
-and covered by 21 schema-integration tests. See
-[docs/database.md](docs/database.md). **No business features are implemented
-yet** — auth, rides, pools, and fares arrive in later phases per
+relational schema is implemented and migrated (users, vehicles, zones, ride
+requests, pools, memberships, fares, ride-status history), seeded with the PRD
+cast (Jashim + Bullet, Nusrat, Rafiq, Shirin and 8 Dhaka zones), and covered by
+23 schema-integration tests. See [docs/database.md](docs/database.md).
+
+**Phase 3 — Authentication (Clerk): complete.** Authentication is managed by
+Clerk (ADR-013). The frontend uses `@clerk/nextjs` (sign-in/sign-up, a
+protected `/account` page, route middleware); the Fastify API verifies Clerk
+session bearer tokens via `@clerk/backend` and resolves them to the local
+PostgreSQL user (`users.clerk_user_id`) for role-based authorization
+(`request.auth` + `requireAuth`/`requireRole`). Password storage and the
+application `sessions` table are gone (migrations 0001/0002). Covered by 19
+auth tests (deterministic fakes — no network). **No ride/pooling business logic
+is implemented yet** — those arrive in later phases per
 [docs/development-plan.md](docs/development-plan.md).
 
 ## Project Description
@@ -35,35 +43,45 @@ status; and history must stay explainable after the ride ends.
 - **Driver/Tesla** — goes online/offline, owns a Tesla with fixed capacity, accepts a ride/pool, marks arrival/start/complete.
 - **Pool/Ride** — multiple requests may share one Tesla; explicit membership; seats never exceed capacity; individual fares preserved.
 
-## Planned Architecture
+## Architecture
 
 A modular monolith:
 
 ```
 Browser
-  → Next.js (apps/web)
+  → Next.js (apps/web) + Clerk (identity provider)
+      └─ web verifies the user with Clerk and sends its session token
+         to the API as  Authorization: Bearer <clerk-session-token>
   → Node.js/Fastify API (apps/api)
+      └─ verifies the token (@clerk/backend), resolves the local user
+         (users.clerk_user_id), attaches request.auth
   → PostgreSQL
+      └─ application data + users.role / users.active (authorization source)
 ```
 
 The frontend never talks to PostgreSQL directly; all business rules live in the
-API. See [docs/architecture.md](docs/architecture.md) for the diagram.
+API. Identity (who you are) is Clerk's job; authorization (what you may do) is
+the application's job and lives in PostgreSQL. See
+[docs/architecture.md](docs/architecture.md) for the full diagram and §3.4 for
+route policy.
 
-## Planned Technology Stack
+## Technology Stack
 
-Proposed choices, recorded as ADRs in [docs/decisions.md](docs/decisions.md).
+Recorded as ADRs in [docs/decisions.md](docs/decisions.md).
 
 - **Frontend:** Next.js 15 (App Router), React 19, TypeScript. Tailwind CSS,
   shadcn/ui, TanStack Query, React Hook Form, Zod, and Leaflet + OpenStreetMap
   are added when the relevant frontend feature phase begins.
 - **Backend:** Node.js, Fastify 5, TypeScript, REST, Pino. Zod validation is
-  added with the auth/rides phases.
+  added with the rides/pools phases.
 - **Database:** PostgreSQL 16 (Docker), Drizzle ORM (`postgres.js` driver),
   integer paisa/poysha money. Schema, enums, constraints and indexes are
   implemented; see [docs/database.md](docs/database.md).
-- **Auth:** application-owned cookie sessions, Argon2id, role-based
-  (passenger/driver) — later phase.
-- **Testing:** Vitest (API unit/integration), Playwright E2E (later phase).
+- **Auth:** Clerk (`@clerk/nextjs` on the web, `@clerk/backend` +
+  `authenticateRequest` on the API). Role-based authorization stays in
+  PostgreSQL (`users.role`); no passwords or sessions are stored by the
+  application. See [Authentication](#authentication) and ADR-013.
+- **Testing:** Vitest (42 API tests: 23 database integration + 19 auth), Playwright E2E (later phase).
 - **Infrastructure:** Docker, Docker Compose, GitHub Actions.
 - **Deployment:** Vercel, Render, Neon — free tier only (later phase).
 
@@ -78,12 +96,18 @@ Proposed choices, recorded as ADRs in [docs/decisions.md](docs/decisions.md).
 
 ```
 apps/
-  web/        Next.js 15 App Router frontend (Phase 1 scaffold)
+  web/        Next.js 15 App Router frontend (Phase 1 scaffold + Phase 3 Clerk)
+              middleware.ts        Clerk route policy (Phase 3)
+              app/sign-in|sign-up  Clerk-managed auth pages (Phase 3)
+              app/account/         protected profile page (Phase 3)
+              lib/api.ts           bearer-token API client (Phase 3)
   api/        Fastify 5 + Drizzle REST API (Phase 1 scaffold)
-              src/db/schema.ts        schema (Phase 2)
-              src/db/seed.ts          idempotent cast seed (Phase 2)
-              drizzle/                generated migrations (Phase 2)
-              test/database.test.ts   schema-integration tests (Phase 2)
+              src/db/schema.ts        schema (Phase 2 + Phase 3 clerk_user_id)
+              src/db/seed.ts          idempotent cast seed (Phases 2 + 3)
+              src/auth/               Clerk verification + authorization (Phase 3)
+              drizzle/                generated migrations (Phases 2 + 3)
+              test/database.test.ts   schema-integration tests (Phases 2 + 3)
+              test/auth.test.ts       auth behavior tests (Phase 3)
 docs/
   reference/PRD.pdf   primary source of truth (unmodified)
   requirements.md     implementation-oriented PRD interpretation
@@ -110,8 +134,11 @@ Copy the example file (no real secrets in the repo):
 cp .env.example .env
 ```
 
-Defaults work for local development with Docker Postgres. Generate a real
-`SESSION_SECRET` locally when auth is implemented.
+Defaults work for local development with Docker Postgres. For live Clerk
+flows you must put real Clerk keys in `.env` (see [Authentication](#authentication)).
+Without them the stack still starts, but authenticated API routes fail with a
+clear `AUTH_CONFIGURATION` error and the web `/account` redirect targets
+`/sign-in` (its route policy is unchanged).
 
 ### 3. Start PostgreSQL (Docker)
 
@@ -137,8 +164,9 @@ npm run db:generate -w @dhaka-tesla-pool/api  # regenerate after schema edits
 ```
 
 `db:seed` is safe to run any number of times (inserts with
-`ON CONFLICT DO NOTHING`; never deletes). The seeded `password_hash` values are
-documented development-only placeholders until the auth phase.
+`ON CONFLICT DO NOTHING`; never deletes). Seeded users carry a reserved
+development-only `clerk_user_id` placeholder (`dev-only::seed::<email>`) — see
+[Authentication](#mapping-clerk-users-to-seeded-characters).
 
 ### 5. Start the API
 
@@ -174,7 +202,73 @@ npm run build
 
 The API test suite runs its database-integration tests against a disposable
 `dhaka_tesla_pool_test` database when PostgreSQL is reachable (`DATABASE_URL`
-or the `.env` default), and skips cleanly when it is not.
+or the `.env` default), and skips cleanly when it is not. The auth tests use
+deterministic fakes for the Clerk boundary and never need a network or keys.
+
+### 8. Database type changes (dev)
+
+Adding a `NOT NULL` column (like `clerk_user_id` in migration 0001) cannot be
+applied to a populated table, so the local dev database must be recreated and
+remigrated:
+
+```bash
+docker compose exec db psql -U postgres -c "DROP DATABASE IF EXISTS dhaka_tesla_pool WITH (FORCE);" -c "CREATE DATABASE dhaka_tesla_pool;"
+npm run db:migrate -w @dhaka-tesla-pool/api
+npm run db:seed   -w @dhaka-tesla-pool/api
+```
+
+CI and the `*_test` database always build from a fresh database, so they are
+unaffected.
+
+## Authentication (Clerk)
+
+Authentication is managed by [Clerk](https://clerk.com) (ADR-013) — the
+application does **not** store passwords or sessions.
+
+- **Web (`@clerk/nextjs`):** `ClerkProvider` in the root layout, sign-in /
+  sign-up pages, a protected `/account` page, and `middleware.ts` route policy
+  (`/`, `/sign-in*`, `/sign-up*` public; `/account*` requires a signed-in user
+  and redirects to `/sign-in`).
+- **API (`@clerk/backend`):** Fastify verifies every request under `/api` with
+  `authenticateRequest()` (bearer token). `apps/api/src/auth/` implements the
+  flow as two injectable boundaries — `SessionVerifier` (token → Clerk userId)
+  and `LocalUserResolver` (Clerk userId → local `users` row) — so the behavior
+  is unit-tested with fakes. The API **never** trusts a `userId` or `role` from
+  a request body.
+- **Authorization:** `request.auth.user` carries the PostgreSQL `role`
+  (`PASSENGER` | `DRIVER` | `ADMIN`), `active`. Route guards:
+  `requireAuth()` (any signed-in user) and `requireRole([...])`. The role is
+  granted by the project owner in the database — it is application policy, not
+  identity.
+- **Environment:**
+  - Web: `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` (browser-safe) and (server-side)
+    `CLERK_SECRET_KEY` used by middleware/ClerkProvider SSR.
+  - API: `CLERK_SECRET_KEY`, `CLERK_PUBLISHABLE_KEY`,
+    `CLERK_AUTHORIZED_PARTIES` (comma-separated origins allowed to present
+    tokens; defaults to `WEB_URL`). `CLERK_SECRET_KEY` is server-side only and
+    must never reach the browser or be committed.
+  - The placeholder values in `.env.example`/compose are well-formed **but
+    invalid** (they only keep builds and the stack starting); real keys come
+    from the [Clerk dashboard](https://dashboard.clerk.com).
+- **Unauthenticated/unmapped behavior:** no token → `401 AUTH_UNAUTHENTICATED`;
+  valid Clerk identity with no local user → `403 AUTH_USER_NOT_FOUND` (no
+  silent user provisioning); inactive user → `403 AUTH_INACTIVE`; Clerk
+  unconfigured → `500 AUTH_CONFIGURATION`.
+
+### Mapping Clerk users to seeded characters
+
+The seed uses a reserved placeholder (`dev-only::seed::<email>`) because we
+never invent real Clerk IDs. Reserved values are rejected during auth, so they
+can never authenticate. To use a seeded character (e.g. Nusrat) with a real
+Clerk account, create the person in Clerk, then map in the database:
+
+```sql
+-- Replace <clerk-user-id> with the real Clerk user ID (starts with "user_").
+UPDATE users SET clerk_user_id = '<clerk-user-id>' WHERE email = 'nusrat@example.com';
+```
+
+Real Clerk IDs cannot collide with placeholders (`user_...` vs
+`dev-only::seed::...`).
 
 ## Docker (full stack, reproducible)
 
@@ -194,6 +288,10 @@ Notes:
   require `docker compose up --build` again. For hot reload during development
   use the per-workspace `npm run dev` commands (API/web) with `docker compose
   up db` for PostgreSQL.
+- Without real `CLERK_SECRET_KEY`/`CLERK_PUBLISHABLE_KEY` in `.env`, compose
+  falls back to invalid-but-well-formed placeholders: the stack boots and the
+  unauthenticated shape of every route works, while authenticated API routes
+  return the documented `AUTH_CONFIGURATION` error.
 - `docker compose down` stops containers and keeps the DB volume.
   `docker compose down -v` also deletes the database volume (destructive).
 
@@ -221,11 +319,28 @@ Long-lived branches: `master`, `pre-release`, `release/v1.0.0`. Commits follow
   < 0.24.3. The proposed "fix" downgrades drizzle-kit (breaking); the exposure
   is development-time only, so it is accepted and revisited when tooling
   allows.
+- Clerk keys are server-side secrets (`CLERK_SECRET_KEY`); only the publishable
+  key is browser-safe. Neither is committed, and tokens/sessions are never
+  logged by the API. `CLERK_AUTHORIZED_PARTIES` constrains which origins may
+  present tokens to the API.
 
 ## AI Usage
 
 AI coding tools are explicitly allowed by the PRD and are used as a normal
-engineering tool — never hidden. Per the PRD, this README will document which
-AI tools were used, for what, one accepted suggestion, and one rejected or
-modified suggestion with reasons, once features are implemented. The human
-engineer owns and must be able to explain every line of code.
+engineering tool — never hidden. This is the record the PRD requires.
+
+- **Tool:** an AI CLI coding agent (opencode) used throughout the project for
+  implementation, testing, docs, and verification.
+- **For what:** scaffolding; the database schema, migrations and seed; the
+  Clerk authentication implementation (SDK wiring, middleware, Fastify auth
+  plugin); tests; and this documentation.
+- **Accepted suggestion:** generate the `users.clerk_user_id` NOT NULL +
+  UNIQUE constraint so the DB — not the application — enforces "one application
+  user per Clerk identity", and drive the lookup from that unique index.
+- **Rejected/modified suggestion:** the agent proposed keeping an
+  application-owned `sessions` table alongside Clerk for local revocation
+  bookkeeping. This was rejected: Clerk owns the session lifecycle
+  (ADR-013), the API re-validates every request with `authenticateRequest()`,
+  and a second session store would reintroduce exactly the manual-auth surface
+  the decision removed — so the `sessions` table was dropped (migration 0001).
+- The human engineer owns and must be able to explain every line of code.

@@ -8,6 +8,20 @@
       "when": 1790293149137,
       "tag": "0000_whole_queen_noir",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1790296592084,
+      "tag": "0001_fluffy_lethal_legion",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790296600697,
+      "tag": "0002_greedy_ultimatum",
+      "breakpoints": true
     }
   ]
 }

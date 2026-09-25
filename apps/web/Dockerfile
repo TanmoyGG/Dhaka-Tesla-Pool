@@ -10,7 +10,14 @@ COPY apps/api/package.json apps/api/package.json
 COPY apps/web/package.json apps/web/package.json
 RUN npm ci
 
-# Build the Next.js app.
+# Build the Next.js app. NEXT_PUBLIC_* values are baked into the browser
+# bundle, so they must be present at build time (passed as build args; the
+# default is an INVALID placeholder that only exists so the image builds and
+# the app starts without real Clerk credentials — see docker-compose.yml).
+ARG NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_cGxhY2Vob2xkZXIuaW52YWxpZC5jbGVyay5hY2NvdW50cy5kZXYk
+ARG NEXT_PUBLIC_API_URL=http://localhost:3001
+ENV NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=$NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 COPY . .
 RUN npm run build -w @dhaka-tesla-pool/web
 

@@ -44,8 +44,16 @@ services:
       API_HOST: 0.0.0.0
       API_PORT: 3001
       DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-dhaka_tesla_pool}
-      SESSION_SECRET: ${SESSION_SECRET:-dev-only-session-secret-change-me}
       WEB_URL: ${WEB_URL:-http://localhost:3000}
+      # Clerk API keys (server-side). The default is an INVALID build-only
+      # placeholder so the stack starts without real credentials; authenticated
+      # routes then fail with a clear AUTH_CONFIGURATION error. Set real values
+      # in .env to run authenticated flows (see .env.example). The placeholder is
+      # deliberately not shaped like a real key (sk_test_) so secret scanners do
+      # not misflag it, yet still parses in @clerk/backend.
+      CLERK_SECRET_KEY: ${CLERK_SECRET_KEY:-sk_placeholder-not-a-real-clerk-secret-key-do-not-use-000000}
+      CLERK_PUBLISHABLE_KEY: ${CLERK_PUBLISHABLE_KEY:-pk_test_cGxhY2Vob2xkZXIuaW52YWxpZC5jbGVyay5hY2NvdW50cy5kZXYk}
+      CLERK_AUTHORIZED_PARTIES: ${CLERK_AUTHORIZED_PARTIES:-${WEB_URL:-http://localhost:3000}}
     ports:
       - "3001:3001"
     depends_on:
@@ -62,10 +70,18 @@ services:
     build:
       context: .
       dockerfile: apps/web/Dockerfile
+      args:
+        # NEXT_PUBLIC_* vars are baked into the browser bundle at BUILD time.
+        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:-pk_test_cGxhY2Vob2xkZXIuaW52YWxpZC5jbGVyay5hY2NvdW50cy5kZXYk}
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
     environment:
       NODE_ENV: production
       WEB_URL: ${WEB_URL:-http://localhost:3000}
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
+      # Server-side Clerk key used by the Next.js middleware/ClerkProvider SSR.
+      # Placeholder default for build-only reproduction (matches the API
+      # service); real key required for live Clerk flows (see .env.example).
+      CLERK_SECRET_KEY: ${CLERK_SECRET_KEY:-sk_placeholder-not-a-real-clerk-secret-key-do-not-use-000000}
     ports:
       - "3000:3000"
     depends_on:

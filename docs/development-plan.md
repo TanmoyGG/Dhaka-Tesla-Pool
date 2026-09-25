@@ -73,15 +73,41 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
   the seat-claim transaction (`SELECT … FOR UPDATE` + derived occupancy) is
   implemented and tested in the pooling phase (`docs/database.md` §7).
 
-## Phase 3 — Authentication
+## Phase 3 — Authentication (Clerk)
 
-- **Objective:** Register/login/logout with role-based sessions.
-- **Deliverables:** Argon2id hashing, session cookie lifecycle, passenger/driver
-  roles, `GET /me`, auth middleware, role guard.
+> **Status: COMPLETE.** The planned manual Argon2id/cookie-session phase was
+> replaced by Clerk as identity provider (**ADR-013**; the rejected manual-auth
+> suggestion is recorded in README "AI Usage"). Database adapted
+> (`users.clerk_user_id` unique, `sessions` dropped, `password_hash` dropped,
+> `ADMIN` role value), `@clerk/nextjs` frontend (sign-in/sign-up/account/
+> middleware), `@clerk/backend` Fastify verification + local-user resolution +
+> role guards (`requireAuth`/`requireRole`) + `GET /api/me`, 19 auth tests,
+> full-stack compose validation — see `docs/architecture.md` §3.2/§3.4/§10 and
+> `docs/decisions.md` ADR-013.
+
+- **Objective:** Application users authenticate through Clerk; the API verifies
+  every bearer token and resolves the local user + PostgreSQL role.
+- **Deliverables:** `users.clerk_user_id` (NOT NULL UNIQUE) + generated
+  migrations (`0001_*`, `0002_*`; `sessions` table and password hashes removed);
+  `@clerk/nextjs` UI (`/sign-in`, `/sign-up`, protected `/account`,
+  `middleware.ts` route policy, bearer `lib/api.ts`); Fastify auth plugin
+  (`install.ts` — `request.auth`, `requireAuth`, `requireRole`), Clerk
+  verification boundary (`provider.ts` via `@clerk/backend`), local user
+  resolver (`user-resolver.ts`), `GET /api/me`; `/health` stays public.
 - **Dependencies:** Phase 2.
-- **Risks:** cookie flags (HttpOnly/SameSite/Secure); CSRF on cookie auth.
-- **Tests:** register→login→me→logout; wrong password rejected; expired/invalid
-  session rejected; role guard denies cross-role access.
+- **Risks:** Clerk SDK surface change (Core 3 removed `SignedIn`/`SignedOut` —
+  use `<Show>`); placeholder keys must be well-formed (build/runtime); dev-mode
+  `auth.protect` rewrites to Clerk-hosted fallback → manual redirect used;
+  `CLERK_SECRET_KEY` needed server-side at runtime.
+- **Tests:** 401 unauthenticated; valid identity → local user; unknown Clerk
+  user 403; wrong role 403; correct role accepted; body `userId` cannot
+  override; invalid/expired/inactive/reserved identities rejected; `/health`
+  public. 19 tests run against injected deterministic fakes (no network).
+- **Verified:** api/web lint + typecheck, root lint/typecheck/test/build
+  (42 tests with Postgres up — 23 DB + 19 auth), fresh-DB migrate/seed/check,
+  `docker compose up --build` full stack healthy + route policy live
+  (`/account` 307 → `/sign-in`), README/env/compose/CI updated, no `db:generate`
+  drift.
 
 ## Phase 4 — Passenger ride requests
 
