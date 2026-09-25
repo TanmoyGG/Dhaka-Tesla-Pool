@@ -509,6 +509,15 @@ placeholders** (`dev-only::seed::<email>`) — real Clerk identities start with
 `user_`, and the resolver rejects the reserved prefix (defense in depth). Demo
 logins arrive with the Clerk dashboard configuration.
 
+First-request provisioning (ADR-014) keeps the identity mapping consistent
+without manual steps: a verified Clerk identity with no `users` row is created
+as `PASSENGER`/`active`, name = Clerk username, email = primary Clerk email
+(lowercased), with `INSERT … ON CONFLICT (clerk_user_id) DO NOTHING RETURNING`
+— the `users_clerk_user_id_unique` index makes concurrent first requests yield
+exactly one row, and the losers re-read the winner. If the email is already
+taken (`users_email_unique`), the INSERT aborts (`AUTH_PROVISION_FAILED`) and
+the existing row is never rebound.
+
 ## 9. Database Commands
 
 ```bash
@@ -537,3 +546,9 @@ npm run db:seed   -w @dhaka-tesla-pool/api    # idempotent cast seed
 11. One app user per Clerk identity — `users.clerk_user_id` UNIQUE (ADR-013). ✔ DB
 12. Authenticated requests map to one verified local user with an app role —
     bearer verification + `users.role` lookup (Phase 3, implemented). ✔ App + DB
+13. A verified Clerk identity without a local row is provisioned exactly once as
+    `PASSENGER` — `INSERT … ON CONFLICT (clerk_user_id) DO NOTHING RETURNING`
+    + re-read (Phase 3.5, ADR-014). ✔ App + DB
+14. Provisioning never steals another user's email — a `users_email_unique`
+    conflict aborts with `AUTH_PROVISION_FAILED` instead of rebinding rows.
+    ✔ App + DB

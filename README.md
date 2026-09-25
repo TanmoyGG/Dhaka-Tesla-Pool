@@ -15,10 +15,12 @@ Clerk (ADR-013). The frontend uses `@clerk/nextjs` (sign-in/sign-up, a
 protected `/account` page, route middleware); the Fastify API verifies Clerk
 session bearer tokens via `@clerk/backend` and resolves them to the local
 PostgreSQL user (`users.clerk_user_id`) for role-based authorization
-(`request.auth` + `requireAuth`/`requireRole`). Password storage and the
-application `sessions` table are gone (migrations 0001/0002). Covered by 19
-auth tests (deterministic fakes — no network). **No ride/pooling business logic
-is implemented yet** — those arrive in later phases per
+(`request.auth` + `requireAuth`/`requireRole`). New Clerk identities are
+provisioned as `PASSENGER` users on their first authenticated request
+(ADR-014), atomically and race-safe. Password storage and the application
+`sessions` table are gone (migrations 0001/0002). Covered by 23 auth tests
+(deterministic fakes — no network) and 29 database tests. **No ride/pooling
+business logic is implemented yet** — those arrive in later phases per
 [docs/development-plan.md](docs/development-plan.md).
 
 ## Project Description
@@ -231,10 +233,11 @@ application does **not** store passwords or sessions.
   and redirects to `/sign-in`).
 - **API (`@clerk/backend`):** Fastify verifies every request under `/api` with
   `authenticateRequest()` (bearer token). `apps/api/src/auth/` implements the
-  flow as two injectable boundaries — `SessionVerifier` (token → Clerk userId)
-  and `LocalUserResolver` (Clerk userId → local `users` row) — so the behavior
-  is unit-tested with fakes. The API **never** trusts a `userId` or `role` from
-  a request body.
+  flow as three injectable boundaries — `SessionVerifier` (token → Clerk
+  userId), `LocalUserResolver` (Clerk userId → local `users` row), and
+  `ProvisionLocalUser` (first-request user creation, see Ad hoc provisioning
+  below) — so the behavior is unit-tested with fakes. The API **never** trusts
+  a `userId`, `role`, `name`, or `email` from a request body.
 - **Authorization:** `request.auth.user` carries the PostgreSQL `role`
   (`PASSENGER` | `DRIVER` | `ADMIN`), `active`. Route guards:
   `requireAuth()` (any signed-in user) and `requireRole([...])`. The role is
@@ -250,17 +253,30 @@ application does **not** store passwords or sessions.
   - The placeholder values in `.env.example`/compose are well-formed **but
     invalid** (they only keep builds and the stack starting); real keys come
     from the [Clerk dashboard](https://dashboard.clerk.com).
+- **Ad hoc provisioning (first authenticated request, ADR-014):** a valid
+  Clerk identity with no local `users` row is provisioned on first use —
+  anything new signing up just works. The Clerk profile is loaded server-side;
+  the local user is created atomically (role `PASSENGER`, `active`, name =
+  Clerk **username**, email = primary Clerk email) via
+  `INSERT … ON CONFLICT (clerk_user_id) DO NOTHING`, so concurrent first
+  requests yield exactly one row. If the email already belongs to another
+  user, provisioning aborts with `500 AUTH_PROVISION_FAILED` — it never
+  rebinds the existing row. `DRIVER`/`ADMIN` are **never** self-assignable.
 - **Unauthenticated/unmapped behavior:** no token → `401 AUTH_UNAUTHENTICATED`;
-  valid Clerk identity with no local user → `403 AUTH_USER_NOT_FOUND` (no
-  silent user provisioning); inactive user → `403 AUTH_INACTIVE`; Clerk
-  unconfigured → `500 AUTH_CONFIGURATION`.
+  reserved seed placeholder → `401`; provisioning failure (e.g. email already
+  taken) → `500 AUTH_PROVISION_FAILED`; inactive user → `403 AUTH_INACTIVE`;
+  Clerk unconfigured → `500 AUTH_CONFIGURATION`. `403 AUTH_USER_NOT_FOUND`
+  remains only as a defensive backstop for identities that are deliberately
+  not provisionable.
 
 ### Mapping Clerk users to seeded characters
 
 The seed uses a reserved placeholder (`dev-only::seed::<email>`) because we
 never invent real Clerk IDs. Reserved values are rejected during auth, so they
-can never authenticate. To use a seeded character (e.g. Nusrat) with a real
-Clerk account, create the person in Clerk, then map in the database:
+can never authenticate. **Brand-new** Clerk identities are now provisioned
+automatically (PASSENGER, see Ad hoc provisioning above), so the only mapping
+step left is for demo characters, e.g. giving Nusrat access to the seeded
+`nusrat@example.com` user with a real Clerk account:
 
 ```sql
 -- Replace <clerk-user-id> with the real Clerk user ID (starts with "user_").
@@ -343,4 +359,14 @@ engineering tool — never hidden. This is the record the PRD requires.
   (ADR-013), the API re-validates every request with `authenticateRequest()`,
   and a second session store would reintroduce exactly the manual-auth surface
   the decision removed — so the `sessions` table was dropped (migration 0001).
+- **Accepted suggestion:** for the `AUTH_USER_NOT_FOUND` gap, provision the
+  application user lazily on the **first authenticated request** (ADR-014)
+  using `INSERT … ON CONFLICT (clerk_user_id) DO NOTHING`, rather than bind a
+  Clerk account to a seeded row by email.
+- **Rejected/modified suggestion:** for the same gap, the agent evaluated Clerk
+  **webhooks** to create users at signup and **email-binding** of seeded
+  characters. Both were rejected: webhooks add an event system no consumer
+  needs yet, and email-binding lets anyone self-assign a seeded identity
+  (including, with a crafted email, a DRIVER). New identities are provisioned
+  on demand; demo-character mapping remains an explicit `users` UPDATE.
 - The human engineer owns and must be able to explain every line of code.

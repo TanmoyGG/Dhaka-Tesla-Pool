@@ -116,10 +116,15 @@ flowchart LR
 - Phase 3 (complete): `src/auth/` — Clerk verification boundary
   (`provider.ts`: `@clerk/backend` `authenticateRequest` with
   `authorizedParties`), local user resolution (`user-resolver.ts`:
-  `users.clerk_user_id`), and the Fastify auth plugin (`install.ts`:
+  `users.clerk_user_id`), the Fastify auth plugin (`install.ts`:
   `request.auth`, `requireAuth`, `requireRole`) plus the authenticated
   `GET /api/me` route (`routes.ts`). Everything under `/api` requires a valid
   bearer session; `/health` stays public.
+- Phase 3.5 (complete): first-request user provisioning (`provision.ts` +
+  `user-resolver.ts` `upsertLocalUser`): a verified Clerk identity with no
+  local row is provisioned as `PASSENGER` on its first authenticated request,
+  atomically (`INSERT … ON CONFLICT (clerk_user_id) DO NOTHING`). Webhooks are
+  not used (ADR-014).
 - Later phases: ride state machine, capacity enforcement via transactional seat
   allocation (`SELECT … FOR UPDATE` + constraint checks), individual passenger
   fares (integer paisa/poysha), request validation on routes (Zod).
@@ -246,11 +251,22 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-013,
   client).
 - Backend: `@clerk/backend` verification boundary + local user resolution +
   Fastify auth plugin (`request.auth`, `requireAuth`, `requireRole`) +
-  `GET /api/me`; `/health` public.
-- Auth behavior tests (19 in `apps/api/test/auth.test.ts`) run with injected
+  `GET /api/me`; `/health` public. First-request provisioning
+  (`provision.ts`, `upsertLocalUser` in `user-resolver.ts`) materializes new
+  Clerk identities as `PASSENGER` users atomically and fails closed with
+  `AUTH_PROVISION_FAILED` on any provisioning error, including email-uniqueness
+  conflicts (see [docs/decisions.md](decisions.md) ADR-014).
+- Auth behavior tests (23 in `apps/api/test/auth.test.ts`) run with injected
   deterministic fakes (no network): unauthenticated, valid identity, local-user
-  mapping, unknown/expired/inactive/reserved identities, role reject/accept,
-  body-supplied userId/role never trusted, `/health` public.
+  mapping, unknown identities (provisioned on first request), idempotent
+  provisioning across requests, provisioning failure → `AUTH_PROVISION_FAILED`,
+  expired/inactive/reserved identities, role reject/accept, body-supplied
+  userId/role/name/email never trusted, `/health` public.
+- Database tests (`apps/api/test/database.test.ts`, 29) cover the
+  `users.clerk_user_id` upsert against a disposable `_test` database: PASSENGER
+  creation, email lowercasing (constraint), idempotency, concurrent
+  provisioning → exactly one row, email-taken → `AUTH_PROVISION_FAILED` with no
+  rebind, reserved placeholders never provisioned.
 - Full compose stack (`web` + `api` + `db`) builds and runs with healthchecks;
   route policy verified live (`/` 200, `/sign-in` 200, `/account` 307 →
   `/sign-in`, `/health` 200); unprovisioned Clerk yields the documented
