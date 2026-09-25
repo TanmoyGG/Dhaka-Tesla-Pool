@@ -49,18 +49,45 @@ export class AuthConfigurationError extends Error {
   }
 }
 
-// The two injectable boundaries of the authentication flow. Injecting these
+// Error code surfaced when first-request user provisioning cannot complete.
+// Requirement (docs/decisions.md ADR-014): provisioning is atomic — a failure
+// MUST NOT leave a partial application user row behind.
+export const AUTH_PROVISION_FAILED = "AUTH_PROVISION_FAILED";
+
+// Raised when provisioning a verified Clerk identity into a local user fails.
+// Caught by the auth plugin and turned into a 500 AUTH_PROVISION_FAILED error;
+// never a partial row.
+export class ProvisioningError extends Error {
+  readonly code: string = AUTH_PROVISION_FAILED;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "ProvisioningError";
+  }
+}
+
+// The three injectable boundaries of the authentication flow. Injecting these
 // is what keeps the auth logic testable without real Clerk (or a network):
 // tests substitute a deterministic fake for each.
 //
-// verifySession(token)      — verifies a bearer session token with Clerk and
-//                             returns the authenticated Clerk userId (or null).
-// resolveLocalUser(clerkId) — maps a verified Clerk userId to the local
-//                             application user via users.clerk_user_id.
+// verifySession(token)        — verifies a bearer session token with Clerk and
+//                               returns the authenticated Clerk userId (or null).
+// resolveLocalUser(clerkId)   — maps a verified Clerk userId to the local
+//                               application user via users.clerk_user_id
+//                               (never creates one).
+// provisionLocalUser(clerkId) — invoked ONLY when resolveLocalUser misses:
+//                               creates the application user from the verified
+//                               Clerk profile (name = Clerk username, email =
+//                               primary Clerk email, role PASSENGER, active).
+//                               Returns null when the identity is explicitly
+//                               not provisionable (defensive backstop); throws
+//                               ProvisioningError on failure.
 export type SessionVerifier = (token: string) => Promise<string | null>;
 export type LocalUserResolver = (clerkUserId: string) => Promise<AuthUser | null>;
+export type ProvisionLocalUser = (clerkUserId: string) => Promise<AuthUser | null>;
 
 export interface AuthDependencies {
   verifySession: SessionVerifier;
   resolveLocalUser: LocalUserResolver;
+  provisionLocalUser: ProvisionLocalUser;
 }
