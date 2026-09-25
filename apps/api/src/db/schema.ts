@@ -251,6 +251,10 @@ export const rideRequests = pgTable(
       .references(() => zones.id, { onDelete: "restrict" }),
     requestedSeats: integer("requested_seats").notNull(),
     status: rideStatusEnum("status").notNull().default("REQUESTED"),
+    // Client-supplied idempotency key (optional): lets a passenger retry a
+    // "create ride" safely. Requests WITHOUT a key may create a new ride on a
+    // repeated submission (documented MVP behavior, ADR-015).
+    clientRequestId: uuid("client_request_id"),
     // Null while the request is unassigned; set when it joins a pool.
     poolId: uuid("pool_id").references(() => pools.id, {
       onDelete: "restrict",
@@ -299,6 +303,12 @@ export const rideRequests = pgTable(
       table.passengerId,
       table.createdAt,
     ),
+    // Idempotent ride creation: at most one ride per (passenger, key) when a
+    // key is supplied (partial: NULL keys are ignored). See docs/decisions.md
+    // ADR-015 — the service re-reads the winner's row on a unique conflict.
+    uniqueIndex("ride_requests_client_request_id_key")
+      .on(table.passengerId, table.clientRequestId)
+      .where(sql`${table.clientRequestId} is not null`),
     // matching: scan for requests awaiting a driver.
     index("ride_requests_status_idx").on(table.status),
     // reverse lookup: which requests ride in this pool (FK support too).
