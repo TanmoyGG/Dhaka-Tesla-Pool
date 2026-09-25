@@ -2,7 +2,8 @@
 //
 // These tests run against a dedicated `<main_db>_test` database (created and
 // dropped per run) and never touch the development data. They verify the
-// Phase 2 schema: migration correctness, seed data, and that the important
+// schema across the Phase 2 (database design) and Phase 3 (Clerk auth
+// adaptation) work: migration correctness, seed data, and that the important
 // constraints actually reject bad rows.
 //
 // Drizzle query errors wrap the underlying PostgresError as `.cause`, so
@@ -12,10 +13,11 @@
 // whole suite is skipped so `npm test` still passes on machines without a DB.
 // CI runs these tests against a Postgres service container.
 
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { config } from "../src/config.js";
-import { SEED_IDS, SEED_ZONE_IDS, SEED_PLACEHOLDER_PASSWORD_HASH, runSeed } from "../src/db/seed.js";
+import { isReservedClerkUserId, seedClerkUserId } from "../src/auth/identity.js";
+import { SEED_IDS, SEED_ZONE_IDS, runSeed } from "../src/db/seed.js";
 import {
   fares,
   poolMembers,
@@ -61,7 +63,7 @@ async function insertRideRequest(overrides: Partial<typeof rideRequests.$inferIn
     .returning();
 }
 
-describeDb("database schema (Phase 2)", () => {
+describeDb("database schema (Phases 2 + 3)", () => {
   beforeAll(async () => {
     testUrl = await resetTestDatabase(config.databaseUrl);
     await applyMigrations(testUrl);
@@ -87,12 +89,13 @@ describeDb("database schema (Phase 2)", () => {
         "pools",
         "ride_requests",
         "ride_status_history",
-        "sessions",
         "users",
         "vehicles",
         "zones",
       ]),
     );
+    // Clerk (ADR-013) owns sessions; the application never stores them.
+    expect(names).not.toContain("sessions");
   });
 
   it("migration defines the full PRD lifecycle as a Postgres enum", async () => {
@@ -147,8 +150,14 @@ describeDb("database schema (Phase 2)", () => {
       expect(names).toContain(zoneName);
     }
 
-    // Seed password hashes are documented placeholders until the auth phase.
-    expect(jashim?.passwordHash).toBe(SEED_PLACEHOLDER_PASSWORD_HASH);
+    // Seeded users carry reserved dev-only Clerk placeholders. These are never
+    // treated as authenticated identities by the API (src/auth/user-resolver.ts)
+    // and can never collide with real Clerk IDs (which start with "user_").
+    for (const user of seededUsers) {
+      expect(isReservedClerkUserId(user.clerkUserId)).toBe(true);
+    }
+    const nusratRow = seededUsers.find((u) => u.id === SEED_IDS.nusrat);
+    expect(nusratRow?.clerkUserId).toBe(seedClerkUserId("nusrat@example.com"));
   });
 
   it("seed is idempotent (safe to re-run)", async () => {
@@ -164,7 +173,7 @@ describeDb("database schema (Phase 2)", () => {
       db.insert(users).values({
         name: "Clone User",
         email: "nusrat@example.com",
-        passwordHash: "x",
+        clerkUserId: "user_clone_email",
         role: "PASSENGER",
       }),
     ).rejects.toMatchObject(rejectionCode("23505"));
@@ -175,10 +184,75 @@ describeDb("database schema (Phase 2)", () => {
       db.insert(users).values({
         name: "   ",
         email: "noname@example.com",
-        passwordHash: "x",
+        clerkUserId: "user_no_name",
         role: "PASSENGER",
       }),
     ).rejects.toMatchObject(rejectionCode("23514"));
+  });
+
+  it("requires a clerk_user_id for every user", async () => {
+    // Raw SQL on purpose: the type-level NOT NULL could hide an accidental
+    // omission, so we ban it at the database with a direct (nullable) insert.
+    await expect(
+      db.execute(sql`
+        insert into users (name, email, role)
+        values ('No Clerk Identity', 'noclerk@example.com', 'PASSENGER')
+      `),
+    ).rejects.toMatchObject(rejectionCode("23502"));
+  });
+
+  it("enforces one application user per Clerk identity", async () => {
+    const clerkUserId = "user_2zXxYyWwVvUuTtSsRrQqPpOoNnMm";
+    await expect(
+      db.insert(users).values({
+        name: "First Mapping",
+        email: "first-mapping@example.com",
+        clerkUserId,
+        role: "PASSENGER",
+      }),
+    ).resolves.toBeDefined();
+
+    await expect(
+      db.insert(users).values({
+        name: "Second Mapping",
+        email: "second-mapping@example.com",
+        clerkUserId,
+        role: "PASSENGER",
+      }),
+    ).rejects.toMatchObject(rejectionCode("23505"));
+  });
+
+  it("looks up a seeded user by its verified clerk_user_id", async () => {
+    const [row] = await db
+      .select()
+      .from(users)
+      .where(eq(users.clerkUserId, seedClerkUserId("nusrat@example.com")));
+    expect(row?.id).toBe(SEED_IDS.nusrat);
+    expect(row?.role).toBe("PASSENGER");
+  });
+
+  it("adapts users for Clerk auth (no password hashes, unique clerk_user_id index)", async () => {
+    const cols = await db.execute<{ column_name: string; is_nullable: string }>(
+      sql`select column_name, is_nullable from information_schema.columns
+          where table_schema = 'public' and table_name = 'users'
+          order by ordinal_position`,
+    );
+    const columnNames = cols.map((c) => c.column_name!);
+    expect(columnNames).toContain("clerk_user_id");
+    expect(columnNames).toContain("role");
+    // Passwords and sessions belong to Clerk, not the application DB.
+    expect(columnNames).not.toContain("password_hash");
+    expect(columnNames).not.toContain("password");
+    const clerkCol = cols.find((c) => c.column_name === "clerk_user_id");
+    expect(clerkCol?.is_nullable).toBe("NO");
+
+    const idx = await db.execute<{ indexname: string }>(
+      sql`select indexname from pg_indexes
+          where schemaname = 'public' and tablename = 'users'`,
+    );
+    const indexNames = idx.map((i) => i.indexname!);
+    expect(indexNames).toContain("users_clerk_user_id_unique");
+    expect(indexNames).toContain("users_email_unique");
   });
 
   it("rejects non-positive seats on a ride request", async () => {
