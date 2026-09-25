@@ -28,6 +28,11 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/dhaka_tesla_pool
+      # Placeholder Clerk keys (well-formed but NOT real): the web build fails if
+      # NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY is missing because ClerkProvider runs
+      # during prerendering. Real secrets are never present in CI; authenticated
+      # requests are covered by unit tests with injected fakes (test/auth.test.ts).
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: pk_test_cGxhY2Vob2xkZXIuaW52YWxpZC5jbGVyay5hY2NvdW50cy5kZXYk
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
