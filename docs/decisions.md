@@ -432,3 +432,132 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   MVP gain); a full idempotency-key framework (keys on rides are the only
   retry-prone write today); storing total instead of per-seat components
   (would contradict the per-seat fare model, §21.K).
+
+## ADR-016: Deterministic pool matching + lifecycle (Phase 5)
+
+- **Status:** Implemented in `apps/api/src/matching/rules.ts` (pure rule),
+  `apps/api/src/rides/state.ts` (state machine), `src/rides/pooling/service.ts`
+  (orchestration), `POST /api/rides/:rideId/cancel`; migration 0004; covered in
+  `test/matching.test.ts`, `test/state.test.ts`, `test/pooling.test.ts`.
+- **Decision:** a single, fully deterministic matching rule resolves *all*
+  pooling decisions, and the pool lifecycle is the explicit PRD state machine.
+- **Matching rule (realizes requirements.md §5, §21.A):**
+  1. Same `pickup_zone_id`.
+  2. All-pairs drop-off spread ≤ **`POOL_DEST_SPREAD_KM` = 2.0 km** (max
+     pairwise haversine distance among the candidate's and every ACTIVE
+     member's destination point). Nusrat + Rafiq match (≈1.906 km); a Dhanmondi
+     drop-off does not (≈4.6 km from the pool).
+  3. `occupiedSeats + requestedSeats ≤ capacity_snapshot` (occupancy is derived
+     from ACTIVE memberships — no cached counter).
+  Pool choice among eligible candidates: **fullest first** (`occupiedSeats
+  DESC`, then `created_at ASC`, then `id ASC`). An existing eligible pool always
+  beats creating a new one; the new-pool Tesla pick is also deterministic
+  (`name ASC, id ASC`, online + active driver + no non-terminal pool). Two
+  concurrent first-seat requests therefore converge on the **same** pool.
+- **Why no driver "accept" in Phase 5:** the PRD lets us improve if explainable
+  (requirements.md §4). Making matching part of create-ride keeps the very
+  first transaction atomic (ride + fare + history + membership), avoids a
+  separate accept endpoint with unhandled pending state, and makes the required
+  concurrency scenario testable without a driver UI. `DRIVER_ARRIVED`/accept
+  semantics arrive with the driver phase and are already declared in the state
+  map (ADR-017/state.ts).
+- **State machine:** `RIDE_STATE_TRANSITIONS` is the single source of truth;
+  `canTransition` rejects every invalid move and the service raises
+  `409 INVALID_STATE_TRANSITION` instead of writing a bad row. A REQUESTED→
+  MATCHED journal row is written at match time, NULL→REQUESTED at creation.
+- **Cancellation (realizes §21.B):** passenger cancels only their own ride
+  (not-the-owner = the same 404 as "does not exist"); legal while REQUESTED or
+  MATCHED; MATCHED cancels flip the membership to `LEFT` (kept as history with
+  `left_at`), recompute remaining fares, and cancel an emptied pool. No
+  `cancel_reason` column — the PRD asks only for "cancel while valid". Forced
+  cancellation (driver/admin service path, `forceCancelRide`) adds a full refund
+  (ADR-017).
+- **Alternatives rejected:** zone-prefix/route-overlap rules (opaque, not
+  hand-checkable); driver-accept-before-hold (pending-state handling with no UI
+  consumer in Phase 5); closest-first or random Tesla selection (non-determinism
+  makes the required one-pool race flaky and the story unexplainable).
+- **Switch later if:** real routing/geo becomes available (then the spread rule
+  becomes a detour/time rule), or a driver-accept step becomes product-required
+  (then automatch becomes "reserve while pending" — a separate hold state gains
+  concurrency requirements that the current design deliberately avoids).
+
+## ADR-017: Seat-claim transaction: `FOR UPDATE` + derived occupancy (Phase 5)
+
+- **Status:** Implemented in `apps/api/src/rides/pooling/service.ts` +
+  `pooling/fare.ts`; exercised by `test/pooling.test.ts` **including two
+  concurrent last-seat claims** and the `ON CONFLICT DO NOTHING` first-pool
+  race.
+- **Decision:** Bullet's capacity is protected by a database-backed transactional
+  claim — **no Redis, no mutexes, no queues, no distributed machinery**:
+  - Occupancy is always **derived**: `SUM(seats) WHERE status = 'ACTIVE'` over
+    `pool_members` (ADR-012). There is no cached available-seats counter to
+    desync, so two readers can each see "one seat left" — the *claim*, not the
+    read, is what must be safe.
+  - A claim **`SELECT … FOR UPDATE` the pool row**, then re-derives occupancy
+    under that lock and only joins when `occupied + seats ≤ capacity_snapshot`.
+    The pool row is the single serialization point for a Tesla, which is correct
+    because `pools_single_active_per_vehicle` guarantees at most one active pool
+    per vehicle.
+  - Pool **creation** uses `INSERT … ON CONFLICT DO NOTHING RETURNING` against
+    that partial unique index. This is the subtle bit: a plain second INSERT on
+    the same Tesla would abort the whole transaction with SQLSTATE 23505. With
+    DO NOTHING the racing INSERT **waits** for the winner (committed or aborted)
+    and then skips with an EMPTY result while our transaction stays alive — and
+    because the winner's commit is a full statement-level snapshot (READ
+    COMMITTED), a single re-scan deterministically finds the winner's pool to
+    join. Bounded re-evaluation exactly once, then stop.
+  - **Lock ordering (deadlock-free):** every transaction that writes both a ride
+    row and a pool row acquires the RIDE row lock first, then the POOL row lock
+    second. Matches already hold their ride lock from the create-INSERT; cancels
+    take the ride lock first in their `FOR UPDATE` select. Consistent order ⇒ no
+    cycle possible between match, cancel, and force-cancel.
+  - Rationale for no cache/queue: the MVP has one writer (Postgres) and the race
+    is one row. A cache would *add* a second source of truth; a queue would add
+    latency + ops for a synchronous request path. What changes at scale: shard or
+    partition claim hot-spots per zone, or move the same serialization into a
+    geospatial index + `FOR UPDATE SKIP LOCKED` reservation table; Redis remains
+    unnecessary until cross-region coordination forces it (requirements.md §15).
+- **In-place fare recompute:** a join/leave/force-cancel recomputes EVERY ACTIVE
+  member's fare row in place (`pool_discount = roundHalfUp(25%·(base+distance))`
+  when members ≥ 2 else 0; `final = base + distance − discount`). Stored base /
+  distance are frozen; only derived values and `fares.updated_at` (migration
+  0004) are rewritten. This is a lifecycle recompute, not parameter drift
+  (requirements.md §21.I, ADR-015).
+- **Forced cancellation = full refund:** `forceCancelRide(rideId)` (service
+  only; no route yet) reuses the cancellation core and additionally writes the
+  ride's fare to zero BY the discount term (`discount = base + distance`,
+  `final = 0`) — every `fares` CHECK stays satisfied. Documented as the full
+  refund semantics the PRD implies; a payment gateway would consume this
+  differently (later phase).
+- **Migration 0004 (additive only):** `fares.updated_at`, so a recompute is
+  auditable. Nothing else changed — the schema already carried the lockable
+  tables, the capacity snapshot, and the partial unique indexes (ADR-012).
+- **Tests (beta of the required 6 behaviors):** `test/pooling.test.ts` covers
+  capacity-never-exceeded (sequential + concurrent), invalid transitions
+  rejected (409), pooled fares for Nusrat/Rafiq (4449/3105 paisa), ownership
+  isolation (404), cancellation rules, atomic rollback when a join recompute
+  throws, and two true concurrency races (last-seat claim; first-pool creation)
+  from two independent database connections.
+- **Alternatives rejected:** application-level mutex/lock (process-local, not
+  safe across API instances); `INSERT … ON CONFLICT DO NOTHING` without the
+  return-then-rescan step (silently leaves the loser REQUESTED forever); a
+  cached `available_seats` column with optimistic update (would require retry
+  loops and can still oversell); Redis locks (unnecessary infra, ADR-free
+  violation of "do not decorate").
+- **Switch later if:** a driver-accept step is added (claim becomes "reserve
+  pending accept" — still the same pool-row lock, just a new state); or the
+  system grows to many API instances with hot-zone contention worth sharding.
+
+## ADR-018: Cancellation routes and forced-cancel (Phase 5 follow-up)
+
+- **Status:** `POST /api/rides/{rideId}/cancel` implemented in
+  `apps/api/src/rides/routes.ts` (`PASSENGER`-only, returns the post-cancel
+  ride). Forced-cancel currently has **no HTTP route** — it exists as the
+  documented service path (`pooling.forceCancelRide`) used by tests and future
+  driver/admin endpoints (deliberately: no driver flow in Phase 5, and an
+  unexposed capability cannot be misused).
+- **Decision:** cancellation is a state-machine transition exposed as a plain
+  POST resource action. A `cancel_reason` field was explicitly **not** added:
+  the PRD requires only "cancel while valid"; adding speculative reason UX is
+  decoration. If a driver/admin force-cancel UI appears, the refund + reason
+  semantics extend this service without a schema change.

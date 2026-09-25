@@ -31,9 +31,27 @@ Rafiq Banani→Gulshan 1 = **4140 paisa** (pinned in tests). Ride + fare + initi
 status journal row commit in one transaction; an optional `client_request_id`
 makes creation idempotent (migration 0003, replay → HTTP 200). Zod strict
 validation on routes; PASSENGER-only; errors carry additive `details`. Covered
-by 7 fare and 22 rides integration tests — full suite 83/83. See
+by 7 fare and 22 rides integration tests. See
 [the API section](#api-phase-4) below and ADR-015.
-Pooling/matching, the ride state machine, and drivers are later phases per
+
+**Phase 5 — Pool matching, lifecycle & concurrency: complete.** Matching and
+pooling are implemented on `feature/matching-pooling` (ADR-016/017/018):
+requests are auto-matched at creation onto Bullet when they share the pickup
+zone and their drop-offs are within a 2.0 km spread (Nusrat + Rafiq pool;
+Banani→Dhanmondi does not). A single explicit transition map
+(`src/rides/state.ts`) enforces the PRD lifecycle and rejects illegal moves with
+`409 INVALID_STATE_TRANSITION`. Seat claims are database-transactional —
+`SELECT … FOR UPDATE` on the pool row + derived occupancy, with race-safe pool
+creation via `INSERT … ON CONFLICT DO NOTHING RETURNING` — so the last-seat race
+(Rafiq vs Shirin on Bullet's final seat) can never exceed capacity. Pooled fares
+are recomputed **in place** on the same `fares` row: 25% off
+base+distance when the pool holds ≥ 2 active members (Nusrat **4449** / Rafiq
+**3105** paisa, pinned); passengers cancel via
+`POST /api/rides/:rideId/cancel` (owner-only, REQUESTED/MATCHED). Migration 0004
+adds `fares.updated_at` (additive). Full suite **122/122** across 8 test files,
+including two real concurrent-claim races. See
+[the API section](#api-phase-5) below.
+Drivers and the driver-flow transitions are the next phase per
 [docs/development-plan.md](docs/development-plan.md).
 
 ## Project Description
@@ -88,7 +106,7 @@ Recorded as ADRs in [docs/decisions.md](docs/decisions.md).
   shadcn/ui, TanStack Query, React Hook Form, Zod, and Leaflet + OpenStreetMap
   are added when the relevant frontend feature phase begins.
 - **Backend:** Node.js, Fastify 5, TypeScript, REST, Pino. Zod validation is
-  added with the rides/pools phases.
+  used by the rides endpoints (Phases 4/5); Pino logs errors.
 - **Database:** PostgreSQL 16 (Docker), Drizzle ORM (`postgres.js` driver),
   integer paisa/poysha money. Schema, enums, constraints and indexes are
   implemented; see [docs/database.md](docs/database.md).
@@ -96,7 +114,8 @@ Recorded as ADRs in [docs/decisions.md](docs/decisions.md).
   `authenticateRequest` on the API). Role-based authorization stays in
   PostgreSQL (`users.role`); no passwords or sessions are stored by the
   application. See [Authentication](#authentication) and ADR-013.
-- **Testing:** Vitest (42 API tests: 23 database integration + 19 auth), Playwright E2E (later phase).
+- **Testing:** Vitest (122 tests across 8 files: 23 database + 19 auth + 7 fare
+  + 22 rides + matching/state/pooling suites), Playwright E2E (later phase).
 - **Infrastructure:** Docker, Docker Compose, GitHub Actions.
 - **Deployment:** Vercel, Render, Neon — free tier only (later phase).
 
@@ -117,12 +136,16 @@ apps/
               app/account/         protected profile page (Phase 3)
               lib/api.ts           bearer-token API client (Phase 3)
   api/        Fastify 5 + Drizzle REST API (Phase 1 scaffold)
-              src/db/schema.ts        schema (Phase 2 + Phase 3 clerk_user_id)
+              src/db/schema.ts        schema (Phases 2–5)
               src/db/seed.ts          idempotent cast seed (Phases 2 + 3)
               src/auth/               Clerk verification + authorization (Phase 3)
-              drizzle/                generated migrations (Phases 2 + 3)
-              test/database.test.ts   schema-integration tests (Phases 2 + 3)
-              test/auth.test.ts       auth behavior tests (Phase 3)
+              src/fare/               deterministic fare estimation (Phase 4, ADR-015)
+              src/matching/           pool matching rule (Phase 5, ADR-016)
+              src/rides/              rides service/routes + state machine (Phases 4/5)
+              src/rides/pooling/      seat-claim + fare recompute service (Phase 5)
+              drizzle/                generated migrations (Phases 2–5)
+              test/                   suite (database, auth, fare, rides, matching,
+                                      state, pooling — Phases 2–5)
 docs/
   reference/PRD.pdf   primary source of truth (unmodified)
   requirements.md     implementation-oriented PRD interpretation
@@ -299,7 +322,7 @@ UPDATE users SET clerk_user_id = '<clerk-user-id>' WHERE email = 'nusrat@example
 Real Clerk IDs cannot collide with placeholders (`user_...` vs
 `dev-only::seed::...`).
 
-## API (Phase 4)
+## API
 
 All `/api` routes require a Clerk session **bearer token**
 (`Authorization: Bearer <token>`); the web client attaches it automatically
@@ -308,9 +331,10 @@ All `/api` routes require a Clerk session **bearer token**
 | Endpoint | Policy | Notes |
 |---|---|---|
 | `GET /api/me` | any signed-in user | authenticated identity / role |
-| `POST /api/rides` | `PASSENGER` | create a ride request with its initial fare estimate |
+| `POST /api/rides` | `PASSENGER` | create a ride request; automatically matched & pooled (Phase 5) |
 | `GET /api/rides` | `PASSENGER` | the caller's own requests, newest first |
 | `GET /api/rides/:rideId` | `PASSENGER` (owner) | 404 for unknown/another user's ride |
+| `POST /api/rides/:rideId/cancel` | `PASSENGER` (owner) | cancel own ride while REQUESTED/MATCHED (409 otherwise) |
 | `GET /api/zones` | any signed-in user | pickup/destination pick-list (8 zones) |
 
 `POST /api/rides` body (Zod, strict — unknown keys rejected, identity/role is
@@ -354,6 +378,34 @@ A two-seat booking of Nusrat's route costs 2 × 5932 = **11864 paisa**.
 These values are pinned in `test/fare.test.ts` and `test/rides.test.ts` from
 the seed coordinates, so any drift is a test failure. See ADR-015 and
 `apps/api/src/fare/calculate.ts` for the exact code.
+
+### Pooling (Phase 5)
+
+`POST /api/rides` now runs the match inside its own create transaction
+(ADR-016/017). A request joins the best **eligible** pool — same pickup zone,
+all-pairs drop-off spread ≤ **2.0 km**, enough seats — or starts a new one on an
+online, available Tesla; either way it responds `MATCHED` with an additive
+`pool` object on the ride (vehicle, driver, `capacitySnapshot`, `occupiedSeats`).
+Nusrat + Rafiq pool (drop-off spread ≈ 1.906 km); `Banani → Dhanmondi`
+(≈ 4.6 km away) does not.
+
+```
+poolDiscountPaisa = roundHalfUp(25% · (baseFare + distanceCharge))  // pool ≥ 2 ACTIVE members, else 0
+finalFarePaisa    = baseFare + distanceCharge − poolDiscount         // same row, updated in place
+```
+
+| Passenger | Route | solo (initial) | pooled (25% off) |
+|---|---|---|---|
+| Nusrat | Banani → Mohakhali | **5932 paisa** | **4449 paisa** |
+| Rafiq | Banani → Gulshan 1 | **4140 paisa** | **3105 paisa** |
+| Shirin | Banani → ... (any) | full fare | 25% off once pooled with a partner |
+
+Pooled values are pinned in `test/pooling.test.ts`, `test/rides.test.ts`, and
+`test/fare.test.ts`. `POST /api/rides/:rideId/cancel` (owner-only) cancels
+`REQUESTED`/`MATCHED` rides, frees the seats, recomputes remaining members'
+fares in place, and cancels a pool that empties (403/409/404 semantics in
+`test/pooling.test.ts`). The last-seat and first-pool races are covered by real
+concurrent tests against two database connections.
 
 ## Docker (full stack, reproducible)
 
@@ -438,4 +490,22 @@ engineering tool — never hidden. This is the record the PRD requires.
   needs yet, and email-binding lets anyone self-assign a seeded identity
   (including, with a crafted email, a DRIVER). New identities are provisioned
   on demand; demo-character mapping remains an explicit `users` UPDATE.
+- **Accepted suggestion (Phase 5):** create the racing pool with
+  `INSERT … ON CONFLICT DO NOTHING RETURNING` instead of a plain insert +
+  uniqueness-error retry. The conflict-target partial index
+  (`pools_single_active_per_vehicle`) turns the losing concurrent insert into a
+  no-op with an empty result, so one bounded re-scan joins the winner's pool —
+  no retry loop (ADR-017).
+- **Rejected/modified suggestion (Phase 5):** the agent's first concurrency draft
+  used a cached `available_seats` counter with optimistic `UPDATE … WHERE
+  available >= n` and a bounded retry loop. Rejected: a counter is a second
+  source of truth that can desync, and it did not solve the *pool-creation*
+  race on the same Tesla. The final design derives occupancy from ACTIVE
+  `pool_members` under a `SELECT … FOR UPDATE` on the pool row and settles
+  creation via the ON CONFLICT flow above.
+- **Rejected suggestion (Phase 5):** a Redis lock/`SETNX` gate for the last-seat
+  race. Rejected — the MVP has exactly one writer (PostgreSQL) and one hot row
+  (the pool row); a cache would add a second source of truth and latency. The
+  database-transactional claim is proven by concurrent tests; Redis stays out
+  per AGENTS.md "no unnecessary Redis" (ADR-017).
 - The human engineer owns and must be able to explain every line of code.

@@ -71,6 +71,13 @@ REQUESTED
   journal entry `NULL → REQUESTED` into `ride_status_history`; a REQUESTED ride
   holds no pool and no seats (`REQUESTED` is a seat-hold-free state, so Phase 4
   needs no concurrency locking — the pooling phase adds it, requirements §14).
+- **Phase 5 notes** (ADR-016/017): the full lifecycle is declared as an explicit
+  state machine (`apps/api/src/rides/state.ts`) with a single transition map;
+  every service state change goes through it and invalid moves raise
+  `409 INVALID_STATE_TRANSITION`. Phase 5 exercises the automatically-matched
+  `REQUESTED → MATCHED` and cancellation `{REQUESTED, MATCHED} → CANCELLED`
+  arms. `DRIVER_ARRIVED → STARTED → COMPLETED` are declared in the map now and
+  implemented with the driver flow (later phase).
 
 ## 5. Geography
 
@@ -80,6 +87,9 @@ REQUESTED
   plain lat/long points, or a lightweight free map.
 - **Invent and document a matching rule** (e.g., same pickup zone or compatible routes)
   and apply it **consistently** to Nusrat and Rafiq's overlapping-but-not-identical trip.
+- **Realized in Phase 5** (ADR-016): same pickup zone AND all-pairs drop-off
+  spread ≤ **2.0 km** (`POOL_DEST_SPREAD_KM`), applied deterministically —
+  fullest pool first, then `created_at`, then `id` (see §21.A).
 
 ## 6. Fare Model
 
@@ -93,8 +103,11 @@ REQUESTED
   Rafiq `Banani → Gulshan 1` = **4140 paisa (BDT 41.40)** — both pinned in
   `test/fare.test.ts` and `test/rides.test.ts`. Formula/rounding:
   `roundHalfUp(haversine × 1.3 × 1200)`; `final = base + distance − discount`
-  derived, never independently rounded; pool discount stays 0 until the ride
-  is pooled (later phase), then the same fare row is updated in place.
+  derived, never independently rounded; a pool discount stays 0 for a
+  single-member pool and is applied **in place** once a pool holds ≥ 2 ACTIVE
+  members (Phase 5, ADR-017): `poolDiscount = roundHalfUp(25% of (base +
+  distance))`, `final = base + distance − discount` — Nusrat lands at **4449
+  paisa**, Rafiq at **3105 paisa** (both pinned).
 - The evaluator must be able to **verify the calculation by hand** using Nusrat's
   and Rafiq's trip.
 - Document **how money is stored** (integer paisa/poysha vs. decimal) and why.
@@ -281,22 +294,52 @@ the ambiguity is explained, and one reasonable MVP assumption is proposed.
 ### A. Pool matching rule ("invent … a matching rule")
 - PRD: "Invent and document a matching rule (e.g. same pickup zone or compatible routes), and apply it consistently to Nusrat and Rafiq's overlapping-but-not-identical trip."
 - Ambiguity: No concrete rule is given; only examples.
-- MVP assumption: **Same pickup zone AND overlapping destination region (shared prefix of the predefined route), with a maximum detour allowance.** Concretely, define monotonic straight-line distances over predefined Dhaka zones; passengers are compatible if their pickup zone matches and the straight-line distance from drop-off A along the path to drop-off B is below a configured detour threshold. Applied consistently for Nusrat/Rafiq.
+- MVP assumption (finalized in Phase 5, ADR-016): **Same pickup zone AND
+  all-pairs drop-off spread ≤ `POOL_DEST_SPREAD_KM` (2.0 km)**, where the
+  spread is the maximum pairwise haversine distance among the given ride's and
+  every ACTIVE pool member's destination points. An existing eligible pool is
+  always preferred over creating a new one; the pool choice is fully
+  deterministic (**fullest first** — `occupiedSeats DESC, created_at ASC, id
+  ASC`) so concurrent requests converge on the same Tesla. Applied to the story:
+  Nusrat (Banani → Mohakhali) and Rafiq (Banani → Gulshan 1) share a pool
+  (spread ≈ 1.906 km); Banani → Dhanmondi does **not** (≈ 4.6 km from the pool).
+  The rule is pure and unit-tested (`test/matching.test.ts`), with no routing
+  engine — only predefined zone points (§5).
 
 ### B. Cancellation rules ("cancel while valid")
 - PRD: "cancel while valid" (passenger).
 - Ambiguity: What cancellations are valid, by whom, and under what state conditions?
-- MVP assumption: Passenger may cancel a ride while it is `REQUESTED`. Once `MATCHED/ACCEPTED`, cancellation is also allowed but recorded with a reason and the pool is resized consistently (capacity never exceeded). `CANCELLED` is a terminal state; a cancelled pool releases seats for reuse if not yet `STARTED`. This will be revisited when the state machine + tests are implemented (Phase 8).
+- MVP assumption (finalized in Phase 5, ADR-016/017): A passenger may cancel
+  their own ride while it is `REQUESTED` or `MATCHED`; cancellation is rejected
+  for every other state (`409 INVALID_STATE_TRANSITION`) and for any ride the
+  caller does not own (`404 NOT_FOUND`, never a leak). A `REQUESTED` cancel
+  just terminates the request. A `MATCHED` cancel frees the seats by flipping
+  the membership to `LEFT` (recorded with `left_at`), recomputes the remaining
+  members' fares in place, and terminates the pool when it becomes empty. No
+  `cancel_reason` column (the PRD only requires "cancel while valid" — a reason
+  would be speculative UI). **Forced cancellation** (driver/admin action,
+  `forceCancelRide`, no route yet) applies the same pool semantics plus a
+  **full refund**: the cancelled ride's fare is written back to zero via its
+  discount term (`final = base + distance − discount`, all CHECKs satisfied).
+  This assumption supersedes the earlier draft that always required a recorded
+  reason.
 
 ### C. Pool creation timing ("Multiple requests may share one Tesla")
 - PRD: Pool is a first-class actor; a ride may contain multiple passengers.
 - Ambiguity: Is a pool created when a passenger requests, or only when the driver accepts / when a second passenger matches?
-- MVP assumption: A `REQUESTED` ride holds no seats until it is accepted into a pool. Rides are grouped into a `Pool` at **matching time (REQUESTED → MATCHED/ACCEPTED)**, and seats are only committed on accepted pool membership. Driver accepts a pool (ride), which seals its members.
+- MVP assumption (finalized in Phase 5, ADR-016): A `REQUESTED` ride holds no
+  seats until it is matched. Matching runs **inside the create-ride
+  transaction** (ride + fare + history + membership commit together): the ride
+  is either joined to the best eligible existing pool or placed into a newly
+  created pool, and the ride becomes `MATCHED` with a committed membership —
+  seats are only ever consumed by an ACTIVE membership. **Phase 5 has no driver
+  "accept" step**: allocation happens at match time, so a pool begins life in
+  `MATCHED` (`DRIVER_ARRIVED`/accept flows arrive with the driver phase).
 
 ### D. Exact fare parameters
 - PRD: `passengerFare = baseFare + distanceCharge − poolDiscount`; must be hand-verifiable.
 - Ambiguity: No values for baseFare, per-km charge, or poolDiscount.
-- MVP assumption (**realized in Phase 4, ADR-015**): Paisa (int) based:
+- MVP assumption (**realized in Phase 4, ADR-015; discount realized in Phase 5, ADR-017**): Paisa (int) based:
   `baseFare = 3000 paisa (30 BDT)`, `distanceCharge = 1200 paisa/km (12 BDT/km)`,
   and for a pooled ride `poolDiscount = 25% of (baseFare + distanceCharge)`
   rounded **round-half-up** (deterministic; exact rule documented in ADR-015).
@@ -338,7 +381,7 @@ the ambiguity is explained, and one reasonable MVP assumption is proposed.
 ### I. Ride-history immutability
 - PRD: "hold onto enough history to explain exactly what happened."
 - Ambiguity: Is history append-only / immutable?
-- MVP assumption: Completed and cancelled rides are **presentation-immutable**: fares and status transitions are recorded as stored values (fare snapshots + status history table), never recomputed from later parameter changes. Fare parameters may change only for new rides.
+- MVP assumption: Completed and cancelled rides are **presentation-immutable**: fares and status transitions are recorded as stored values (fare snapshots + status history table), never recomputed from later parameter changes. Fare parameters may change only for new rides. **Lifecycle recomputes during pooling are NOT parameter drift** (ADR-015/017): a fare's base/distance are frozen at creation, and only the *derived* discount/final are rewritten in place on a join/leave/force-cancel — the same row, `fares.updated_at` bumped, all CHECKs recomputed to hold.
 
 ### J. Driver going offline with active rides
 - PRD: driver can go online/offline.

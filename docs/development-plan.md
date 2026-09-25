@@ -139,15 +139,43 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 
 ## Phase 5 — Pool matching
 
+> **Status: COMPLETE** (branch `feature/matching-pooling`). The documented,
+> deterministic matching rule (§21.A) and the full pool lifecycle are
+> implemented, including the automatch, the state machine, the seat-claim
+> concurrency design, and pooling fares. **Scope changes vs. the plan:**
+> (1) the ride state machine (`src/rides/state.ts`) was pulled forward into
+> this phase since automatching and cancellation are state transitions;
+> (2) the **pooled-fare recompute** was pulled forward from Phase 7 — joining,
+> cancelling, and force-cancelling rewrite the existing `fares` row in place
+> (`fares.updated_at`, migration 0004), so Phase 7 now only owns the README
+> worked example; (3) **there is no driver "accept" step in Phase 5** — matching
+> happens at request time, so a pool is born `MATCHED` (ADR-016); driver-flow
+> states (`DRIVER_ARRIVED → STARTED → COMPLETED`) are declared in the transition
+> map and get endpoints in Phase 6.
+
 - **Objective:** Documented matching rule (requirements §21.A) groups compatible
   requests into a pool on one Tesla.
-- **Deliverables:** matching service, pool creation/join, `MATCHED/ACCEPTED`,
-  explicit `pool_members`, seat accounting.
-- **Dependencies:** Phases 3, 4.
-- **Risks:** matching rule edge cases (Nusrat/Rafiq overlap but mismatch);
-  one-active-pool-per-vehicle guarantee.
-- **Tests:** Nusrat+Rafiq match; incompatible trips not matched; seats never
-  exceed capacity on join.
+- **Deliverables:** pure matching rule `src/matching/rules.ts` (same pickup zone
+  + all-pairs drop-off spread ≤ **2.0 km** + capacity; fullest pool first —
+  ADR-016); explicit transition map `src/rides/state.ts` (`409
+  INVALID_STATE_TRANSITION` on illegal moves); auto-match inside the create-ride
+  transaction; transactional seat claims (`SELECT … FOR UPDATE` pool row +
+  derived occupancy; pool creation via `INSERT … ON CONFLICT DO NOTHING
+  RETURNING` + one bounded re-scan — ADR-017); in-place pooled-fare recompute +
+  full-refund forced cancel (`src/rides/pooling/fare.ts`); `POST
+  /api/rides/:rideId/cancel` (ADR-018); migration 0004 (`fares.updated_at`,
+  additive). No Redis/queues/mutexes.
+- **Dependencies:** Phases 2, 3, 4.
+- **Risks (realized by tests):** matching edge cases (Nusrat+Rafiq pool at
+  ≈1.906 km spread; Banani→Dhanmondi at ≈4.6 km does not); last-seat race
+  (Rafiq vs Shirin, exactly one wins); first-seat race (two concurrent claims
+  coalesce onto ONE pool via ON CONFLICT); capacity never exceeded; empty-pool
+  cancel → pool CANCELLED; ownership isolation (404) and illegal-state cancel
+  (409).
+- **Tests:** `test/matching.test.ts`, `test/state.test.ts`, `test/pooling.test.ts`
+  (new) + `test/rides.test.ts`/`test/fare.test.ts` updates — full suite
+  **122 passing**, including two true concurrency races on two independent
+  database connections.
 
 ## Phase 6 — Driver flow
 
@@ -163,35 +191,53 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 
 ## Phase 7 — Fare calculation
 
-> **Status: mostly superseded by Phase 4.** The initial per-seat estimate
-> (`final = 3000 + roundHalfUp(haversine × 1.3 × 1200) − 0`) is already
-> implemented, unit-tested, and persisted at ride creation (ADR-015, K4/K5).
-> Remaining: the **pooled-fare recompute** — when a REQUESTED ride joins a pool,
-> the pooling service recomputes the discount and **updates the same `fares` row
-> in place** (`final = base + distance − poolDiscount`, 25% discount); the total
-> a passenger pays remains per-seat × seats. Worked pooled example (Nusrat +
-> Rafiq) lands here and in the README.
+> **Status: fully absorbed by Phases 4 + 5.** The initial per-seat estimate
+> (`final = 3000 + roundHalfUp(haversine × 1.3 × 1200) − 0`, ADR-015) is
+> persisted at ride creation, and the **pooled-fare recompute** was pulled
+> forward into Phase 5 (`src/rides/pooling/fare.ts`, ADR-017): when a pool holds
+> ≥ 2 ACTIVE members, every member's fare row is updated **in place** with
+> `poolDiscount = roundHalfUp(25%·(base + distance))`, `final = base + distance −
+> poolDiscount`; leaving (cancel) and forced-cancel-with-full-refund recompute
+> the same row too (`fares.updated_at`, migration 0004). The total a passenger
+> pays remains per-seat × seats. **Remaining for this phase scope:** the worked
+> by-hand pooled example (Nusrat + Rafiq → 4449 / 3105 paisa) lands in the README
+> (deferred to Phase 12 docs, already pinned in tests).
 
 - **Objective:** Correct, documented, hand-verifiable per-passenger fares.
-- **Deliverables:** pooled-fare recompute service updating the existing fare
-  row; worked example (Nusrat, Rafiq pooled) in README; the one-row-one-fare
-  invariant (updated in place, never duplicated).
+- **Deliverables:** (done) pooled-fare recompute service updating the existing
+  fare row; one-row-one-fare invariant (updated in place, never duplicated);
+  (deferred) worked example (Nusrat, Rafiq pooled) in README.
 - **Dependencies:** Phases 4, 5 (pooled trip needed).
 - **Risks:** rounding choice (settled: **round-half-up**, ADR-015);
   distance-approximation constant (requirements §21.D/H, = 1.3).
-- **Tests:** Nusrat and Rafiq's pooled fares match the published by-hand example;
-  precision is integer-based; snapshots are stable.
+- **Tests (implemented in Phase 5):** Nusrat 4449 / Rafiq 3105 paisa pinned in
+  `test/fare.test.ts` + `test/rides.test.ts`; precision integer-based; snapshots
+  stable; recompute rollback atomicity under an injected throwing recompute.
 
 ## Phase 8 — Concurrency / data integrity
 
+> **Status: pulled forward and completed in Phase 5.** The seat-claim race was a
+> first-class deliverable of the pooling phase (ADR-017), implemented in
+> `apps/api/src/rides/pooling/service.ts` and proven by `test/pooling.test.ts`
+> on two independent database connections. What remains for Phase 8's scope is
+> driver-phase concurrency (busy-vehicle guards once Phase 6 adds ARRIVED/STARTED
+> endpoints).
+
 - **Objective:** Seat-claim race cannot corrupt capacity (Nusrat vs. Shirin).
-- **Deliverables:** transactional seat allocation (`SELECT … FOR UPDATE` +
-  recheck + constraint), documented approach and large-scale alternative
-  (requirements §14).
-- **Dependencies:** Phases 5, 6.
-- **Risks:** deadlocks; choosing the right lock scope.
-- **Tests:** required behavioral test #6 — two concurrent claims on 1 remaining
-  seat; exactly one succeeds; capacity intact.
+- **Deliverables (done in Phase 5):** transactional seat allocation
+  (`SELECT … FOR UPDATE` pool row + derived-occupancy recheck; pool creation via
+  `INSERT … ON CONFLICT DO NOTHING RETURNING` + one bounded re-scan — no retry
+  loop), documented approach and large-scale alternative (requirements §14,
+  database.md §7). Chosen lock order: ride row → pool row (deadlock-free).
+  No Redis/queues/mutexes; the database is the truth.
+- **Dependencies:** Phases 5 (done), 6 (driver-phase residual).
+- **Risks (settled):** deadlocks (consistent ride→pool lock order);
+  choosing the right lock scope (pool row is the single per-Tesla
+  serialization point thanks to `pools_single_active_per_vehicle`).
+- **Tests (implemented):** required behavioral test #6 — Bullet pre-filled to 2
+  seats, Rafiq and Shirin concurrently claim the last seat: exactly one MATCHED,
+  one stays REQUESTED, occupancy stays 3; plus the first-pool race (both
+  concurrent claims land in one pool).
 
 ## Phase 9 — Frontend UX
 

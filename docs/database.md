@@ -179,21 +179,23 @@ Individual, per-request **final fare snapshot** in integer paisa.
 | `final_fare_paisa` | integer NOT NULL | CHECK `>= 0` **and** `= base + distance − discount` |
 | `currency` | char(3) NOT NULL DEFAULT `BDT` | CHECK 3 uppercase letters |
 | `created_at` | timestamptz | |
+| `updated_at` | timestamptz NOT NULL DEFAULT now() | **added in migration 0004** (Phase 5) so a pooling recompute is auditable |
 
 The formula `passengerFare = baseFare + distanceCharge − poolDiscount` is
 enforced by a CHECK so stored history can never contradict the documented fare
 model. **Implemented in Phase 4** (ADR-015, `apps/api/src/fare/`): the initial
 estimated fare is written per seat at ride creation (the `fares` row is the
 *current applied fare snapshot* — `pool_discount_paisa = 0` for a REQUESTED
-ride). When the request later joins a pool, the discount is recomputed and the
-**same row is updated in place** by the pooling-phase service — a lifecycle
-recompute, not parameter drift, so history-immutability
-(`docs/requirements.md` §21.I) is preserved. Values follow §21.D:
-`base = 3000 paisa`, `charge = roundHalfUp(haversine × 1.3 × 1200) paisa/km`.
-
-Note: `fares` has no `updated_at` column; the pooling phase should add one if
-the recompute must be audited (the `ride_status_history` journal already
-records the `REQUESTED → MATCHED` transition that accompanies it).
+ride). **Implemented in Phase 5** (`apps/api/src/rides/pooling/fare.ts`, ADR-017):
+when a pool reaches ≥ 2 ACTIVE members each fare is recomputed in place via
+`pool_discount = roundHalfUp(25%·(base+distance))`; joining, leaving
+(cancelling), and forced-cancelling all rewrite derived values on the **same
+row** (`fares.updated_at` bumped) — a lifecycle recompute, not parameter drift,
+so history-immutability (`docs/requirements.md` §21.I) is preserved. Forced
+cancellation produces a full refund **through the discount term**
+(`discount = base + distance`, `final = 0`), so the CHECK keeps holding. Values
+follow §21.D: `base = 3000 paisa`,
+`charge = roundHalfUp(haversine × 1.3 × 1200) paisa/km`.
 
 ### 3.9 `ride_status_history`
 
@@ -331,7 +333,9 @@ The DB's source of truth for "this request rides in this pool" is `pool_members`
 (which carries the same passenger, seats, and join/leave history). `ride_requests.pool_id`
 is denormalized for the passenger-facing status view and is kept consistent by
 the pooling service. The DB guards the obvious impossible value: a request with
-`pool_id` set is never `REQUESTED`.
+`pool_id` set is never `REQUESTED`. **Phase 5** (`src/rides/pooling/service.ts`)
+writes both together inside the create-and-match transaction, so the two can
+never disagree at commit.
 
 ### 5.4 Membership history is preserved
 `pool_members` rows are never deleted or overwritten (ON DELETE RESTRICT +
@@ -353,7 +357,11 @@ avoids the classic cache-divergence bug where a cached counter drifts from the
 truth. The DB still enforces the structural bounds (`seats > 0`, snapshots
 positive, one active pool per vehicle, one active membership per request); the
 **aggregate** occupancy vs. capacity check is transactional application logic
-(§7) because it spans rows.
+(§7) because it spans rows. **Implemented in Phase 5** (ADR-017): every claim
+re-derives this sum inside a `SELECT … FOR UPDATE` on the pool row, and pool
+**creation** races are settled with `INSERT … ON CONFLICT DO NOTHING RETURNING`
+against `pools_single_active_per_vehicle`, followed by exactly one re-scan to
+join the concurrent winner (§7).
 
 ### 5.6 `capacity_snapshot` preserves history
 `pools.capacity_snapshot` copies `vehicles.capacity` at pool creation. If Bullet
@@ -454,37 +462,46 @@ Deliberately **not** indexed (documented choice): `ride_requests.pickup_zone_id`
 no reverse query path, and a (never-occurring) zone delete only costs a scan on
 the FK restriction.
 
-## 7. Concurrency Strategy (planned for the pooling phase — NOT yet implemented)
+## 7. Concurrency Strategy (implemented in Phase 5)
 
 **What must hold:** Bullet has 1 seat left. Nusrat and Shirin both try to claim
 it at nearly the same instant; both may read `occupied = 2`, and exactly one of
-them may join. This is post-auth pooling-phase work — the **service** that
-implements it does not exist yet; this section documents the planned approach
-against the schema we now have (PRD §12 and `docs/requirements.md` §14).
+them may join. **Phase 5 implements this** in `apps/api/src/rides/pooling/
+service.ts` (ADR-017) and proves it with real concurrent tests
+(`test/pooling.test.ts`); §3.5 records why Phase 4 needed no locking (a
+`REQUESTED` ride holds no pool/seats; the only cross-request race — same
+`client_request_id` replayed twice — is settled by the partial unique index from
+migration 0003).
 
-**Phase 4 does not need locking:** a `REQUESTED` ride holds no pool and no
-seats — creation is (zone lookup + insert ride + insert fare + insert initial
-journal row) in one transaction, with no shared-mutable row to contend over.
-The only cross-request race Phase 4 must answer is a passenger retrying the
-same `client_request_id` twice — that is settled by the partial unique index
-`ride_requests_client_request_id_key` (migration 0003): the loser's INSERT
-hits the unique violation, its transaction rolls back, and the service
-replays the winner (§3.5, ADR-015).
+**Implemented strategy — DB-backed transactional consistency, database as truth:**
 
-**Planned strategy — DB-backed transactional consistency, database as truth:**
-
-1. `BEGIN` (default `read committed` or `repeatable read` is acceptable).
-2. `SELECT ... FOR UPDATE` on the **pool row** to serialize claims per pool. This
-   locks `pools` for the row being joined, so the two concurrent claims queue
-   instead of racing.
+1. `BEGIN` (default `read committed`).
+2. `SELECT ... FOR UPDATE` on the **pool row** to serialize claims per pool, so
+   the two concurrent claims queue instead of racing.
 3. Recompute occupancy inside the transaction:
    `SELECT COALESCE(SUM(seats),0) FROM pool_members WHERE pool_id=$pool AND status='ACTIVE'`.
-4. Assert `occupied + new.seats <= capacity_snapshot`; on violation, roll back
-   and return a 409/insufficient-seats error.
+4. Assert `occupied + new.seats <= capacity_snapshot`; on violation the ride
+   stays `REQUESTED` and the transaction commits as a no-op join (single-shot —
+   no retry loop), later matching attempts can still find the seat freed.
 5. Insert the `pool_members` row (and flip the request to `MATCHED`, with
    `pool_id` updated) in the **same transaction**.
 6. Commit. The second claimant's `FOR UPDATE` only sees the committed state and
-   correctly fails.
+   correctly fails to join.
+
+**Pool creation race** (two requests simultaneously claim a Tesla's first seat
+when no active pool exists yet): the create uses
+`INSERT INTO pools ... ON CONFLICT DO NOTHING RETURNING *`. The losing INSERT
+waits for the winner's transaction to settle, then skips with an **empty**
+result instead of aborting with SQLSTATE 23505 — and since the winner's commit
+is a complete statement-level snapshot (READ COMMITTED), a single bounded
+re-scan deterministically finds the winner's pool to join. Both passengers end
+`MATCHED` in the same pool, occupancy exact.
+
+**Lock ordering:** every transaction that writes both a ride row and a pool row
+acquires the RIDE row lock first, then the POOL row lock second (create holds
+the ride lock from its own INSERT; cancel/force-cancel `FOR UPDATE` the ride
+first, then the pool). Consistent ordering ⇒ no deadlock cycle between match,
+cancel, and force-cancel.
 
 Why this is safe here:
 - The **partial unique index** `pools_single_active_per_vehicle` already blocks a
@@ -500,7 +517,8 @@ becomes a hotspot, switch to a dedicated per-pool seat ledger (atomic
 `UPDATE ... WHERE occupied+n <= capacity_snapshot` as the atomic gate; read
 replicas for every read except the claim; and eventually a queue/event for
 latency isolation. These are deliberately deferred — see "Oi Tesla Goes Viral"
-notes in `docs/requirements.md` §15.
+notes in `docs/requirements.md` §15. No Redis/mutex/queue is used or planned
+(ADR-017).
 
 ## 8. Migrations and Seed
 
@@ -513,6 +531,11 @@ notes in `docs/requirements.md` §15.
   `0002_greedy_ultimatum.sql` (`DROP COLUMN password_hash`). Phase 4 added
   `0003_fluffy_pixie.sql` (`ADD COLUMN client_request_id uuid` + the partial
   unique index `ride_requests_client_request_id_key` — ADR-015 idempotency).
+  Phase 5 added `0004_spotty_harrier.sql` (**additive only**:
+  `ALTER TABLE fares ADD COLUMN updated_at timestamptz NOT NULL DEFAULT now()`
+  — ADR-017 auditability of the in-place pooling recompute). The pool/pool_members
+  tables and their partial unique indexes already existed from 0000 (ADR-012), so
+  no other schema change was needed for pooling.
   Generated SQL was reviewed and is committed **unmodified** — no manual edits
   unless a documented reason forces one.
 - Apply with `npm run db:migrate` (uses `apps/api/drizzle/meta/_journal.json`
@@ -568,9 +591,12 @@ npm run db:seed   -w @dhaka-tesla-pool/api    # idempotent cast seed
 5. A request cannot appear twice in the same pool — `UNIQUE(pool_id, ride_request_id)`. ✔ DB
 6. Occupied seats are derived from ACTIVE memberships — no cached counter. ✔ By design
 7. Occupied seats never exceed pool capacity — transactional `FOR UPDATE` +
-   derived sum (pooling phase service). ⏳ App (documented in §7)
+   derived sum (**implemented in Phase 5**, `src/rides/pooling/service.ts`,
+   ADR-017). ✔ App + DB
 8. A completed/cancelled ride cannot move back to an earlier state — state
-   machine + `ride_status_history` (later ride phase). ⏳ App
+   machine (`src/rides/state.ts`) + `ride_status_history`; invalid moves raise
+   `409 INVALID_STATE_TRANSITION` (**Phase 5 implemented the map for all
+   transitions; driver-flow arms exercised in later phases**). ✔ App
 9. Fare amounts cannot be negative — CHECK. ✔ DB
 10. Foreign keys always valid — FKs + restrictive delete policy. ✔ DB
 11. One app user per Clerk identity — `users.clerk_user_id` UNIQUE (ADR-013). ✔ DB
