@@ -1,4 +1,4 @@
-// Drizzle schema for Dhaka Tesla Pool — Phase 2 (database design).
+// Drizzle schema for Dhaka Tesla Pool — phases 2 (database design) + 3 (Clerk).
 //
 // Conventions:
 // - All primary keys are UUIDs (default gen_random_uuid(), PG >= 13 built-in).
@@ -6,10 +6,15 @@
 // - All money is integer paisa/poysha (never floating point).
 // - Domain enums are PostgreSQL-native enum types for integrity + readability.
 // - Ride-domain tables use ON DELETE RESTRICT: ride data is history and must
-//   stay explainable (docs/requirements.md §21.I). Sessions and vehicles are
-//   infrastructure owned by a user and use ON DELETE CASCADE.
+//   stay explainable (docs/requirements.md §21.I). vehicles are infrastructure
+//   owned by a user and use ON DELETE CASCADE.
 // - One naming for the PRD's lifecycle: "MATCHED/ACCEPTED" is stored as the
 //   single enum value MATCHED (see docs/database.md §5.2).
+// - Authentication is owned by Clerk (external identity provider). The local
+//   `users` table keeps the application-level record: a `clerk_user_id` maps a
+//   verified Clerk identity to the local user, and the application ROLE lives
+//   here in PostgreSQL (the application source of truth for authorization).
+//   There is no `sessions` table: Clerk owns the session lifecycle (ADR-013).
 //
 // What cannot be expressed as a simple SQL CHECK (documented, enforced by the
 // application in later phases):
@@ -38,7 +43,11 @@ import {
   text,
 } from "drizzle-orm/pg-core";
 
-export const userRoleEnum = pgEnum("user_role", ["PASSENGER", "DRIVER"]);
+export const userRoleEnum = pgEnum("user_role", [
+  "PASSENGER",
+  "DRIVER",
+  "ADMIN",
+]);
 
 export const rideStatusEnum = pgEnum("ride_status", [
   "REQUESTED",
@@ -55,16 +64,25 @@ export const poolMemberStatusEnum = pgEnum("pool_member_status", [
 ]);
 
 // ---------------------------------------------------------------------------
-// users
+// users — the application-owned user record.
+//
+// Clerk owns AUTHENTICATION (who you are: a verified Clerk identity).
+// This table owns the APPLICATION record (role, active, and every ride-domain
+// relationship): who the user is inside the product and what they may do.
+// `clerk_user_id` is the non-null, unique mapping from a verified Clerk
+// identity to this row. The role NEVER comes from the frontend or from Clerk —
+// it is stored here in PostgreSQL (docs/database.md §6).
 // ---------------------------------------------------------------------------
 export const users = pgTable(
   "users",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    // Clerk's opaque user identifier (e.g. "user_2..."). Unique + indexed via
+    // the unique constraint. Never invented/guessed: only a verified Clerk
+    // session produces a value that the API will look up here.
+    clerkUserId: text("clerk_user_id").notNull(),
     name: text("name").notNull(),
     email: text("email").notNull(),
-    // Argon2id hash; hashing is implemented in the auth phase (Phase 3).
-    passwordHash: text("password_hash").notNull(),
     role: userRoleEnum("role").notNull().default("PASSENGER"),
     active: boolean("active").notNull().default(true),
     createdAt: timestamp("created_at", { withTimezone: true })
@@ -81,34 +99,19 @@ export const users = pgTable(
     // construction; the app normalizes on write.
     check("users_email_lowercase", sql`${table.email} = lower(${table.email})`),
     unique("users_email_unique").on(table.email),
+    // One local application user per Clerk identity and vice-versa. The
+    // UNIQUE constraint creates the unique index the API uses to resolve a
+    // verified Clerk userId to its application record.
+    unique("users_clerk_user_id_unique").on(table.clerkUserId),
   ],
 );
 
 // ---------------------------------------------------------------------------
-// sessions — application-owned cookie sessions (Phase 3 auth).
+// NOTE: there is no `sessions` table. Phase 2 had an application-owned session
+// table for the originally planned manual cookie authentication; that design
+// was replaced by Clerk (ADR-013) and the table was dropped by migration 0001.
+// Clerk owns authentication sessions; PostgreSQL is not an auth-session store.
 // ---------------------------------------------------------------------------
-export const sessions = pgTable(
-  "sessions",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    userId: uuid("user_id")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
-    // Hash of the opaque session token (SHA-256 hex) — never store the raw token.
-    tokenHash: text("token_hash").notNull(),
-    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
-    createdAt: timestamp("created_at", { withTimezone: true })
-      .notNull()
-      .defaultNow(),
-  },
-  (table) => [
-    unique("sessions_token_hash_unique").on(table.tokenHash),
-    // look up a session by user (logout-all, user session list).
-    index("sessions_user_id_idx").on(table.userId),
-    // purge/query expired sessions efficiently.
-    index("sessions_expires_at_idx").on(table.expiresAt),
-  ],
-);
 
 // ---------------------------------------------------------------------------
 // vehicles — the driver-owned, fixed-capacity Tesla.
