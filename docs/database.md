@@ -454,6 +454,7 @@ ones are explained inline in `src/db/schema.ts` and summarized here.
 | users | `users_clerk_user_id_unique` | **one app user per Clerk identity** (ADR-013) — prevents double registration and silent identity swaps |
 | zones | `zones_name_unique` | deterministic, named geography |
 | ride_requests | (none beyond PK) | requests are never unique by content |
+| ride_requests | `ride_requests_one_active_per_passenger` (**partial**) | at most **one non-terminal ride per passenger** (`(passenger_id) WHERE status IN ('REQUESTED','MATCHED','DRIVER_ARRIVED','STARTED')`, migration 0006, ADR-021) — the DB is the arbiter when two bookings race; service maps a violation to `409 ACTIVE_RIDE_EXISTS` |
 | pools | `pools_single_active_per_vehicle` (**partial**) | a Tesla runs at most one active pool — capacity + concurrency integrity |
 | pool_members | `pool_members_pool_request_unique` | no request twice in the same pool |
 | pool_members | `pool_members_one_active_per_request` (**partial**) | a request in at most one active pool |

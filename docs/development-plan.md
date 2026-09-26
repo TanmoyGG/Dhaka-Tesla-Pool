@@ -270,6 +270,23 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 
 ## Phase 9 — Frontend UX
 
+> **Status: complete** on `feature/passenger-ui` → `feature/full-ride-driver-ux`
+> (ADR-021). Passenger and driver flows are implemented in `apps/web`:
+> always-dark plain-CSS design system (no Tailwind/shadcn pulled in — ADR-021
+> §4); Clerk sign-in/sign-up themed dark; role-aware nav + `RoleGate` pages
+> (PASSENGER ↔ DRIVER, UX-only — the API stays the security boundary);
+> passenger: book with a **live pre-booking estimate**
+> (`GET /api/rides/estimate`, ADR-021 §2), active-trip banner + hidden booking
+> form while a non-terminal ride exists (ADR-021 §1), 25%-shared-ride discount
+> in the fare breakdown, state timeline, two-step cancel; driver: online/offline
+> toggle with true state, open pools + pool detail (member list, seats, zones,
+> no fares P9), accept/arrive/start/complete actions, completed-trip history.
+> State pages poll at 5 s and **stop at terminal status** (ADR-021 §6). 36
+> Vitest + RTL tests; `next build` clean. **Deferred from this phase:** the
+> Zebra-style Leaflet + OSM map stays out of the MVP (visualization-only later,
+> ADR-007) and Playwright E2E is parked in Phase 10 — the six required
+> behaviors are covered by the API suite (162 tests) plus the web unit tests.
+
 - **Objective:** Passenger + driver flows with proper loading/error/empty states.
 - **Deliverables:** auth screens, ride request + fare display, status tracking,
   driver hub (online/offline, accept, lifecycle buttons), Zebra-style map

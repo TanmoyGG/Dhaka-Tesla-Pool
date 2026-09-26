@@ -183,7 +183,13 @@ flowchart LR
 |---|---|---|
 | `GET /health` (API) | **Public** | No auth (registered outside the `/api` scope) |
 | `/api/me` (API) | Signed-in user (any role) | Auth plugin preHandler (bearer token) + `requireAuth` |
+| `GET/POST /api/driver/availability` (API) | `DRIVER` | current switch state + toggle (Phase 6; `GET` added Phase 8 for the hub UI) |
+| `GET /api/driver/pools` (API) | `DRIVER` (own) | open pools hub (Phase 6) |
+| `GET /api/driver/pools/history` (API) | `DRIVER` (own) | terminal pools view (Phase 8, ADR-021 §3) |
+| `GET /api/driver/pools/:poolId` (API) | `DRIVER` (owner); 404 otherwise | one pool with passengers/seats/zones — no fares (Phase 6) |
+| `POST /api/driver/pools/:poolId/{accept,arrive,start,complete}` (API) | `DRIVER` (owner); 404/409 otherwise | lifecycle actions (Phase 6) |
 | `POST /api/rides` (API) | `PASSENGER` | `requireAuth` + `requireRole(["PASSENGER"])` + strict Zod body |
+| `GET /api/rides/estimate` (API) | `PASSENGER` | read-only pre-booking fare (ADR-021 §2); nothing persisted |
 | `GET /api/rides` (API) | `PASSENGER` (own rides only) | `requireAuth` + `requireRole(["PASSENGER"])` |
 | `GET /api/rides/:rideId` (API) | `PASSENGER` (owner); 404 otherwise | `requireAuth` + `requireRole(["PASSENGER"])` + owner check |
 | `POST /api/rides/:rideId/cancel` (API) | `PASSENGER` (owner); 404 or 409 otherwise | `requireAuth` + `requireRole(["PASSENGER"])` + owner/state checks (Phase 5) |

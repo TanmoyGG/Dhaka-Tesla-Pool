@@ -55,8 +55,12 @@ placeholders.
 > PRD-specific reason to change arises, document the reason in
 > `docs/decisions.md` before changing.
 
-- **Frontend:** Next.js (App Router), React, TypeScript, Tailwind CSS,
-  shadcn/ui, TanStack Query, React Hook Form, Zod, Leaflet + OpenStreetMap.
+- **Frontend:** Next.js (App Router), React, TypeScript, TanStack Query, React
+  Hook Form, Zod, Leaflet + OpenStreetMap (optional visualization later).
+  **Implemented deviation (ADR-021 §4):** the UI uses a hand-written always-dark
+  plain-CSS design system; Tailwind CSS + shadcn/ui were **not** pulled in —
+  do not add them without a new, documented reason. Clerk surfaces are themed
+  dark via `@clerk/themes`.
 - **Backend:** Node.js, Fastify, TypeScript, REST API, Zod, Pino.
 - **Database:** PostgreSQL, Drizzle ORM.
 - **Authentication:** Clerk at the edge — the web app uses `@clerk/nextjs`
