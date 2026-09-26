@@ -6,9 +6,17 @@
 //   instead of looking them up.
 //
 // The seed is NON-destructive: it never deletes or overwrites existing rows.
-// It only adds users, Jashim's Tesla Bullet, and the predefined Dhaka zones.
-// No rides, pools, or memberships are seeded — those arrive with the ride
-// features.
+// It only adds users, the four-driver Tesla fleet, and the predefined Dhaka
+// zones. No rides, pools, or memberships are seeded — those arrive with the
+// ride features.
+//
+// Besides Jashim and Bullet (the canonical cast), the seed includes three more
+// DRIVER-role drivers — Karim, Rahim and Faruq, each with a three-seat Tesla
+// (Tesla 2 / Tesla 3 / Tesla 4). They exist for the driver-accept-selection
+// story (ADR-022): a fresh pool waits UNASSIGNED in the driver lobby and the
+// first of these drivers to accept it wins it. They are seeded ONLINE so a
+// demo can accept immediately; going offline is the dashboard toggle
+// (requirements.md §21.J).
 //
 // Authentication is owned by Clerk (see docs/decisions.md ADR-013). The
 // application never stores passwords. The seeded users carry a reserved
@@ -41,7 +49,13 @@ export const SEED_IDS = {
   nusrat: "a1000000-0000-4000-8000-000000000002",
   rafiq: "a1000000-0000-4000-8000-000000000003",
   shirin: "a1000000-0000-4000-8000-000000000004",
+  karim: "a1000000-0000-4000-8000-000000000005",
+  rahim: "a1000000-0000-4000-8000-000000000006",
+  faruq: "a1000000-0000-4000-8000-000000000007",
   bullet: "b2000000-0000-4000-8000-000000000001",
+  tesla2: "b2000000-0000-4000-8000-000000000002",
+  tesla3: "b2000000-0000-4000-8000-000000000003",
+  tesla4: "b2000000-0000-4000-8000-000000000004",
 } as const;
 
 export const SEED_ZONE_IDS = {
@@ -84,6 +98,24 @@ export const SEED_USERS: Array<{
     name: "Shirin Islam",
     email: "shirin@example.com",
     role: "PASSENGER",
+  },
+  {
+    id: SEED_IDS.karim,
+    name: "Karim Hossain",
+    email: "karim@example.com",
+    role: "DRIVER",
+  },
+  {
+    id: SEED_IDS.rahim,
+    name: "Rahim Mia",
+    email: "rahim@example.com",
+    role: "DRIVER",
+  },
+  {
+    id: SEED_IDS.faruq,
+    name: "Faruq Hasan",
+    email: "faruq@example.com",
+    role: "DRIVER",
   },
 ];
 
@@ -186,6 +218,27 @@ export async function runSeed(
         capacity: 3,
         isOnline: true,
       },
+      {
+        id: SEED_IDS.tesla2,
+        driverId: SEED_IDS.karim,
+        name: "Tesla 2",
+        capacity: 3,
+        isOnline: true,
+      },
+      {
+        id: SEED_IDS.tesla3,
+        driverId: SEED_IDS.rahim,
+        name: "Tesla 3",
+        capacity: 3,
+        isOnline: true,
+      },
+      {
+        id: SEED_IDS.tesla4,
+        driverId: SEED_IDS.faruq,
+        name: "Tesla 4",
+        capacity: 3,
+        isOnline: true,
+      },
     ])
     .onConflictDoNothing();
 
@@ -195,7 +248,7 @@ export async function runSeed(
 
   if (options.log) {
     console.log(
-      `seed complete: ${SEED_USERS.length} users, 1 vehicle, ${SEED_ZONES.length} zones (idempotent, existing rows untouched)`,
+      `seed complete: ${SEED_USERS.length} users, 4 vehicles, ${SEED_ZONES.length} zones (idempotent, existing rows untouched)`,
     );
   }
 }
