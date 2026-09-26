@@ -1,12 +1,16 @@
 # Database Design — Dhaka Tesla Pool (MVP)
 
-> **Status:** Phases 2 + 3 complete. The schema described here is implemented in
-> `apps/api/src/db/schema.ts`, migrated by `apps/api/drizzle/0000_*.sql` +
-> `0001_*.sql` + `0002_*.sql`, and exercised by `apps/api/test/database.test.ts`.
-> The ERD below reflects the **actual** schema (including the Phase 3 Clerk
-> adaptation: `users.clerk_user_id`, no `sessions` table, no password hashes).
-> Everything else here is a record of the design decisions, invariants, and
-> planned later-phase behavior (which is marked as such).
+> **Status:** Phases 2–6 complete. The schema described here is implemented in
+> `apps/api/src/db/schema.ts`, migrated by `apps/api/drizzle/0000_*.sql` through
+> `0005_*.sql`, and exercised by `apps/api/test/database.test.ts` plus the
+> ride/pooling/driver/state suites. The ERD below reflects the **actual**
+> schema: the Phase 3 Clerk adaptation (`users.clerk_user_id`, no `sessions`
+> table, no password hashes), the Phase 4 idempotency key
+> (`ride_requests.client_request_id`, migration 0003), the Phase 5 pooled-fare
+> refresh (`fares.updated_at`, migration 0004), and the Phase 6 driver flow
+> (`pools.accepted_at`, migration 0005). Everything else here is a record of
+> the design decisions, invariants, and planned later-phase behavior (which is
+> marked as such).
 
 ## 1. Design Goals
 
