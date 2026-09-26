@@ -408,6 +408,23 @@ the ambiguity is explained, and one reasonable MVP assumption is proposed.
 - Ambiguity: Can one passenger reserve >1 seat, and does each seat get its own fare?
 - MVP assumption: A ride request declares a number of seats (1–3); passengerFare applies **per seat requested** (per-person fare is the unit documented/tested). Rarely used >1 in MVP but modeled correctly.
 
+### L. One active ride per passenger
+- PRD: "Track status … View history; cancel while valid." No explicit limit on
+  concurrent requests.
+- Ambiguity: May a passenger hold several simultaneously-active rides (multiple
+  seats on Bullet, or several parallel trips)?
+- MVP assumption (**realized in Phase 7, ADR-021, DB-enforced**): a passenger
+  may hold **at most one non-terminal ride at a time**. Partial unique index
+  `ride_requests_one_active_per_passenger` on `(passenger_id) WHERE status IN
+  ('REQUESTED','MATCHED','DRIVER_ARRIVED','STARTED')` (migration 0006); a second
+  booking during an active trip is rejected `409 ACTIVE_RIDE_EXISTS` even if two
+  requests race concurrently (the DB is the arbiter). Passenger-facing UX: the
+  web app hides the booking form and shows the active trip banner until the ride
+  reaches COMPLETED/CANCELLED. A passenger may freely book again once the
+  previous trip is terminal — the Nusrat flow (book → cancel → rebook) depends
+  on this. This is a product assumption for a working demo (one passenger cannot
+  meaningfully ride two Teslas at once), not a security boundary.
+
 ---
 
 ## 22. PRD Priorities Summary

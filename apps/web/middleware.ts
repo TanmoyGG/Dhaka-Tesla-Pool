@@ -2,15 +2,23 @@
 //
 // Policy for this phase:
 //   PUBLIC   / , /sign-in(.*), /sign-up(.*)
-//   PROTECTED /account(.*)          -> redirects to sign-in when signed out
+//   PROTECTED /account(.*), /rides(.*), /driver(.*) -> redirect to /sign-in
+//             when signed out
 //   /health lives on the Fastify API (different origin/port) and stays public.
+//
+// (Note: /driver pages are reserved for the upcoming driver UI; they are
+// protected here now so the policy is in place before the pages land.)
 //
 // Application route policy is documented in docs/architecture.md §3.4.
 
 import { NextResponse } from "next/server";
 import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
 
-const isProtectedRoute = createRouteMatcher(["/account(.*)"]);
+const isProtectedRoute = createRouteMatcher([
+  "/account(.*)",
+  "/rides(.*)",
+  "/driver(.*)",
+]);
 
 export default clerkMiddleware(async (auth, request) => {
   if (isProtectedRoute(request)) {

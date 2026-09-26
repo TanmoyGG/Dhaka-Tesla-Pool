@@ -71,6 +71,32 @@ accept/arrive/complete and offline-vs-booking. Migration 0005 adds
 `pools.accepted_at` + a progression CHECK (additive). Full suite **152/152**
 across 9 test files. See [Driver workflow](#driver-workflow-phase-6) below.
 
+**Phase 7 — One active ride, pre-booking estimates & driver read surface:
+complete.** Implemented on `feature/full-ride-driver-ux` (branch off
+`feature/passenger-ui`, ADR-021). A passenger may hold at most **one
+non-terminal ride** — enforced by the database (partial unique index
+`ride_requests_one_active_per_passenger`, migration 0006 → `409
+ACTIVE_RIDE_EXISTS`, race-safe even for two concurrent bookings). New
+`GET /api/rides/estimate` shows the deterministic fare **before** booking
+(PRD "See estimated fare"). New driver read routes `GET /api/driver/availability`
+(current switch state) and `GET /api/driver/pools/history` (terminal trips, still
+fare-free). Backend suite now **162/162 across 9 test files**.
+
+**Phase 8 — Passenger + driver web UI: complete** (ADR-021). `apps/web`
+exposes the full product flow against the complete API in an always-dark,
+plain-CSS design system (Clerk sign-in/sign-up themed dark via `@clerk/themes`):
+role-aware nav with `PASSENGER`/`DRIVER` gates, passenger booking with a live
+estimate preview, an active-trip banner that hides the booking form while a ride
+is in flight, pooled 25%-shared-ride discount visible in the fare breakdown, a
+state timeline that follows REQUESTED → MATCHED → DRIVER_ARRIVED → STARTED →
+COMPLETED, and a two-step cancel confirm. The driver hub adds the online/offline
+switch (true state from the API), open pools with passenger/seat/zone detail,
+the full accept → arrive → start → complete journey, and completed-trip history
+— still **no fares** anywhere in the driver view (P9). State pages poll at 5 s
+and stop at terminal status. Verified by 36 Vitest + RTL tests, clean
+`next build`, `typecheck`, and `lint`. The free Leaflet/OSM map stays optional
+(ADR-007/ADR-021 §4); see [Docs](#documentation).
+
 ## Project Description
 
 A ride-pooling MVP for Dhaka. Battery-powered, three-seat "Teslas" (easy-bike
@@ -119,9 +145,11 @@ route policy.
 
 Recorded as ADRs in [docs/decisions.md](docs/decisions.md).
 
-- **Frontend:** Next.js 15 (App Router), React 19, TypeScript. Tailwind CSS,
-  shadcn/ui, TanStack Query, React Hook Form, Zod, and Leaflet + OpenStreetMap
-  are added when the relevant frontend feature phase begins.
+- **Frontend:** Next.js 15 (App Router), React 19, TypeScript. TanStack Query,
+  React Hook Form, Zod. The UI is a hand-written always-dark plain-CSS design
+  system (no Tailwind/shadcn pulled in — ADR-021 §4); Clerk surfaces are themed
+  dark via `@clerk/themes`. Leaflet + OpenStreetMap remains an
+  optional/visualization-only later step (ADR-007).
 - **Backend:** Node.js, Fastify 5, TypeScript, REST, Pino. Zod validation is
   used by the rides endpoints (Phases 4/5); Pino logs errors.
 - **Database:** PostgreSQL 16 (Docker), Drizzle ORM (`postgres.js` driver),
@@ -131,8 +159,9 @@ Recorded as ADRs in [docs/decisions.md](docs/decisions.md).
   `authenticateRequest` on the API). Role-based authorization stays in
   PostgreSQL (`users.role`); no passwords or sessions are stored by the
   application. See [Authentication](#authentication) and ADR-013.
-- **Testing:** Vitest (122 tests across 8 files: 23 database + 19 auth + 7 fare
-  + 22 rides + matching/state/pooling suites), Playwright E2E (later phase).
+- **Testing:** Vitest — **162 API tests across 9 files** (database, auth, fare,
+  rides + matching/state/pooling + driver) and **36 web tests across 7 files**
+  (Vitest + React Testing Library). Playwright E2E (later phase).
 - **Infrastructure:** Docker, Docker Compose, GitHub Actions.
 - **Deployment:** Vercel, Render, Neon — free tier only (later phase).
 
@@ -147,11 +176,15 @@ Recorded as ADRs in [docs/decisions.md](docs/decisions.md).
 
 ```
 apps/
-  web/        Next.js 15 App Router frontend (Phase 1 scaffold + Phase 3 Clerk)
+  web/        Next.js 15 App Router frontend (Phase 8: full passenger + driver UI)
+              app/globals.css      always-dark design system (ADR-021 §4)
+              app/{page,rides,driver,account}/  role-aware passenger/driver flows
               middleware.ts        Clerk route policy (Phase 3)
               app/sign-in|sign-up  Clerk-managed auth pages (Phase 3)
-              app/account/         protected profile page (Phase 3)
-              lib/api.ts           bearer-token API client (Phase 3)
+              components/          app-shell, role-gate, booking-area, ride-form,
+                                   pool-info, status-timeline, cancel, driver/*
+              lib/{api,queries,types,format,pool-actions}.ts  client layer + state rules
+              test/                Vitest + RTL suite (36 tests)
   api/        Fastify 5 + Drizzle REST API (Phase 1 scaffold)
               src/db/schema.ts        schema (Phases 2–5)
               src/db/seed.ts          idempotent cast seed (Phases 2 + 3)
@@ -160,7 +193,8 @@ apps/
               src/matching/           pool matching rule (Phase 5, ADR-016)
               src/rides/              rides service/routes + state machine (Phases 4/5)
               src/rides/pooling/      seat-claim + fare recompute service (Phase 5)
-              drizzle/                generated migrations (Phases 2–5)
+              src/driver/             availability + hub + lifecycle routes (Phases 6/7)
+              drizzle/                generated migrations (Phases 2–7)
               test/                   suite (database, auth, fare, rides, matching,
                                       state, pooling — Phases 2–5)
 docs/
@@ -281,9 +315,9 @@ Authentication is managed by [Clerk](https://clerk.com) (ADR-013) — the
 application does **not** store passwords or sessions.
 
 - **Web (`@clerk/nextjs`):** `ClerkProvider` in the root layout, sign-in /
-  sign-up pages, a protected `/account` page, and `middleware.ts` route policy
-  (`/`, `/sign-in*`, `/sign-up*` public; `/account*` requires a signed-in user
-  and redirects to `/sign-in`).
+  sign-up pages, protected passenger pages, and `middleware.ts` route policy
+  (`/`, `/sign-in*`, `/sign-up*` public; `/account*`, `/rides*`, and
+  `/driver*` require a signed-in user and redirect to `/sign-in`).
 - **API (`@clerk/backend`):** Fastify verifies every request under `/api` with
   `authenticateRequest()` (bearer token). `apps/api/src/auth/` implements the
   flow as three injectable boundaries — `SessionVerifier` (token → Clerk
@@ -339,6 +373,60 @@ UPDATE users SET clerk_user_id = '<clerk-user-id>' WHERE email = 'nusrat@example
 Real Clerk IDs cannot collide with placeholders (`user_...` vs
 `dev-only::seed::...`).
 
+The four Development-cluster cast identities (below) are applied for you by the
+ready-made development-only script
+[`apps/api/scripts/map-cast-clerk-ids.sql`](apps/api/scripts/map-cast-clerk-ids.sql);
+it only updates `clerk_user_id` on the exact seeded rows and preserves every
+role.
+
+### Demo guide (local)
+
+A complete local demo of the passenger flow (roles come from the seed — they
+are never derived from email):
+
+1. **Start PostgreSQL (Docker):**
+   ```bash
+   docker compose up db
+   ```
+2. **Run migrations:**
+   ```bash
+   npm run db:migrate -w @dhaka-tesla-pool/api
+   ```
+3. **Run seed** (idempotent — adds Jashim, Nusrat, Rafiq, Shirin, Bullet, and
+   the 8 zones):
+   ```bash
+   npm run db:seed -w @dhaka-tesla-pool/api
+   ```
+4. **Map the four seeded cast users to their real Clerk Development
+   identities.** These four users are **Development-instance test users** (the
+   IDs are not secrets, but a matching `CLERK_SECRET_KEY` is required to verify
+   their sessions). The script preserves the seeded roles exactly:
+   ```bash
+   docker compose exec -T db psql -U postgres -d dhaka_tesla_pool -f - `
+     < apps/api/scripts/map-cast-clerk-ids.sql
+   ```
+   Result — `jashim@example.com` → DRIVER; `nusrat@example.com`, `rafiq@example.com`,
+   `shirin@example.com` → PASSENGER.
+5. **Sign in through Clerk** at `http://localhost:3000` with one of the four
+   Development accounts (any brand-new identity is provisioned automatically).
+6. **Scripted story:**
+   - Nusrat → book **Banani → Mohakhali** and watch the fare estimate before
+     confirming; the booked trip shows as an active banner that hides the
+     booking form. Cancel (with the two-step confirm) then **rebook** — the
+     active-ride rule only blocks while a trip is non-terminal.
+   - Rafiq → book **Banani → Gulshan 1** on Bullet → verify the pooled fare
+     (both riders see the 25% discount).
+   - Shirin → grab Bullet's **last seat** after it is 2/3 full — the
+     concurrency/capacity case.
+   - Jashim → the **driver hub** at `/driver`: go online, watch the automatched
+     open pools appear, and run accept → arrive → start → complete on the pool
+     detail. Pool completion frees Bullet for a new pool. The toggle is refused
+     while a pool is non-terminal (strict §21.J).
+
+No passwords appear in the README, source, seed, script, or git history. The
+four Clerk accounts are **Development-instance** test users in the project's
+dev Clerk application; any production instance uses separate real identities.
+
 ## API
 
 All `/api` routes require a Clerk session **bearer token**
@@ -348,13 +436,16 @@ All `/api` routes require a Clerk session **bearer token**
 | Endpoint | Policy | Notes |
 |---|---|---|
 | `GET /api/me` | any signed-in user | authenticated identity / role |
-| `POST /api/rides` | `PASSENGER` | create a ride request; automatically matched & pooled (Phase 5) |
+| `POST /api/rides` | `PASSENGER` | create a ride request; auto-matched & pooled (Phase 5); refused `409 ACTIVE_RIDE_EXISTS` while the caller has a non-terminal ride |
+| `GET /api/rides/estimate` | `PASSENGER` | read-only pre-booking fare estimate (`?pickupZoneId=&destinationZoneId=&requestedSeats=`), nothing persisted |
 | `GET /api/rides` | `PASSENGER` | the caller's own requests, newest first |
 | `GET /api/rides/:rideId` | `PASSENGER` (owner) | 404 for unknown/another user's ride |
 | `POST /api/rides/:rideId/cancel` | `PASSENGER` (owner) | cancel own ride while REQUESTED/MATCHED/DRIVER_ARRIVED (409 otherwise) |
 | `GET /api/zones` | any signed-in user | pickup/destination pick-list (8 zones) |
+| `GET /api/driver/availability` | `DRIVER` | current online/offline switch state |
 | `POST /api/driver/availability` | `DRIVER` | switch the driver's Teslas online/offline (`{ "isOnline": boolean }` → 204; refused while any pool is non-terminal) |
 | `GET /api/driver/pools` | `DRIVER` | the caller's non-terminal pools (newest first) |
+| `GET /api/driver/pools/history` | `DRIVER` | the caller's terminal (completed/cancelled) pools |
 | `GET /api/driver/pools/:poolId` | `DRIVER` (owner) | one pool with passengers/seats/zones — no fares; 404 if not theirs or unknown |
 | `POST /api/driver/pools/:poolId/accept` | `DRIVER` (owner) | confirm the assigned pool (idempotent; requires Tesla online) |
 | `POST /api/driver/pools/:poolId/arrive` | `DRIVER` (owner) | requires accept first (else 409) |
@@ -379,6 +470,12 @@ taken from the session, never from the body):
   `clientRequestId`** replays the existing ride and returns HTTP **200**
   (idempotent, migration 0003). Without a `clientRequestId`, each submission
   creates a new ride — documented MVP behavior.
+- **One active ride per passenger (ADR-021):** while the caller already has a
+  non-terminal ride (REQUESTED/MATCHED/DRIVER_ARRIVED/STARTED), a new booking is
+  refused with `409 ACTIVE_RIDE_EXISTS` — enforced by the database
+  (`ride_requests_one_active_per_passenger`, migration 0006), so even two
+  concurrent bookings from the same passenger race safely. Cancelled or
+  completed trips free the passenger to book again.
 - Same-zone-partner hint: riding with Nusrat (`Banani → Mohakhali`) or Rafiq
   (`Banani → Gulshan 1`) both use `pickupZoneId = Banani`.
 
@@ -571,4 +668,17 @@ engineering tool — never hidden. This is the record the PRD requires.
   (the pool row); a cache would add a second source of truth and latency. The
   database-transactional claim is proven by concurrent tests; Redis stays out
   per AGENTS.md "no unnecessary Redis" (ADR-017).
+- **Accepted suggestion (Phase 7):** enforce "one active ride per passenger"
+  with a **database partial unique index**
+  (`ride_requests_one_active_per_passenger`, migration 0006) whose violation the
+  service maps to `409 ACTIVE_RIDE_EXISTS`, instead of a read-then-write
+  application check. The DB is the arbiter even when two concurrent bookings
+  race (ADR-021 §1).
+- **Rejected/modified suggestion (Phase 8):** the agent's first draft of the
+  state pages polled forever (`refetchInterval: 5000` unconditionally). Modified
+  to **poll only while the trip is non-terminal and stop at
+  COMPLETED/CANCELLED** — an infinite poll on a finished trip is wasted traffic
+  and hides the "ride is over" state (ADR-021 §6). A Tailwind/shadcn scaffold
+  for the design was likewise deferred in favor of the hand-written plain-CSS
+  system (ADR-021 §4): no dependency without a reason.
 - The human engineer owns and must be able to explain every line of code.

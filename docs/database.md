@@ -1,12 +1,16 @@
 # Database Design — Dhaka Tesla Pool (MVP)
 
-> **Status:** Phases 2 + 3 complete. The schema described here is implemented in
-> `apps/api/src/db/schema.ts`, migrated by `apps/api/drizzle/0000_*.sql` +
-> `0001_*.sql` + `0002_*.sql`, and exercised by `apps/api/test/database.test.ts`.
-> The ERD below reflects the **actual** schema (including the Phase 3 Clerk
-> adaptation: `users.clerk_user_id`, no `sessions` table, no password hashes).
-> Everything else here is a record of the design decisions, invariants, and
-> planned later-phase behavior (which is marked as such).
+> **Status:** Phases 2–6 complete. The schema described here is implemented in
+> `apps/api/src/db/schema.ts`, migrated by `apps/api/drizzle/0000_*.sql` through
+> `0005_*.sql`, and exercised by `apps/api/test/database.test.ts` plus the
+> ride/pooling/driver/state suites. The ERD below reflects the **actual**
+> schema: the Phase 3 Clerk adaptation (`users.clerk_user_id`, no `sessions`
+> table, no password hashes), the Phase 4 idempotency key
+> (`ride_requests.client_request_id`, migration 0003), the Phase 5 pooled-fare
+> refresh (`fares.updated_at`, migration 0004), and the Phase 6 driver flow
+> (`pools.accepted_at`, migration 0005). Everything else here is a record of
+> the design decisions, invariants, and planned later-phase behavior (which is
+> marked as such).
 
 ## 1. Design Goals
 
@@ -450,6 +454,7 @@ ones are explained inline in `src/db/schema.ts` and summarized here.
 | users | `users_clerk_user_id_unique` | **one app user per Clerk identity** (ADR-013) — prevents double registration and silent identity swaps |
 | zones | `zones_name_unique` | deterministic, named geography |
 | ride_requests | (none beyond PK) | requests are never unique by content |
+| ride_requests | `ride_requests_one_active_per_passenger` (**partial**) | at most **one non-terminal ride per passenger** (`(passenger_id) WHERE status IN ('REQUESTED','MATCHED','DRIVER_ARRIVED','STARTED')`, migration 0006, ADR-021) — the DB is the arbiter when two bookings race; service maps a violation to `409 ACTIVE_RIDE_EXISTS` |
 | pools | `pools_single_active_per_vehicle` (**partial**) | a Tesla runs at most one active pool — capacity + concurrency integrity |
 | pool_members | `pool_members_pool_request_unique` | no request twice in the same pool |
 | pool_members | `pool_members_one_active_per_request` (**partial**) | a request in at most one active pool |

@@ -35,6 +35,19 @@ const rideParamsSchema = z.object({
   rideId: z.string().uuid("must be a valid UUID"),
 });
 
+// Query params arrive as strings; coerce the numeric seat count safely.
+const estimateQuerySchema = z.object({
+  pickupZoneId: z.string().uuid("must be a valid UUID"),
+  destinationZoneId: z.string().uuid("must be a valid UUID"),
+  requestedSeats: z.coerce
+    .number({ invalid_type_error: "must be a number" })
+    .int("must be an integer")
+    .min(1, "must be at least 1")
+    .max(MAX_REQUESTED_SEATS, `must be at most ${MAX_REQUESTED_SEATS}`),
+});
+
+type LoneRecord = Record<string, string | undefined>;
+
 function zodIssues(error: z.ZodError): Array<{ field: string; message: string }> {
   return error.issues.map((issue) => ({
     field: issue.path.join(".") || "body",
@@ -78,6 +91,26 @@ export const ridesRoutes: FastifyPluginAsync<RidesRoutesOptions> = async (
         // ride that already existed for this (passenger, clientRequestId).
         reply.code(result.created ? 201 : 200);
         return { ride: result.ride };
+      },
+    );
+
+    // Read-only fare estimate (PRD: "see estimated fare" BEFORE booking). Same
+    // thoroughfare-friendly formula a booking will use — nothing is created,
+    // so there is no idempotency key and no active-ride constraint here.
+    scope.get<{ Querystring: LoneRecord }>(
+      "/rides/estimate",
+      { preHandler: [scope.requireRole(["PASSENGER"])] },
+      async (request) => {
+        const parsed = estimateQuerySchema.safeParse(request.query);
+        if (!parsed.success) {
+          throw new RideValidationError(zodIssues(parsed.error));
+        }
+        const fare = await options.rides.estimateRide(request.auth!.user, {
+          pickupZoneId: parsed.data.pickupZoneId,
+          destinationZoneId: parsed.data.destinationZoneId,
+          requestedSeats: parsed.data.requestedSeats,
+        });
+        return { fare };
       },
     );
 

@@ -1,9 +1,15 @@
-// Ride-request integration tests (Phase 4).
+// Ride-request integration tests (Phase 4, extended in the driver-UX pass).
 //
 // These run against the disposable `_test` database (created and dropped per
 // run, never touching dev data) with DISPOSABLE AUTH fakes — no Clerk, no
 // network. The auth fakes resolve fixed tokens to the SEEDED story cast
-// (Nusrat / Rafiq / Jashim) so every ride row satisfies the users FK.
+// (Nusrat / Rafiq / Jashim / inactived Shirin) so every ride row satisfies the
+// users FK.
+//
+// EVERY test starts from an empty ride surface (wipeRideState beforeEach):
+// the one-active-ride-per-passenger rule (ADR-021) means "a second submission"
+// now means "a 409", so accumulating rides across tests would silently make
+// later tests pass for the wrong reason.
 //
 // If the configured PostgreSQL is unreachable the suite is skipped, matching
 // the database.test.ts convention.
@@ -12,11 +18,17 @@ import { type FastifyInstance } from "fastify";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { config } from "../src/config.js";
 import { buildApp } from "../src/app.js";
 import { SEED_IDS, SEED_ZONE_IDS, runSeed } from "../src/db/seed.js";
-import { fares, rideRequests, rideStatusHistory } from "../src/db/schema.js";
+import {
+  fares,
+  poolMembers,
+  pools,
+  rideRequests,
+  rideStatusHistory,
+} from "../src/db/schema.js";
 import { createRideService } from "../src/rides/service.js";
 import type { AuthDependencies, AuthUser } from "../src/auth/identity.js";
 import {
@@ -123,6 +135,16 @@ function createBody(overrides: Record<string, unknown> = {}) {
   };
 }
 
+// FK-safe wipe of the ride surface (children first): journal → members →
+// fares → rides → pools. Users/vehicles/zones are seed fixtures and stay.
+async function wipeRideState(): Promise<void> {
+  await db.delete(rideStatusHistory);
+  await db.delete(poolMembers);
+  await db.delete(fares);
+  await db.delete(rideRequests);
+  await db.delete(pools);
+}
+
 describeDb("ride requests (Phase 4)", () => {
   beforeAll(async () => {
     const testUrl = await resetTestDatabase(config.databaseUrl);
@@ -141,7 +163,15 @@ describeDb("ride requests (Phase 4)", () => {
     await client.end();
   });
 
-  it("requires a verified session for every /api route", async () => {
+  beforeEach(async () => {
+    await wipeRideState();
+  });
+
+  it("requires a verified session for every /api route (cancel/estimate routes are registered)", async () => {
+    // The reported cancel bug was "route POST /api/rides/:id/cancel not found"
+    // from a STALE image. A registered route responds 401 (missing session)
+    // BEFORE the handler runs; a missing route would 404. This is the
+    // regression test for that recovery.
     for (const method of ["GET", "POST"]) {
       const res = await app.inject({ method, url: "/api/rides" });
       expect(res.statusCode).toBe(401);
@@ -149,6 +179,20 @@ describeDb("ride requests (Phase 4)", () => {
     }
     const zones = await app.inject({ method: "GET", url: "/api/zones" });
     expect(zones.statusCode).toBe(401);
+
+    const cancel = await app.inject({
+      method: "POST",
+      url: "/api/rides/99999999-9999-4999-8999-999999999999/cancel",
+    });
+    expect(cancel.statusCode).toBe(401);
+    expect(cancel.json()).toMatchObject({ error: { code: "AUTH_UNAUTHENTICATED" } });
+
+    const estimate = await app.inject({
+      method: "GET",
+      url: "/api/rides/estimate",
+    });
+    expect(estimate.statusCode).toBe(401);
+    expect(estimate.json()).toMatchObject({ error: { code: "AUTH_UNAUTHENTICATED" } });
   });
 
   it("exposes the predefined zones to an authenticated caller (sorted by name)", async () => {
@@ -239,27 +283,33 @@ describeDb("ride requests (Phase 4)", () => {
   });
 
   it("scales the estimated total by the requested seats (stored components per seat)", async () => {
-    const res = await app.inject({
+    // Rafiq's 2-seat ride joins Nusrat's 1-seat pool: both members get the
+    // 25 % pooled discount — 3000 + 2932 - round(1482.97…) = 5932 - 1483 =
+    // 4449/seat. Bullet's 3 seats are now occupied.
+    const nusrat = await app.inject({
       method: "POST",
       url: "/api/rides",
       headers: AUTH("tok-passenger"),
+      payload: createBody(),
+    });
+    expect(nusrat.statusCode).toBe(201);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/rides",
+      headers: AUTH("tok-rafiq"),
       payload: createBody({ requestedSeats: 2 }),
     });
     expect(res.statusCode).toBe(201);
     const { ride } = res.json();
     expect(ride.requestedSeats).toBe(2);
 
-    // This second ride joins the pool the previous test created, so the pool
-    // now holds TWO ACTIVE members and both rides get the 25 % pooled
-    // discount: 3000 + 2932 - round(1482.97…) = 5932 - 1483 = 4449/seat.
     expect(ride.fare.baseFarePaisa).toBe(3000);
     expect(ride.fare.distanceChargePaisa).toBe(2932);
     expect(ride.fare.poolDiscountPaisa).toBe(1483);
     expect(ride.fare.finalFarePaisa).toBe(4449);
     expect(ride.fare.estimatedTotalPaisa).toBe(8898);
 
-    // Still fit the pool from the previous test (1 seat) without exceeding
-    // Bullet's 3-seat capacity.
     expect(ride.status).toBe("MATCHED");
     expect(ride.pool?.capacitySnapshot).toBe(3);
     expect(ride.pool!.occupiedSeats).toBe(3);
@@ -294,28 +344,51 @@ describeDb("ride requests (Phase 4)", () => {
     expect(rows).toHaveLength(1);
   });
 
-  it("creates a new ride per submission when no clientRequestId is given", async () => {
+  it("rejects a second ACTIVE ride with 409 ACTIVE_RIDE_EXISTS (Rule: one active ride per passenger)", async () => {
     const first = await app.inject({
       method: "POST",
       url: "/api/rides",
-      headers: AUTH("tok-rafiq"),
-      payload: createBody({
-        pickupZoneId: ZONE_IDS.banani,
-        destinationZoneId: ZONE_IDS.gulshan,
-      }),
+      headers: AUTH("tok-passenger"),
+      payload: createBody(),
     });
+    expect(first.statusCode).toBe(201);
+
     const second = await app.inject({
       method: "POST",
       url: "/api/rides",
-      headers: AUTH("tok-rafiq"),
-      payload: createBody({
-        pickupZoneId: ZONE_IDS.banani,
-        destinationZoneId: ZONE_IDS.gulshan,
-      }),
+      headers: AUTH("tok-passenger"),
+      payload: createBody(),
     });
-    expect(first.statusCode).toBe(201);
-    expect(second.statusCode).toBe(201);
-    expect(first.json().ride.id).not.toBe(second.json().ride.id);
+    expect(second.statusCode).toBe(409);
+    const body = second.json();
+    expect(body.error.code).toBe("ACTIVE_RIDE_EXISTS");
+    expect(body.error.message).toContain("You already have an active ride");
+
+    // A DIFFERENT passenger is unaffected, and cancelling frees the slot.
+    const rafiq = await app.inject({
+      method: "POST",
+      url: "/api/rides",
+      headers: AUTH("tok-rafiq"),
+      payload: createBody(),
+    });
+    expect(rafiq.statusCode).toBe(201);
+
+    const cancelled = await app.inject({
+      method: "POST",
+      url: `/api/rides/${first.json().ride.id}/cancel`,
+      headers: AUTH("tok-passenger"),
+    });
+    expect(cancelled.statusCode).toBe(200);
+    expect(cancelled.json().ride.status).toBe("CANCELLED");
+
+    const third = await app.inject({
+      method: "POST",
+      url: "/api/rides",
+      headers: AUTH("tok-passenger"),
+      payload: createBody(),
+    });
+    expect(third.statusCode).toBe(201);
+    expect(third.json().ride.id).not.toBe(first.json().ride.id);
   });
 
   it("keeps one ride even when duplicate submissions race for the same key", async () => {
@@ -334,11 +407,39 @@ describeDb("ride requests (Phase 4)", () => {
         payload: createBody({ clientRequestId: key }),
       }),
     ]);
+    // The loser replays the winner, so both reads describe the SAME ride.
     expect([a.statusCode, b.statusCode].sort()).toEqual([200, 201]);
+    expect(a.json().ride.id).toBe(b.json().ride.id);
     const rows = await db
       .select()
       .from(rideRequests)
       .where(eq(rideRequests.clientRequestId, key));
+    expect(rows).toHaveLength(1);
+  });
+
+  it("races two submissions WITHOUT a shared key: exactly one wins, the loser gets 409 (DB rule, not just a pre-check)", async () => {
+    // Same passenger, no idempotency key. The partial unique index
+    // ride_requests_one_active_per_passenger (migration 0006) lets exactly
+    // one through; the other sees 409 ACTIVE_RIDE_EXISTS whether it collides
+    // at the pre-check or inside the transaction on the index itself.
+    const [a, b] = await Promise.all([
+      app.inject({
+        method: "POST",
+        url: "/api/rides",
+        headers: AUTH("tok-passenger"),
+        payload: createBody(),
+      }),
+      app.inject({
+        method: "POST",
+        url: "/api/rides",
+        headers: AUTH("tok-passenger"),
+        payload: createBody(),
+      }),
+    ]);
+    expect([a.statusCode, b.statusCode].sort()).toEqual([201, 409]);
+
+    // Exactly ONE ride row exists after the race (no double booking).
+    const rows = await db.select().from(rideRequests);
     expect(rows).toHaveLength(1);
   });
 
@@ -460,46 +561,184 @@ describeDb("ride requests (Phase 4)", () => {
   });
 
   it("lists only the caller's own rides", async () => {
-    const nusratBefore = await app.inject({
-      method: "GET",
-      url: "/api/rides",
-      headers: AUTH("tok-passenger"),
-    });
-    const nusratCount = nusratBefore.json().rides.length;
-
-    const mine = await app.inject({
+    const nusrat = await app.inject({
       method: "POST",
       url: "/api/rides",
       headers: AUTH("tok-passenger"),
       payload: createBody(),
     });
-    void mine;
+    const nusratId = nusrat.json().ride.id;
 
-    const rafiqList = await app.inject({
+    const rafiq = await app.inject({
+      method: "POST",
+      url: "/api/rides",
+      headers: AUTH("tok-rafiq"),
+      payload: createBody({
+        pickupZoneId: ZONE_IDS.banani,
+        destinationZoneId: ZONE_IDS.gulshan,
+      }),
+    });
+    const rafiqId = rafiq.json().ride.id;
+
+    const rafiqRes = await app.inject({
       method: "GET",
       url: "/api/rides",
       headers: AUTH("tok-rafiq"),
     });
-    const nusratList = await app.inject({
+    const nusratRes = await app.inject({
       method: "GET",
       url: "/api/rides",
       headers: AUTH("tok-passenger"),
     });
 
-    const rafiqIds = rafiqList
-      .json()
-      .rides.map((r: { id: string }) => r.id);
-    const nusratIds = nusratList
-      .json()
-      .rides.map((r: { id: string }) => r.id);
+    const rafiqIds = rafiqRes.json().rides.map((r: { id: string }) => r.id);
+    const nusratIds = nusratRes.json().rides.map((r: { id: string }) => r.id);
 
-    // Rafiq sees only the two rides created earlier in this suite.
-    expect(rafiqIds).toHaveLength(2);
-    // Every Nusrat ride belongs to Nusrat; nothing of Rafiq's leaks in.
-    for (const id of nusratIds) {
-      expect(rafiqIds).not.toContain(id);
-    }
-    expect(nusratIds).toHaveLength(nusratCount + 1);
+    // Nothing leaks across passengers, and each list is complete for its owner.
+    expect(rafiqIds).toEqual([rafiqId]);
+    expect(nusratIds).toEqual([nusratId]);
+  });
+
+  it("estimates the fare BEFORE booking (GET /api/rides/estimate; nothing is created)", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/rides/estimate",
+      headers: AUTH("tok-passenger"),
+      query: {
+        pickupZoneId: ZONE_IDS.banani,
+        destinationZoneId: ZONE_IDS.mohakhali,
+        requestedSeats: "1",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    // Identical deterministic formula to a real booking's solo fare.
+    expect(res.json().fare).toEqual({
+      currency: "BDT",
+      baseFarePaisa: 3000,
+      distanceChargePaisa: 2932,
+      poolDiscountPaisa: 0,
+      finalFarePaisa: 5932,
+      perSeatFarePaisa: 5932,
+      estimatedTotalPaisa: 5932,
+    });
+
+    const seats = await app.inject({
+      method: "GET",
+      url: "/api/rides/estimate",
+      headers: AUTH("tok-passenger"),
+      query: {
+        pickupZoneId: ZONE_IDS.banani,
+        destinationZoneId: ZONE_IDS.mohakhali,
+        requestedSeats: "2",
+      },
+    });
+    expect(seats.json().fare.estimatedTotalPaisa).toBe(11864);
+
+    // Estimating never creates a ride.
+    const list = await app.inject({
+      method: "GET",
+      url: "/api/rides",
+      headers: AUTH("tok-passenger"),
+    });
+    expect(list.json().rides).toHaveLength(0);
+  });
+
+  it("estimates are NOT blocked by the active-ride rule (read-only)", async () => {
+    const ride = await app.inject({
+      method: "POST",
+      url: "/api/rides",
+      headers: AUTH("tok-passenger"),
+      payload: createBody(),
+    });
+    expect(ride.statusCode).toBe(201);
+
+    const estimate = await app.inject({
+      method: "GET",
+      url: "/api/rides/estimate",
+      headers: AUTH("tok-passenger"),
+      query: {
+        pickupZoneId: ZONE_IDS.banani,
+        destinationZoneId: ZONE_IDS.gulshan,
+        requestedSeats: "1",
+      },
+    });
+    expect(estimate.statusCode).toBe(200);
+  });
+
+  it("rejects an estimate from a DRIVER (403) and malformed estimate queries (400)", async () => {
+    const driver = await app.inject({
+      method: "GET",
+      url: "/api/rides/estimate",
+      headers: AUTH("tok-driver"),
+      query: {
+        pickupZoneId: ZONE_IDS.banani,
+        destinationZoneId: ZONE_IDS.mohakhali,
+        requestedSeats: "1",
+      },
+    });
+    expect(driver.statusCode).toBe(403);
+
+    const unknownZone = await app.inject({
+      method: "GET",
+      url: "/api/rides/estimate",
+      headers: AUTH("tok-passenger"),
+      query: {
+        pickupZoneId: "99999999-9999-4999-8999-999999999999",
+        destinationZoneId: ZONE_IDS.mohakhali,
+        requestedSeats: "1",
+      },
+    });
+    expect(unknownZone.statusCode).toBe(400);
+
+    const sameZone = await app.inject({
+      method: "GET",
+      url: "/api/rides/estimate",
+      headers: AUTH("tok-passenger"),
+      query: {
+        pickupZoneId: ZONE_IDS.banani,
+        destinationZoneId: ZONE_IDS.banani,
+        requestedSeats: "1",
+      },
+    });
+    expect(sameZone.statusCode).toBe(400);
+
+    const badSeats = await app.inject({
+      method: "GET",
+      url: "/api/rides/estimate",
+      headers: AUTH("tok-passenger"),
+      query: {
+        pickupZoneId: ZONE_IDS.banani,
+        destinationZoneId: ZONE_IDS.mohakhali,
+        requestedSeats: "7",
+      },
+    });
+    expect(badSeats.statusCode).toBe(400);
+  });
+
+  it("cancels only via the owner (another passenger's cancel 404s)", async () => {
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/rides",
+      headers: AUTH("tok-passenger"),
+      payload: createBody(),
+    });
+    const rideId = created.json().ride.id;
+
+    const other = await app.inject({
+      method: "POST",
+      url: `/api/rides/${rideId}/cancel`,
+      headers: AUTH("tok-rafiq"),
+    });
+    expect(other.statusCode).toBe(404);
+    expect(other.json().error.code).toBe("NOT_FOUND");
+
+    const owner = await app.inject({
+      method: "POST",
+      url: `/api/rides/${rideId}/cancel`,
+      headers: AUTH("tok-passenger"),
+    });
+    expect(owner.statusCode).toBe(200);
+    expect(owner.json().ride.status).toBe("CANCELLED");
   });
 
   it("rejects a malformed rideId with 400", async () => {

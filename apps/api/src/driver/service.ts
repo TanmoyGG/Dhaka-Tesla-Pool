@@ -16,11 +16,13 @@ import {
 
 export interface DriverService {
   setAvailability(driverId: string, isOnline: boolean): Promise<void>;
+  getAvailability(driverId: string): Promise<{ isOnline: boolean }>;
   acceptPool(driverId: string, poolId: string): Promise<DriverPoolView>;
   arrivePool(driverId: string, poolId: string): Promise<DriverPoolView>;
   startPool(driverId: string, poolId: string): Promise<DriverPoolView>;
   completePool(driverId: string, poolId: string): Promise<DriverPoolView>;
   listDriverPools(driverId: string): Promise<DriverPoolView[]>;
+  listDriverHistory(driverId: string, limit?: number): Promise<DriverPoolView[]>;
   getDriverPool(driverId: string, poolId: string): Promise<DriverPoolView>;
 }
 
@@ -28,11 +30,13 @@ export function createDriverService(database: AppDatabase): DriverService {
   const pooling = createPoolingService({ database });
   return {
     setAvailability: pooling.setAvailability,
+    getAvailability: pooling.getAvailabilityForDriver,
     acceptPool: pooling.acceptPool,
     arrivePool: pooling.arrivePool,
     startPool: pooling.startPool,
     completePool: pooling.completePool,
     listDriverPools: pooling.listDriverPools,
+    listDriverHistory: pooling.listDriverHistory,
     getDriverPool: pooling.getDriverPool,
   };
 }

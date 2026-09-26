@@ -624,6 +624,88 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
 - **Switch later if:** real routing/geo turns ARRIVAL into a verifiable event,
   or payment gates require the driver to confirm fares before starting.
 
+## ADR-021: One active ride per passenger, estimate endpoint, and the web UI (Phases 7–8)
+
+- **Status:** implemented on `feature/full-ride-driver-ux` (branched from
+  `feature/passenger-ui`). Backend additions in `apps/api` (migration 0006 +
+  `rides`/`driver` routes); the full web UI in `apps/web` with 36 Vitest + RTL
+  tests, clean `next build`.
+
+### 1. One active ride per passenger — database-enforced (requirements §21.L)
+- **Decision:** partial unique index `ride_requests_one_active_per_passenger`
+  on `ride_requests (passenger_id) WHERE status IN ('REQUESTED','MATCHED',
+  'DRIVER_ARRIVED','STARTED')` (migration 0006). The create-ride service maps a
+  constraint violation to `409 ACTIVE_RIDE_EXISTS` (`rides/errors.ts`); two
+  concurrent bookings from the same passenger serialize on the index — exactly
+  one wins (verified in `rides.test.ts`).
+- **Why:** a passenger book/cancel/rebook flow (e.g., the Nusrat demo —
+  book Banani→Mohakhali, cancel, rebook) needs a clear "occupied" signal; a DB
+  constraint beats a read-check-then-write race and needs no transaction ritual.
+  The frontend calls it `useRides().active` and hides the booking form — UX
+  only; the security boundary is the backend 409.
+- **Alternatives rejected:** application-level pre-check (racy — two toggles
+  could both pass before writing); letting the frontend decide (never trust the
+  client — AGENTS).
+
+### 2. Read-only pre-booking estimate (`GET /api/rides/estimate`)
+- **Decision:** a query route that runs the same deterministic fare
+  (`estimateFare`, ADR-015) as a real booking but persists **nothing**.
+  Response matches a booked ride's fare view so a confirmed booking renders
+  identically. Motivation: PRD's "See estimated fare" precedes "Request a ride"
+  — the passenger should see the number *before* committing. The web ride form
+  shows a live preview while still offering idempotent commit.
+
+### 3. Driver read surface (`GET /api/driver/availability`, `GET /api/driver/pools/history`)
+- **Decision:** two read-only `DRIVER` routes feed the driver hub UI without
+  widening the write surface: the current availability switch state (so the
+  toggle renders true state), and terminal pools (so "previous trips" is
+  renderable). Both keep the fare-free rule (P9) — no fares anywhere in the
+  driver graph.
+- **Alternative rejected:** reusing `GET /api/driver/pools` for both open and
+  completed trips — the route's non-terminal semantics are part of the
+  Phase 6 contract; a second read is cheaper than a semantics change.
+
+### 4. Web app: plain-CSS always-dark design system (no Tailwind/shadcn pulled in)
+- **Decision:** the web UI uses a hand-written componentized stylesheet
+  (`apps/web/app/globals.css`) — design tokens, typographic scale, header/nav,
+  cards, forms, badges, state timeline, driver member list — and forces the
+  Clerk sign-in/sign-up into the same dark theme via `@clerk/themes` `dark`
+  appearance (`appearance={{ theme: dark, variables: {...}, elements: {...} }}`,
+  Clerk v7 API — `theme`, not `baseTheme`; variables keys are
+  `colorPrimary/colorBackground/colorForeground/colorMutedForeground/colorInput/
+  colorInputForeground/colorPrimaryForeground/colorDanger/borderRadius/fontFamily`).
+- **Why now:** ADR-001 listed Tailwind + shadcn/ui for later, but AGENTS'
+  "never introduce a dependency without a reason" applies the other way too —
+  the MVP's surface (forms, cards, badges, a switch, a timeline, a member list)
+  is small enough to style explicitly, and a design system this lean costs fewer
+  moving parts than a toolchain. Server-side rendering compatibility and the
+  always-dark product look (a night-city Dhaka ride share) are trivial with
+  plain CSS. Git history + the two UX prior-art designs were the reference, not
+  a new framework.
+- **Switch later if:** the design surface grows (more roles, live map states) —
+  Tailwind/shadcn remain the sanctioned path (ADR-001).
+
+### 5. Role-aware navigation and gates are UX, not security
+- **Decision:** the web app derives the role from `GET /api/me` (`useMe`) and
+  redirects PASSENGER ↔ DRIVER between `/rides` and `/driver`; `RoleGate`
+  wraps pages. This is presentation — the API still enforces
+  `requireRole`/owner checks on every route (AGENTS: never trust frontend
+  validation alone).
+
+### 6. Polling, bounded and stopping at terminal
+- **Decision:** ride/pool state pages poll TanStack Query refetchIntervals
+  (5 s) **only while a trip is non-terminal**; once status is COMPLETED or
+  CANCELLED the interval is cleared. No websockets/SSE, no queue — consistent
+  with "no unnecessary infrastructure". Alternatives rejected: auto-refetch
+  forever (waste on finished trips), and a manual refresh button alone (the MVP
+  driver demo needs status to move without a click).
+
+- **Web tests:** 36 Vitest + RTL tests cover the rules helpers
+  (describeApiError, isTerminal/isCancellable, formatPaisa/formatStatus,
+  nextPoolAction), the two-step cancel button, active-ride gating of the
+  booking area, shared-discount visibility, the availability toggle, driver
+  pool actions, and the role gates.
+
 ## ADR-020: Driver lifecycle lock order — vehicle → rides → pool (Phase 6)
 
 - **Status:** implemented across `apps/api/src/rides/pooling/service.ts`

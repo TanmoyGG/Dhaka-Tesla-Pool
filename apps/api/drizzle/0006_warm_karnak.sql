@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "ride_requests_one_active_per_passenger" ON "ride_requests" USING btree ("passenger_id") WHERE "ride_requests"."status" not in ('COMPLETED', 'CANCELLED');
