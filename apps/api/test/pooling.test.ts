@@ -15,7 +15,7 @@
 // If the configured PostgreSQL is unreachable the suite is skipped (matching
 // the database.test.ts convention).
 
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import type { FastifyInstance } from "fastify";
@@ -43,6 +43,12 @@ import {
 
 const REACHABLE = await isDatabaseReachable(config.databaseUrl);
 const describeDb = REACHABLE ? describe : describe.skip;
+
+// Constraint-violation shape (drizzle wraps the PostgresError as .cause):
+//   23505 = unique_violation.
+function rejectionCode(code: string): { cause: { code: string } } {
+  return { cause: { code } };
+}
 
 const Z = SEED_ZONE_IDS;
 
@@ -189,23 +195,35 @@ describeDb("pooling (Phase 5)", () => {
   // Automatch + pooling behaviour
   // -------------------------------------------------------------------------
 
-  it("stays REQUESTED when no online Tesla can take the ride", async () => {
+  it("always creates an unassigned wait pool, even with no online Tesla", async () => {
+    // No Tesla being online no longer blocks a booking: every ride gets ONTO a
+    // pool at create time (ADR-022). It becomes an UNASSIGNED wait pool that
+    // some driver must accept — the offline fleet simply means nobody can
+    // accept it yet.
     await setBulletOnline(false);
-    const { ride } = await rides.createRequest(NUSRAT, booking());
-    expect(ride.status).toBe("REQUESTED");
-    expect(ride.pool).toBeNull();
-    expect(ride.fare.finalFarePaisa).toBe(5932);
-  });
-
-  it("automatches the first ride into a new pool on Bullet", async () => {
     const { ride } = await rides.createRequest(NUSRAT, booking());
     expect(ride.status).toBe("MATCHED");
     expect(ride.pool).toMatchObject({
       status: "MATCHED",
       capacitySnapshot: 3,
       occupiedSeats: 1,
-      vehicleName: "Bullet",
-      driverName: "Jashim Ahmed",
+      vehicleName: null,
+      driverName: null,
+    });
+    expect(ride.fare.finalFarePaisa).toBe(5932);
+  });
+
+  it("automatches the first ride into a new UNASSIGNED wait pool", async () => {
+    const { ride } = await rides.createRequest(NUSRAT, booking());
+    expect(ride.status).toBe("MATCHED");
+    // The pool waits for a driver: no vehicle, no driver, status MATCHED
+    // (ADR-022). Once Jashim accepts it, the same pool gains Bullet.
+    expect(ride.pool).toMatchObject({
+      status: "MATCHED",
+      capacitySnapshot: 3,
+      occupiedSeats: 1,
+      vehicleName: null,
+      driverName: null,
     });
   });
 
@@ -246,19 +264,26 @@ describeDb("pooling (Phase 5)", () => {
     // The final booking's view reflects the settled pool: 3/3 seats taken.
     expect(third.ride.pool?.occupiedSeats).toBe(3);
 
-    // 3/3 seats taken — a FOURTH passenger's 1-seat request must stay
-    // REQUESTED. (It is FAISA who claims now: Nusrat already holds an ACTIVE
-    // ride and the one-active-ride rule would reject her second booking with
-    // 409 before pooling even runs — see the concurrency suite below.)
+    // 3/3 seats taken — a FOURTH passenger's 1-seat request cannot fit the
+    // pool, so it starts its OWN unassigned wait pool instead of stalling
+    // REQUESTED (the "always create a wait pool" model, ADR-022). (It is
+    // FAISA who claims now: Nusrat already holds an ACTIVE ride and the
+    // one-active-ride rule would reject her second booking with 409 before
+    // pooling even runs — see the concurrency suite below.)
     const fourth = await rides.createRequest(FAISA, booking(BOOK_FAISA));
-    expect(fourth.ride.status).toBe("REQUESTED");
-    expect(fourth.ride.pool).toBeNull();
+    expect(fourth.ride.status).toBe("MATCHED");
+    expect(fourth.ride.pool?.status).toBe("MATCHED");
+    expect(fourth.ride.pool?.occupiedSeats).toBe(1);
+    expect(fourth.ride.pool?.id).not.toBe(first.ride.pool!.id);
+    expect(fourth.ride.pool?.vehicleName).toBeNull();
 
     const [poolRow] = await db
       .select()
       .from(pools)
       .where(eq(pools.id, first.ride.pool!.id));
     expect(poolRow?.capacitySnapshot).toBe(3);
+    expect(poolRow?.vehicleId).toBeNull();
+    expect(poolRow?.driverId).toBeNull();
     // Occupancy is DERIVED from ACTIVE memberships; still 3, never 4.
     const seats = await db
       .select({
@@ -269,13 +294,16 @@ describeDb("pooling (Phase 5)", () => {
     expect(seats[0]?.occupied).toBe(3);
   });
 
-  it("rejects a far drop-off (Banani → Dhanmondi, 4.585 km spread) into the pool", async () => {
-    await rides.createRequest(NUSRAT, booking());
+  it("gives a far drop-off its own wait pool instead of joining an incompatible one", async () => {
+    const near = await rides.createRequest(NUSRAT, booking());
     const far = await rides.createRequest(SHIRIN, booking(BOOK_DHANMONDI));
-    // Dhanmondi is outside POOL_DEST_SPREAD_KM from Mohakhali; Bullet already
-    // has an active pool, so no new Tesla is available either.
-    expect(far.ride.status).toBe("REQUESTED");
-    expect(far.ride.pool).toBeNull();
+    // Dhanmondi is outside POOL_DEST_SPREAD_KM from Mohakhali, so the far
+    // request does not join Nusrat's pool — it becomes its own UNASSIGNED
+    // wait pool (docs/requirements.md §21.M). Never stalls REQUESTED.
+    expect(far.ride.status).toBe("MATCHED");
+    expect(far.ride.pool?.status).toBe("MATCHED");
+    expect(far.ride.pool?.occupiedSeats).toBe(1);
+    expect(far.ride.pool?.id).not.toBe(near.ride.pool!.id);
   });
 
   it("a 2-seat ride claims two seats; a later 1-seat ride only fits with 3 free", async () => {
@@ -298,29 +326,37 @@ describeDb("pooling (Phase 5)", () => {
     expect(bigFare?.poolDiscountPaisa).toBe(1483);
     expect(bigFare?.finalFarePaisa).toBe(4449);
 
-    // No seat left for a third.
+    // No seat left for a third in THIS pool — Shirin gets her own wait pool
+    // (ADR-022: a claim that no longer fits never stalls REQUESTED).
     const shirin = await rides.createRequest(SHIRIN, booking());
-    expect(shirin.ride.status).toBe("REQUESTED");
+    expect(shirin.ride.status).toBe("MATCHED");
+    expect(shirin.ride.pool?.occupiedSeats).toBe(1);
+    expect(shirin.ride.pool?.id).not.toBe(rafiq.ride.pool!.id);
   });
 
-  it("a 3-seat request fills the pool; the next request stays REQUESTED", async () => {
+  it("a 3-seat request fills its wait pool; the next request gets its own", async () => {
     const full = await rides.createRequest(NUSRAT, booking({ requestedSeats: 3 }));
     expect(full.ride.pool?.occupiedSeats).toBe(3);
     expect(full.ride.fare.estimatedTotalPaisa).toBe(3 * 5932);
 
     const late = await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
-    expect(late.ride.status).toBe("REQUESTED");
-    expect(late.ride.pool).toBeNull();
+    expect(late.ride.status).toBe("MATCHED");
+    expect(late.ride.pool?.status).toBe("MATCHED");
+    expect(late.ride.pool?.occupiedSeats).toBe(1);
+    expect(late.ride.pool?.id).not.toBe(full.ride.pool!.id);
   });
 
   // -------------------------------------------------------------------------
   // Cancellation rules (docs/requirements.md §21.B)
   // -------------------------------------------------------------------------
 
-  it("cancels a REQUESTED ride (no pool to touch)", async () => {
-    await setBulletOnline(false);
+  it("cancelling the only member of an unassigned wait pool cancels the pool", async () => {
+    // Every booking lands in a pool at create time (ADR-022), so a cancel
+    // from a fresh wait pool frees its seat and, having no other members,
+    // terminates the pool itself.
     const { ride } = await rides.createRequest(NUSRAT, booking());
-    expect(ride.status).toBe("REQUESTED");
+    const poolId = ride.pool!.id;
+    expect(ride.status).toBe("MATCHED");
 
     const cancelled = await rides.cancelRequest(NUSRAT, ride.id);
     expect(cancelled.status).toBe("CANCELLED");
@@ -330,7 +366,17 @@ describeDb("pooling (Phase 5)", () => {
       .from(rideStatusHistory)
       .where(eq(rideStatusHistory.rideRequestId, ride.id))
       .orderBy(rideStatusHistory.createdAt, rideStatusHistory.id);
-    expect(history.map((h) => h.status)).toEqual(["REQUESTED", "CANCELLED"]);
+    // REQUESTED + MATCHED are journaled inside the SAME create transaction
+    // with identical timestamps, so their relative order is nondeterministic
+    // (uuid id tiebreak) — assert the reached-state SET plus the cancellation
+    // link (same convention as rides.test.ts).
+    expect(history.map((h) => h.status).slice().sort()).toEqual(
+      ["REQUESTED", "MATCHED", "CANCELLED"].sort(),
+    );
+    expect(history.find((h) => h.status === "CANCELLED")?.fromStatus).toBe("MATCHED");
+
+    const [poolRow] = await db.select().from(pools).where(eq(pools.id, poolId));
+    expect(poolRow?.status).toBe("CANCELLED");
   });
 
   it("cancelling a MATCHED ride frees its seat and recomputes the remaining fare", async () => {
@@ -518,15 +564,16 @@ describeDb("pooling (Phase 5)", () => {
   // Concurrency (the PRD's Nusrat-vs-Shirin final-seat race)
   // -------------------------------------------------------------------------
 
-  it("lets exactly one concurrent claim take the final seat; capacity never exceeds 3", async () => {
+  it("lets exactly one concurrent claim take the final seat; the loser gets its own wait pool", async () => {
     // Pre-occupied pool: Nusrat books TWO seats (a single 2-seat ride).
     const n = await rides.createRequest(NUSRAT, booking({ requestedSeats: 2 }));
     expect(n.ride.pool?.occupiedSeats).toBe(2);
 
-    // Two independent connections race for Bullet's last seat concurrently:
+    // Two independent connections race for the pool's last seat concurrently:
     // Rafiq (Banani → Gulshan 1) vs Shirin (Banani → Mohakhali). Both routes
     // overlap the pool's occupants within POOL_DEST_SPREAD_KM, so both target
-    // the SAME pool — exactly one may win.
+    // the SAME pool — exactly one may win the final seat. The loser never
+    // stalls REQUESTED: it starts its own UNASSIGNED wait pool (ADR-022).
     const clientA = postgres(testUrl, { max: 1 });
     const clientB = postgres(testUrl, { max: 1 });
     const serviceA = createRideService(drizzle(clientA));
@@ -538,30 +585,63 @@ describeDb("pooling (Phase 5)", () => {
         serviceB.createRequest(SHIRIN, booking(BOOK_SHIRIN)),
       ]);
 
-      const statuses = [a.ride.status, b.ride.status].sort();
-      expect(statuses).toEqual(["MATCHED", "REQUESTED"]);
-      const matched = a.ride.status === "MATCHED" ? a : b;
+      expect(a.ride.status).toBe("MATCHED");
+      expect(b.ride.status).toBe("MATCHED");
 
-      // The pool still holds exactly 3 seats — never 4.
+      // The seat winner rides in the CONTESTED pool; the loser rides its own
+      // 1-seat wait pool elsewhere (never ACCEPTED into the contested pool).
+      const contender = a.ride.pool!.id === n.ride.pool!.id ? a : b;
+      const loser = contender === a ? b : a;
+      expect(contender.ride.pool!.id).toBe(n.ride.pool!.id);
+      expect(loser.ride.pool!.id).not.toBe(n.ride.pool!.id);
+      expect(loser.ride.pool?.occupiedSeats).toBe(1);
+
+      // The contested pool still holds exactly 3 seats — never 4.
       const seats = await db
         .select({
           occupied: sql<number>`coalesce(sum(${poolMembers.seats}), 0)::int`,
         })
         .from(poolMembers)
-        .where(eq(poolMembers.poolId, matched.ride.pool!.id));
+        .where(eq(poolMembers.poolId, n.ride.pool!.id));
       expect(seats[0]?.occupied).toBe(3);
 
-      // The winner is a real member; the loser has no membership and no pool.
-      const losers = [a, b].filter((x) => x.ride.status !== "MATCHED");
-      expect(losers[0]?.ride.pool).toBeNull();
+      // The loser holds NO ACTIVE membership in the contested pool — exactly
+      // Nusrat + the seat winner ride there.
+      const contestedMembers = await db
+        .select()
+        .from(poolMembers)
+        .where(eq(poolMembers.poolId, n.ride.pool!.id));
+      expect(contestedMembers).toHaveLength(2);
+
+      // No pool anywhere exceeds the 3-seat capacity.
+      const allPools = await db.select().from(pools);
+      for (const pool of allPools) {
+        const occupied = await db
+          .select({
+            n: sql<number>`coalesce(sum(${poolMembers.seats}), 0)::int`,
+          })
+          .from(poolMembers)
+          .where(
+            and(
+              eq(poolMembers.poolId, pool.id),
+              eq(poolMembers.status, "ACTIVE"),
+            ),
+          );
+        expect(occupied[0]?.n).toBeLessThanOrEqual(pool.capacitySnapshot);
+      }
     } finally {
       await clientA.end();
       await clientB.end();
     }
   });
 
-  it("coalesces two concurrent first-claims onto ONE pool (ON CONFLICT path)", async () => {
-    // Empty state: no pool exists, both requests race to create Bullet's pool.
+  it("creates SEPARATE wait pools for two concurrent first-claims (accepted tradeoff)", async () => {
+    // Empty state: no pool exists, both requests race to claim a seat at the
+    // same moment. Neither finds an eligible pool, so EACH starts its own
+    // UNASSIGNED wait pool. This is the documented, accepted tradeoff of
+    // passenger-first matching (ADR-022): occupancy is always right and no
+    // seat is ever double-booked, but two concurrent first-rides can briefly
+    // form two pools where a cooperative driver pool could have joined them.
     const clientA = postgres(testUrl, { max: 1 });
     const clientB = postgres(testUrl, { max: 1 });
     const serviceA = createRideService(drizzle(clientA));
@@ -573,30 +653,37 @@ describeDb("pooling (Phase 5)", () => {
         serviceB.createRequest(RAFIQ, booking(BOOK_RAFIQ)),
       ]);
 
-      // Both matched — onto the SAME pool (the loser's INSERT raced and
-      // surrendered via ON CONFLICT DO NOTHING, then re-joined the winner).
       expect(a.ride.status).toBe("MATCHED");
       expect(b.ride.status).toBe("MATCHED");
-      expect(a.ride.pool?.id).toBe(b.ride.pool?.id);
+      expect(a.ride.pool?.id).not.toBe(b.ride.pool?.id);
 
       const poolRows = await db.select().from(pools);
-      expect(poolRows).toHaveLength(1);
-      expect(poolRows[0]?.status).toBe("MATCHED");
+      expect(poolRows).toHaveLength(2);
+      for (const pool of poolRows) {
+        expect(pool.status).toBe("MATCHED");
+        expect(pool.vehicleId).toBeNull();
+        expect(pool.driverId).toBeNull();
+        expect(pool.capacitySnapshot).toBe(3);
+      }
 
-      const seats = await db
-        .select({
-          occupied: sql<number>`coalesce(sum(${poolMembers.seats}), 0)::int`,
-        })
-        .from(poolMembers)
-        .where(eq(poolMembers.poolId, poolRows[0]!.id));
-      expect(seats[0]?.occupied).toBe(2);
+      // Each wait pool holds exactly its own member; no pool can exceed its
+      // capacity no matter how the race was ordered.
+      for (const pool of poolRows) {
+        const occupied = await db
+          .select({
+            n: sql<number>`coalesce(sum(${poolMembers.seats}), 0)::int`,
+          })
+          .from(poolMembers)
+          .where(eq(poolMembers.poolId, pool.id));
+        expect(occupied[0]?.n).toBe(1);
+      }
 
-      // Both members eligible for the pooled discount now.
+      // Two separate single-member pools: no pooled discount in either.
       const faresN = await db
         .select()
         .from(fares)
         .where(eq(fares.rideRequestId, a.ride.id));
-      expect(faresN[0]?.poolDiscountPaisa).toBe(1483);
+      expect(faresN[0]?.poolDiscountPaisa).toBe(0);
     } finally {
       await clientA.end();
       await clientB.end();
@@ -644,29 +731,32 @@ describeDb("pooling (Phase 5)", () => {
     }
   });
 
-  it("rejects a second active pool on the same Tesla at the DB level", async () => {
-    const { ride } = await rides.createRequest(NUSRAT, booking());
-    const poolId = ride.pool!.id;
+  it("rejects a second ACCEPTED non-terminal pool per driver at the DB level", async () => {
+    // A driver may hold at most one accepted non-terminal pool (ADR-022). Even
+    // with application logic bypassed, the partial unique index
+    // pools_single_accepted_per_driver must enforce it on disk. (Unassigned
+    // wait pools carry driver_id NULL and never contend.)
+    await rides.createRequest(NUSRAT, booking());
+    const now = new Date();
 
-    // Simulate a buggy service trying to create a second non-terminal pool on
-    // Bullet while the first is active: the partial unique index must enforce
-    // the invariant even if application logic ever goes wrong.
-    const [tesla] = await db
-      .select()
-      .from(vehicles)
-      .where(eq(vehicles.id, SEED_IDS.bullet));
-    let rejected = false;
-    try {
-      await db.insert(pools).values({
+    await expect(
+      db.insert(pools).values({
         vehicleId: SEED_IDS.bullet,
-        driverId: tesla!.driverId,
+        driverId: SEED_IDS.jashim,
         status: "MATCHED",
         capacitySnapshot: 3,
-      });
-    } catch {
-      rejected = true;
-    }
-    expect(rejected).toBe(true);
-    expect(poolId).toBeTruthy();
+        acceptedAt: now,
+      }),
+    ).resolves.toBeDefined();
+
+    await expect(
+      db.insert(pools).values({
+        vehicleId: SEED_IDS.bullet,
+        driverId: SEED_IDS.jashim,
+        status: "MATCHED",
+        capacitySnapshot: 3,
+        acceptedAt: new Date(),
+      }),
+    ).rejects.toMatchObject(rejectionCode("23505"));
   });
 });

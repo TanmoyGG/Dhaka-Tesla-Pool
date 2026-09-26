@@ -211,7 +211,7 @@ describeDb("ride requests (Phase 4)", () => {
     );
   });
 
-  it("creates Nusrat's ride, automatched into a new pool on Bullet (Phase 5)", async () => {
+  it("creates Nusrat's ride, landed in a brand-new UNASSIGNED wait pool (ADR-022)", async () => {
     const res = await app.inject({
       method: "POST",
       url: "/api/rides",
@@ -221,8 +221,9 @@ describeDb("ride requests (Phase 4)", () => {
     expect(res.statusCode).toBe(201);
     const { ride } = res.json();
 
-    // Auto-match: this FIRST request found no eligible pool and created one on
-    // Bullet (Jashim's online Tesla), so the ride is MATCHED immediately.
+    // Matching never selects a driver or Tesla anymore (ADR-022): this FIRST
+    // request found no eligible pool and started its own UNASSIGNED wait pool,
+    // so the ride is MATCHED immediately and waits in the driver lobby.
     expect(ride.status).toBe("MATCHED");
     expect(ride.pickupZone.name).toBe("Banani");
     expect(ride.destinationZone.name).toBe("Mohakhali");
@@ -240,12 +241,14 @@ describeDb("ride requests (Phase 4)", () => {
       estimatedTotalPaisa: 5932,
     });
 
+    // No driver has accepted the wait pool yet: vehicle/driver are NULL until
+    // the first-wins accept assigns them (ADR-022).
     expect(ride.pool).toMatchObject({
       status: "MATCHED",
       capacitySnapshot: 3,
       occupiedSeats: 1,
-      vehicleName: "Bullet",
-      driverName: "Jashim Ahmed",
+      vehicleName: null,
+      driverName: null,
     });
 
     // The DB row is a MATCHED ride inside a pool, owned by Nusrat.

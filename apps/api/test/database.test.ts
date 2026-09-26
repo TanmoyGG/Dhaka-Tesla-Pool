@@ -70,8 +70,8 @@ async function insertRideRequest(overrides: Partial<typeof rideRequests.$inferIn
 // The one-active-ride partial unique index (migration 0006, ADR-021) forbids
 // a passenger from holding two non-terminal rows even when rows are inserted
 // DIRECTLY through the database, so every test starts from an empty ride
-// surface (children first). Vehicles other than the seeded Bullet are
-// test-created pools' parents and are wiped too.
+// surface (children first). Test-created vehicles (parent rows of test pools)
+// are wiped too; the four seeded fleet vehicles (Bullet + Tesla 2/3/4) stay.
 async function wipeRideSurface(): Promise<void> {
   await db.transaction(async (tx) => {
     await tx.delete(rideStatusHistory);
@@ -79,7 +79,11 @@ async function wipeRideSurface(): Promise<void> {
     await tx.delete(fares);
     await tx.delete(rideRequests);
     await tx.delete(pools);
-    await tx.delete(vehicles).where(sql`${vehicles.id} <> ${SEED_IDS.bullet}`);
+    await tx
+      .delete(vehicles)
+      .where(
+        sql`${vehicles.id} not in (${SEED_IDS.bullet}, ${SEED_IDS.tesla2}, ${SEED_IDS.tesla3}, ${SEED_IDS.tesla4})`,
+      );
   });
 }
 
@@ -140,23 +144,43 @@ describeDb("database schema (Phases 2 + 3)", () => {
     ]);
   });
 
-  it("seed inserts the story cast, Bullet, and the predefined zones", async () => {
+  it("seed inserts the story cast, the four-driver fleet, and the predefined zones", async () => {
     const seededUsers = await db.select().from(users);
-    expect(seededUsers).toHaveLength(4);
+    expect(seededUsers).toHaveLength(7);
 
     const jashim = seededUsers.find((u) => u.id === SEED_IDS.jashim);
     expect(jashim?.role).toBe("DRIVER");
 
-    for (const castName of ["Nusrat Haque", "Rafiq Rahman", "Shirin Islam"]) {
+    for (const castName of [
+      "Nusrat Haque",
+      "Rafiq Rahman",
+      "Shirin Islam",
+      "Karim Hossain",
+      "Rahim Mia",
+      "Faruq Hasan",
+    ]) {
       expect(seededUsers.some((u) => u.name === castName)).toBe(true);
     }
 
-    const bullet = await db.select().from(vehicles);
-    expect(bullet).toHaveLength(1);
-    expect(bullet[0]!.name).toBe("Bullet");
-    expect(bullet[0]!.capacity).toBe(3);
-    expect(bullet[0]!.driverId).toBe(SEED_IDS.jashim);
-    expect(bullet[0]!.isOnline).toBe(true);
+    // Four DRIVER-role cast members with one three-seat Tesla each (the
+    // driver-accept-selection story, ADR-022).
+    const seededVehicles = await db.select().from(vehicles);
+    expect(seededVehicles).toHaveLength(4);
+    const bullet = seededVehicles.find((v) => v.id === SEED_IDS.bullet)!;
+    expect(bullet.name).toBe("Bullet");
+    expect(bullet.capacity).toBe(3);
+    expect(bullet.driverId).toBe(SEED_IDS.jashim);
+    expect(bullet.isOnline).toBe(true);
+
+    expect(seededVehicles.find((v) => v.id === SEED_IDS.tesla2)?.driverId).toBe(
+      SEED_IDS.karim,
+    );
+    expect(seededVehicles.find((v) => v.id === SEED_IDS.tesla3)?.driverId).toBe(
+      SEED_IDS.rahim,
+    );
+    expect(seededVehicles.find((v) => v.id === SEED_IDS.tesla4)?.driverId).toBe(
+      SEED_IDS.faruq,
+    );
 
     const seededZones = await db.select().from(zones);
     expect(seededZones).toHaveLength(8);
@@ -188,8 +212,10 @@ describeDb("database schema (Phases 2 + 3)", () => {
     await runSeed(db);
     const seededUsers = await db.select().from(users);
     const seededZones = await db.select().from(zones);
-    expect(seededUsers).toHaveLength(4);
+    const seededVehicles = await db.select().from(vehicles);
+    expect(seededUsers).toHaveLength(7);
     expect(seededZones).toHaveLength(8);
+    expect(seededVehicles).toHaveLength(4);
   });
 
   it("rejects a duplicate email (users_email_unique)", async () => {
@@ -462,20 +488,14 @@ describeDb("database schema (Phases 2 + 3)", () => {
   });
 
   it("rejects a request in a pool that is still REQUESTED", async () => {
-    const [vehicle] = await db
-      .insert(vehicles)
-      .values({
-        driverId: SEED_IDS.jashim,
-        name: "Bullet Test",
-        capacity: 3,
-      })
-      .returning();
+    // Unassigned wait pools are the pool-creation state now (ADR-022); the
+    // CHECK under test is the ride-side one: poolId + status REQUESTED are
+    // mutually exclusive (ride_requests_pool_requires_matched).
     const [pool] = await db
       .insert(pools)
       .values({
-        vehicleId: vehicle!.id,
-        driverId: SEED_IDS.jashim,
         capacitySnapshot: 3,
+        status: "REQUESTED",
       })
       .returning();
 
@@ -491,44 +511,119 @@ describeDb("database schema (Phases 2 + 3)", () => {
     ).rejects.toMatchObject(rejectionCode("23514"));
   });
 
-  it("allows exactly one active (non-terminal) pool per vehicle", async () => {
-    const [pool] = await db
-      .insert(pools)
-      .values({
-        vehicleId: SEED_IDS.bullet,
-        driverId: SEED_IDS.jashim,
+  it("allows two unassigned wait pools to coexist (driver/vehicle NULL are never unique-conflicting)", async () => {
+    // A wait pool carries driver_id NULL and vehicle_id NULL. Multiple waiting
+    // pools can coexist without ANY row-level conflict — this is what lets
+    // several first-rides use their own lobby when no existing pool fits
+    // (ADR-022). Nothing in matchRide depends on uniqueness for this insert.
+    await expect(
+      db.insert(pools).values({
         capacitySnapshot: 3,
         status: "MATCHED",
-      })
-      .returning();
-    expect(pool?.status).toBe("MATCHED");
+        driverId: null,
+        vehicleId: null,
+      }),
+    ).resolves.toBeDefined();
+    await expect(
+      db.insert(pools).values({
+        capacitySnapshot: 3,
+        status: "MATCHED",
+        driverId: null,
+        vehicleId: null,
+      }),
+    ).resolves.toBeDefined();
+  });
 
+  it("allows exactly one ACCEPTED non-terminal pool per driver (partial unique index)", async () => {
+    const acceptedAt = new Date();
     await expect(
       db.insert(pools).values({
         vehicleId: SEED_IDS.bullet,
         driverId: SEED_IDS.jashim,
         capacitySnapshot: 3,
-        status: "REQUESTED",
+        status: "MATCHED",
+        acceptedAt,
+      }),
+    ).resolves.toBeDefined();
+
+    // A second accepted non-terminal pool for the same driver is rejected at
+    // the database (pools_single_accepted_per_driver) — a driver can only be
+    // working one accepted pool at a time (ADR-022). A WAIT pool on top is
+    // fine (driver_id NULL), so the acceptance below uses a different driver.
+    await expect(
+      db.insert(pools).values({
+        vehicleId: SEED_IDS.tesla2,
+        driverId: SEED_IDS.karim,
+        capacitySnapshot: 3,
+        status: "MATCHED",
+        acceptedAt,
+      }),
+    ).resolves.toBeDefined();
+
+    await expect(
+      db.insert(pools).values({
+        vehicleId: SEED_IDS.tesla3,
+        driverId: SEED_IDS.jashim,
+        capacitySnapshot: 3,
+        status: "MATCHED",
+        acceptedAt,
       }),
     ).rejects.toMatchObject(rejectionCode("23505"));
   });
 
-  it("rejects a duplicate membership of the same request in the same pool", async () => {
-    const [vehicle] = await db
-      .insert(vehicles)
-      .values({
+  it("frees a driver once their accepted pool becomes terminal", async () => {
+    const acceptedAt = new Date();
+    await db.insert(pools).values({
+      vehicleId: SEED_IDS.bullet,
+      driverId: SEED_IDS.jashim,
+      capacitySnapshot: 3,
+      status: "COMPLETED",
+      acceptedAt,
+      startedAt: acceptedAt,
+      completedAt: acceptedAt,
+    });
+
+    // The COMPLETED pool dropped out of the partial unique index, so Jashim
+    // may accept again — a terminal pool marks the work finished.
+    await expect(
+      db.insert(pools).values({
+        vehicleId: SEED_IDS.bullet,
         driverId: SEED_IDS.jashim,
-        name: "Bullet One",
-        capacity: 3,
-      })
-      .returning();
+        capacitySnapshot: 3,
+        status: "MATCHED",
+        acceptedAt: new Date(),
+      }),
+    ).resolves.toBeDefined();
+  });
+
+  it("rejects a partially assigned pool (driver without vehicle)", async () => {
+    await expect(
+      db.insert(pools).values({
+        driverId: SEED_IDS.jashim,
+        capacitySnapshot: 3,
+        status: "MATCHED",
+        acceptedAt: new Date(),
+      }),
+    ).rejects.toMatchObject(rejectionCode("23514"));
+  });
+
+  it("rejects an assigned pool without an accepted_at", async () => {
+    await expect(
+      db.insert(pools).values({
+        vehicleId: SEED_IDS.bullet,
+        driverId: SEED_IDS.jashim,
+        capacitySnapshot: 3,
+        status: "MATCHED",
+      }),
+    ).rejects.toMatchObject(rejectionCode("23514"));
+  });
+
+  it("rejects a duplicate membership of the same request in the same pool", async () => {
     const [pool] = await db
       .insert(pools)
       .values({
-        vehicleId: vehicle!.id,
-        driverId: SEED_IDS.jashim,
         capacitySnapshot: 3,
-        status: "REQUESTED",
+        status: "MATCHED",
       })
       .returning();
     const [request] = await db
@@ -556,28 +651,12 @@ describeDb("database schema (Phases 2 + 3)", () => {
   });
 
   it("rejects a second ACTIVE membership across different pools (one active pool per request)", async () => {
-    const [vehicleA] = await db
-      .insert(vehicles)
-      .values({
-        driverId: SEED_IDS.jashim,
-        name: "Bullet Alpha",
-        capacity: 3,
-      })
-      .returning();
-    const [vehicleB] = await db
-      .insert(vehicles)
-      .values({
-        driverId: SEED_IDS.jashim,
-        name: "Bullet Beta",
-        capacity: 3,
-      })
-      .returning();
-
+    // Both pools are UNASSIGNED wait pools (ADR-022): the second ACTIVE
+    // membership is rejected by pool_members_one_active_per_request alone, for
+    // the exact reason it matters — a passenger can ride in only one pool.
     const [poolA] = await db
       .insert(pools)
       .values({
-        vehicleId: vehicleA!.id,
-        driverId: SEED_IDS.jashim,
         capacitySnapshot: 3,
         status: "MATCHED",
       })
@@ -603,8 +682,6 @@ describeDb("database schema (Phases 2 + 3)", () => {
     const [poolB] = await db
       .insert(pools)
       .values({
-        vehicleId: vehicleB!.id,
-        driverId: SEED_IDS.jashim,
         capacitySnapshot: 3,
         status: "MATCHED",
       })

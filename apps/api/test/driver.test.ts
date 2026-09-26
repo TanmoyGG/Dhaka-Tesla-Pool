@@ -1,9 +1,12 @@
-// Driver workflow integration + concurrency tests (Phase 6).
-//
-// Runs against the disposable `_test` database with DISPOSABLE AUTH fakes (no
-// Clerk). Canonical cast: Jashim drives Bullet (3 seats); Nusrat/Rafiq/Shirin
-// are the passengers; KARIM is a second DRIVER inserted directly — he is the
-// interloper who must be locked out (404) from Jashim's pools.
+// Driver workflow integration + concurrency tests (Phase 6, ADR-019; Phase 9,
+// ADR-022). Runs against the disposable `_test` database with DISPOSABLE AUTH
+// fakes (no Clerk). Canonical cast: Jashim drives Bullet (3 seats);
+// Nusrat/Rafiq/Shirin are the passengers. Pools are now born UNASSIGNED wait
+// pools (driver_id NULL) in the driver lobby and "accept" is the first-wins
+// assignment of a driver + Tesla (ADR-022). KARIM is a DRIVER user with NO
+// Tesla — he can never win an accept (VEHICLE_OFFLINE) and is the interloper
+// on owned (accepted) pools (404). RAHIM is a seeded DRIVER with Tesla 3, the
+// honest competitor in the cross-driver accept race.
 //
 // Concurrency tests use two independent postgres connections so the racing
 // transactions genuinely run in parallel at the database (same convention as
@@ -41,7 +44,8 @@ const describeDb = REACHABLE ? describe : describe.skip;
 
 const Z = SEED_ZONE_IDS;
 
-// A second driver who owns NO pool: the interloper for ownership tests.
+// A second driver who owns NO Tesla: he can never win an accept (VEHICLE_OFFLINE)
+// and is the interloper for owned-pool (404) tests.
 const KARIM_ID = "a1000000-0000-4000-8000-000000000009";
 
 function user(
@@ -64,6 +68,9 @@ function user(
 
 const JASHIM = user(SEED_IDS.jashim, "Jashim Ahmed", "jashim@example.com", "DRIVER");
 const KARIM = user(KARIM_ID, "Karim Mondol", "karim@example.com", "DRIVER");
+// Seeded DRIVER with Tesla 3 (online): the legitimate competitor in the
+// cross-driver accept race — Jashim is not entitled to every pool.
+const RAHIM = user(SEED_IDS.rahim, "Rahim Mia", "rahim@example.com", "DRIVER");
 const NUSRAT = user(SEED_IDS.nusrat, "Nusrat Haque", "nusrat@example.com", "PASSENGER");
 const RAFIQ = user(SEED_IDS.rafiq, "Rafiq Rahman", "rafiq@example.com", "PASSENGER");
 const SHIRIN = user(SEED_IDS.shirin, "Shirin Islam", "shirin@example.com", "PASSENGER");
@@ -196,9 +203,21 @@ describeDb("driver workflow (Phase 6)", () => {
     expect((await bulletRow()).isOnline).toBe(false);
   });
 
-  it("refuses going offline while a MATCHED pool exists; Bullet stays online", async () => {
+  it("going offline is allowed while ONLY unassigned wait pools exist (none reserve Bullet)", async () => {
     const n = await rides.createRequest(NUSRAT, booking());
     expect(n.ride.status).toBe("MATCHED");
+    expect((await poolRow(n.ride.pool!.id)).driverId).toBeNull();
+
+    // A wait pool reserves NO driver and NO Tesla, so the strict offline rule
+    // (ADR-019 §21.J) does not trip: Bullet can go offline freely.
+    await driver.setAvailability(JASHIM.id, false);
+    expect((await bulletRow()).isOnline).toBe(false);
+  });
+
+  it("refuses going offline while an ACCEPTED pool is active; Bullet stays online", async () => {
+    const n = await rides.createRequest(NUSRAT, booking());
+    const poolId = n.ride.pool!.id;
+    await driver.acceptPool(JASHIM.id, poolId);
 
     await expect(
       driver.setAvailability(JASHIM.id, false),
@@ -234,30 +253,100 @@ describeDb("driver workflow (Phase 6)", () => {
     expect((await bulletRow()).isOnline).toBe(false);
   });
 
-  it("an offline Tesla cannot take a new booking (stays REQUESTED)", async () => {
+  it("an offline Tesla no longer blocks a booking: the ride lands in an UNASSIGNED wait pool", async () => {
     await setBulletOnline(false);
     const { ride } = await rides.createRequest(NUSRAT, booking());
-    expect(ride.status).toBe("REQUESTED");
-    expect(ride.pool).toBeNull();
+    // Matching never selects a Tesla, so an offline fleet cannot stall the ride
+    // (ADR-022): it waits UNASSIGNED in the lobby for any online driver.
+    expect(ride.status).toBe("MATCHED");
+    const pool = (await poolRow(ride.pool!.id));
+    expect(pool.driverId).toBeNull();
+    expect(pool.vehicleId).toBeNull();
   });
 
   // -------------------------------------------------------------------------
   // Accept
   // -------------------------------------------------------------------------
 
-  it("accept confirms a MATCHED pool, records accepted_at, keeps MATCHED, and is idempotent", async () => {
+  it("accept confirms a MATCHED pool: assigns driver + Tesla, records accepted_at, stays MATCHED, idempotent", async () => {
     const n = await rides.createRequest(NUSRAT, booking());
     const poolId = n.ride.pool!.id;
 
     const view1 = await driver.acceptPool(JASHIM.id, poolId);
     expect(view1.status).toBe("MATCHED");
     expect(view1.acceptedAt).not.toBeNull();
-    const firstAccepted = (await poolRow(poolId)).acceptedAt;
+    expect(view1.vehicle).toMatchObject({
+      id: SEED_IDS.bullet,
+      name: "Bullet",
+      capacity: 3,
+      isOnline: true,
+    });
+    const pool = await poolRow(poolId);
+    expect(pool.driverId).toBe(SEED_IDS.jashim);
+    expect(pool.vehicleId).toBe(SEED_IDS.bullet);
+    const firstAccepted = pool.acceptedAt;
 
-    // Repeat accept: no-op, same accepted_at, still 200 (idempotent).
+    // Repeat accept: no-op, same accepted_at, still 200 (idempotent — the
+    // owning driver's own row does not count as "another active pool").
     const view2 = await driver.acceptPool(JASHIM.id, poolId);
     expect(view2.acceptedAt).toEqual(firstAccepted);
     expect((await poolRow(poolId)).acceptedAt).toEqual(firstAccepted);
+  });
+
+  it("rejects accepting when every Tesla is offline (VEHICLE_OFFLINE)", async () => {
+    const n = await rides.createRequest(NUSRAT, booking());
+    const poolId = n.ride.pool!.id;
+
+    // Bullet (Jashim's only Tesla) is offline: the lobby pool has no vehicle
+    // of its own, so the accepting driver must supply an online one (ADR-022).
+    await db
+      .update(vehicles)
+      .set({ isOnline: false, updatedAt: new Date() })
+      .where(eq(vehicles.id, SEED_IDS.bullet));
+
+    await expect(
+      driver.acceptPool(JASHIM.id, poolId),
+    ).rejects.toMatchObject({ code: "VEHICLE_OFFLINE", statusCode: 409 });
+  });
+
+  it("a driver with no Tesla cannot accept a wait pool (VEHICLE_OFFLINE)", async () => {
+    const n = await rides.createRequest(NUSRAT, booking());
+    const poolId = n.ride.pool!.id;
+    // KARIM owns no Tesla at all — the lobby is open, but he has no car to
+    // bring, so he can never win an accept (previous interloper-404 role is
+    // superseded by open competition, ADR-022).
+    await expect(driver.acceptPool(KARIM.id, poolId)).rejects.toMatchObject({
+      code: "VEHICLE_OFFLINE",
+      statusCode: 409,
+    });
+  });
+
+  it("a second driver accepting an already-accepted pool gets POOL_ALREADY_ACCEPTED", async () => {
+    const n = await rides.createRequest(NUSRAT, booking());
+    const poolId = n.ride.pool!.id;
+    await driver.acceptPool(JASHIM.id, poolId);
+
+    // Rahim (Tesla 3, online) is an eligible competitor, but the pool is gone.
+    await expect(driver.acceptPool(RAHIM.id, poolId)).rejects.toMatchObject({
+      code: "POOL_ALREADY_ACCEPTED",
+      statusCode: 409,
+    });
+  });
+
+  it("a driver holding an ACCEPTED pool cannot accept a SECOND one (DRIVER_HAS_ACTIVE_POOL)", async () => {
+    // Nusrat's 3-seat booking fills pool A to capacity, so Rafiq's (different)
+    // booking cannot join it and starts its own pool B.
+    const n = await rides.createRequest(NUSRAT, booking({ requestedSeats: 3 }));
+    const poolA = n.ride.pool!.id;
+    await driver.acceptPool(JASHIM.id, poolA);
+
+    const r = await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
+    const poolB = r.ride.pool!.id;
+    expect(poolB).not.toBe(poolA);
+
+    await expect(
+      driver.acceptPool(JASHIM.id, poolB),
+    ).rejects.toMatchObject({ code: "DRIVER_HAS_ACTIVE_POOL", statusCode: 409 });
   });
 
   it("rejects accepting a pool that already left MATCHED (POOL_NOT_ACCEPTABLE)", async () => {
@@ -279,31 +368,6 @@ describeDb("driver workflow (Phase 6)", () => {
     ).rejects.toMatchObject({ code: "POOL_NOT_ACCEPTABLE", statusCode: 409 });
   });
 
-  it("rejects accepting when the pool's own Tesla is offline (VEHICLE_OFFLINE)", async () => {
-    const n = await rides.createRequest(NUSRAT, booking());
-    const poolId = n.ride.pool!.id;
-
-    // Force the pool's own Tesla offline behind the service's back: the
-    // accept guard reads the pool's OWN vehicle row, not the driver's choice.
-    await db
-      .update(vehicles)
-      .set({ isOnline: false, updatedAt: new Date() })
-      .where(eq(vehicles.id, SEED_IDS.bullet));
-
-    await expect(
-      driver.acceptPool(JASHIM.id, poolId),
-    ).rejects.toMatchObject({ code: "VEHICLE_OFFLINE", statusCode: 409 });
-  });
-
-  it("an interloper driver gets 404 on accept (existence hidden)", async () => {
-    const n = await rides.createRequest(NUSRAT, booking());
-    const poolId = n.ride.pool!.id;
-    await expect(driver.acceptPool(KARIM.id, poolId)).rejects.toMatchObject({
-      code: "NOT_FOUND",
-      statusCode: 404,
-    });
-  });
-
   it("accepting an unknown/nonexistent pool id is a plain 404", async () => {
     await expect(
       driver.acceptPool(JASHIM.id, "00000000-0000-4000-8000-000000000000"),
@@ -314,12 +378,15 @@ describeDb("driver workflow (Phase 6)", () => {
   // Lifecycle: accept → arrive → start → complete
   // -------------------------------------------------------------------------
 
-  it("arriving requires a prior accept (POOL_NOT_ACCEPTABLE)", async () => {
+  it("a driver cannot arrive on a pool they never accepted (404, ownership post-dates acceptance)", async () => {
     const n = await rides.createRequest(NUSRAT, booking());
     const poolId = n.ride.pool!.id;
+    // The wait pool belongs to NOBODY (driver_id NULL) until accept assigns it.
+    // Arriving before accepting therefore 404s exactly like any pool Jashim
+    // does not own — ownership is established by acceptance alone (ADR-022).
     await expect(
       driver.arrivePool(JASHIM.id, poolId),
-    ).rejects.toMatchObject({ code: "POOL_NOT_ACCEPTABLE", statusCode: 409 });
+    ).rejects.toMatchObject({ code: "NOT_FOUND", statusCode: 404 });
   });
 
   it("moves the pool AND every member ride through DRIVER_ARRIVED together", async () => {
@@ -459,6 +526,58 @@ describeDb("driver workflow (Phase 6)", () => {
     const second = await rides.createRequest(SHIRIN, booking());
     expect(second.ride.status).toBe("MATCHED");
     expect(second.ride.pool?.id).not.toBe(firstPool);
+
+    // The terminal pool released Jashim: accepting the brand-new wait pool
+    // succeeds (no DRIVER_HAS_ACTIVE_POOL) and reassigns Tesla Bullet.
+    const accepted = await driver.acceptPool(JASHIM.id, second.ride.pool!.id);
+    expect(accepted.vehicle?.id).toBe(SEED_IDS.bullet);
+  });
+
+  it("a passenger may STILL join a pool after it was accepted (acceptance keeps MATCHED)", async () => {
+    const n = await rides.createRequest(NUSRAT, booking());
+    const poolId = n.ride.pool!.id;
+    await driver.acceptPool(JASHIM.id, poolId);
+
+    // Rafiq's compatible booking rides along: the assigned pool is still
+    // MATCHED, so the seat claim is legal (ADR-022, seat-claim contract §1-4).
+    const r = await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
+    expect(r.ride.pool?.id).toBe(poolId);
+    const members = await db
+      .select()
+      .from(poolMembers)
+      .where(eq(poolMembers.poolId, poolId));
+    expect(members).toHaveLength(2);
+  });
+
+  it("once the driver has ARRIVED a matching passenger gets their own wait pool", async () => {
+    const n = await rides.createRequest(NUSRAT, booking());
+    const poolId = n.ride.pool!.id;
+    await driver.acceptPool(JASHIM.id, poolId);
+    await driver.arrivePool(JASHIM.id, poolId);
+
+    const r = await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
+    // The running trip is no longer joinable (claim re-checks status under the
+    // lock); Rafiq starts his own UNASSIGNED wait pool instead (ADR-022).
+    expect(r.ride.status).toBe("MATCHED");
+    expect(r.ride.pool?.id).not.toBe(poolId);
+    const pool = await poolRow(r.ride.pool!.id);
+    expect(pool.driverId).toBeNull();
+    expect(pool.vehicleId).toBeNull();
+  });
+
+  it("an emptied ACCEPTED pool is cancelled and frees the driver to accept again", async () => {
+    const n = await rides.createRequest(NUSRAT, booking());
+    const poolId = n.ride.pool!.id;
+    await driver.acceptPool(JASHIM.id, poolId);
+
+    // The only member cancels: the accepted pool empties → CANCELLED, which
+    // releases the driver's single-active-accepted-pool slot (migration 0007).
+    await rides.cancelRequest(NUSRAT, n.ride.id);
+    expect((await poolRow(poolId)).status).toBe("CANCELLED");
+
+    const second = await rides.createRequest(SHIRIN, booking());
+    const accepted = await driver.acceptPool(JASHIM.id, second.ride.pool!.id);
+    expect(accepted.vehicle?.id).toBe(SEED_IDS.bullet);
   });
 
   // -------------------------------------------------------------------------
@@ -523,10 +642,21 @@ describeDb("driver workflow (Phase 6)", () => {
   // Driver hub reads (list / detail)
   // -------------------------------------------------------------------------
 
-  it("lists only the driver's own non-terminal pools, newest first, fare-free", async () => {
+  it("lists only the driver's own ACCEPTED non-terminal pools, newest first, fare-free", async () => {
     const n = await rides.createRequest(NUSRAT, booking());
     await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
     const poolId = n.ride.pool!.id;
+
+    // The UNASSIGNED wait pool does NOT belong to Jashim yet (driver_id NULL):
+    // it lives in the lobby (getAvailablePools), not in a driver's hub list.
+    expect(await driver.listDriverPools(JASHIM.id)).toEqual([]);
+    expect(await driver.listDriverPools(KARIM.id)).toEqual([]);
+
+    const lobby = await driver.getAvailablePools();
+    expect(lobby).toHaveLength(1);
+    expect(lobby[0]).toMatchObject({ id: poolId, status: "MATCHED", vehicle: null });
+
+    await driver.acceptPool(JASHIM.id, poolId);
 
     const list = await driver.listDriverPools(JASHIM.id);
     expect(list).toHaveLength(1);
@@ -569,10 +699,16 @@ describeDb("driver workflow (Phase 6)", () => {
     expect(view.status).toBe("COMPLETED");
   });
 
-  it("pool detail 404s for another driver and for unknown ids; reflects isOnline", async () => {
+  it("pool detail is owned-only: 404s for the unassigned pool, other drivers, and unknown ids", async () => {
     const n = await rides.createRequest(NUSRAT, booking());
     const poolId = n.ride.pool!.id;
 
+    // Nobody owns the wait pool yet — even Jashim cannot fetch its detail
+    // until he accepts it (ownership-hiding, same as any foreign pool).
+    await expect(driver.getDriverPool(JASHIM.id, poolId)).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      statusCode: 404,
+    });
     await expect(driver.getDriverPool(KARIM.id, poolId)).rejects.toMatchObject({
       code: "NOT_FOUND",
       statusCode: 404,
@@ -581,8 +717,9 @@ describeDb("driver workflow (Phase 6)", () => {
       driver.getDriverPool(JASHIM.id, "00000000-0000-4000-8000-000000000000"),
     ).rejects.toMatchObject({ code: "NOT_FOUND", statusCode: 404 });
 
+    await driver.acceptPool(JASHIM.id, poolId);
     const view = await driver.getDriverPool(JASHIM.id, poolId);
-    expect(view.vehicle.isOnline).toBe(true);
+    expect(view.vehicle?.isOnline).toBe(true);
   });
 
   // -------------------------------------------------------------------------
@@ -629,7 +766,7 @@ describeDb("driver workflow (Phase 6)", () => {
     }
   });
 
-  it("availability toggles over HTTP (204) and rejects off-line with an active pool", async () => {
+  it("availability toggles over HTTP (204) and rejects going offline with an ACCEPTED pool", async () => {
     const app: FastifyInstance = buildApp({
       auth: {
         verifySession: async (token: string) => TOKEN_TO_CLERK[token] ?? null,
@@ -653,6 +790,21 @@ describeDb("driver workflow (Phase 6)", () => {
       const n = await rides.createRequest(NUSRAT, booking());
       expect(n.ride.status).toBe("MATCHED");
 
+      // An UNASSIGNED wait pool reserves no driver, so it does NOT block the
+      // offline toggle (ADR-022) — unlike the pre-Accept model.
+      const waitPoolOff = await app.inject({
+        method: "POST",
+        url: "/api/driver/availability",
+        payload: { isOnline: false },
+        headers: { authorization: `Bearer ${TOKENS.jashim}` },
+      });
+      expect(waitPoolOff.statusCode).toBe(204);
+      expect((await bulletRow()).isOnline).toBe(false);
+      await driver.setAvailability(JASHIM.id, true);
+
+      // An ACCEPTED pool is the driver's own commitment: going offline trips
+      // the strict rule (ADR-019 §21.J) → 409 DRIVER_HAS_ACTIVE_POOL.
+      await driver.acceptPool(JASHIM.id, n.ride.pool!.id);
       const blocked = await app.inject({
         method: "POST",
         url: "/api/driver/availability",
@@ -661,6 +813,7 @@ describeDb("driver workflow (Phase 6)", () => {
       });
       expect(blocked.statusCode).toBe(409);
       expect(blocked.json().error.code).toBe("DRIVER_HAS_ACTIVE_POOL");
+      expect((await bulletRow()).isOnline).toBe(true);
 
       const badBody = await app.inject({
         method: "POST",
@@ -770,7 +923,7 @@ describeDb("driver workflow (Phase 6)", () => {
     }
   });
 
-  it("drives the full lifecycle over HTTP with interloper 404s", async () => {
+  it("drives the full lifecycle over HTTP with interloper lockout", async () => {
     const app: FastifyInstance = buildApp({
       auth: {
         verifySession: async (token: string) => TOKEN_TO_CLERK[token] ?? null,
@@ -788,8 +941,17 @@ describeDb("driver workflow (Phase 6)", () => {
       const jashim = { authorization: `Bearer ${TOKENS.jashim}` };
       const karim = { authorization: `Bearer ${TOKENS.karim}` };
 
-      // Interloper cannot act on Jashim's pool — every action 404s.
-      for (const action of ["accept", "arrive", "start", "complete"]) {
+      // The wait pool is unclaimed. KARIM has no Tesla, so he cannot compete
+      // (VEHICLE_OFFLINE), and he cannot arrive/start/complete a pool he has
+      // not accepted (ownership-hiding 404).
+      const karimAcceptUnassigned = await app.inject({
+        method: "POST",
+        url: `/api/driver/pools/${poolId}/accept`,
+        headers: karim,
+      });
+      expect(karimAcceptUnassigned.statusCode).toBe(409);
+      expect(karimAcceptUnassigned.json().error.code).toBe("VEHICLE_OFFLINE");
+      for (const action of ["arrive", "start", "complete"]) {
         const intruder = await app.inject({
           method: "POST",
           url: `/api/driver/pools/${poolId}/${action}`,
@@ -798,15 +960,21 @@ describeDb("driver workflow (Phase 6)", () => {
         expect(intruder.statusCode).toBe(404);
         expect(intruder.json().error.code).toBe("NOT_FOUND");
       }
-
-      const detail = await app.inject({
+      // The lobby (GET /pools/available) is open to every driver role.
+      const lobby = await app.inject({
+        method: "GET",
+        url: "/api/driver/pools/available",
+        headers: karim,
+      });
+      expect(lobby.statusCode).toBe(200);
+      expect(lobby.json().pools.map((p: { id: string }) => p.id)).toContain(poolId);
+      // But detail is owner-only → 404 for the interloper even here.
+      const intruderDetail = await app.inject({
         method: "GET",
         url: `/api/driver/pools/${poolId}`,
-        headers: jashim,
+        headers: karim,
       });
-      expect(detail.statusCode).toBe(200);
-      expect(detail.json().pool.status).toBe("MATCHED");
-      expect(detail.json().pool.members).toHaveLength(2);
+      expect(intruderDetail.statusCode).toBe(404);
 
       const accept = await app.inject({
         method: "POST",
@@ -816,6 +984,26 @@ describeDb("driver workflow (Phase 6)", () => {
       expect(accept.statusCode).toBe(200);
       expect(accept.json().pool.status).toBe("MATCHED");
       expect(accept.json().pool.acceptedAt).toBeTruthy();
+      expect(accept.json().pool.vehicle).toMatchObject({
+        id: SEED_IDS.bullet,
+        name: "Bullet",
+      });
+      // Detail works for the owner after acceptance.
+      const detail = await app.inject({
+        method: "GET",
+        url: `/api/driver/pools/${poolId}`,
+        headers: jashim,
+      });
+      expect(detail.statusCode).toBe(200);
+      expect(detail.json().pool.members).toHaveLength(2);
+      // The interloper now loses the accept race outright.
+      const karimAcceptAgain = await app.inject({
+        method: "POST",
+        url: `/api/driver/pools/${poolId}/accept`,
+        headers: karim,
+      });
+      expect(karimAcceptAgain.statusCode).toBe(409);
+      expect(karimAcceptAgain.json().error.code).toBe("POOL_ALREADY_ACCEPTED");
 
       const arrive = await app.inject({
         method: "POST",
@@ -858,7 +1046,46 @@ describeDb("driver workflow (Phase 6)", () => {
   // Concurrency (ADR-020: database-backed transactional consistency)
   // -------------------------------------------------------------------------
 
-  it("two concurrent accepts on the same pool both succeed idempotently (single accepted_at)", async () => {
+  it("two drivers race the same unassigned pool: exactly one wins, the loser gets POOL_ALREADY_ACCEPTED", async () => {
+    const n = await rides.createRequest(NUSRAT, booking());
+    const poolId = n.ride.pool!.id;
+
+    const clientA = postgres(testUrl, { max: 1 });
+    const clientB = postgres(testUrl, { max: 1 });
+    const serviceA = createDriverService(drizzle(clientA));
+    const serviceB = createDriverService(drizzle(clientB));
+
+    try {
+      const [a, b] = await Promise.allSettled([
+        serviceA.acceptPool(JASHIM.id, poolId),
+        serviceB.acceptPool(RAHIM.id, poolId),
+      ]);
+      const winners = [a, b].filter((r) => r.status === "fulfilled");
+      const losers = [a, b].filter(
+        (r) => r.status === "rejected",
+      ) as PromiseRejectedResult[];
+      expect(winners).toHaveLength(1);
+      expect(losers).toHaveLength(1);
+      expect(losers[0]!.reason).toMatchObject({
+        code: "POOL_ALREADY_ACCEPTED",
+        statusCode: 409,
+      });
+
+      // Exactly one driver_id and one vehicle assigned, set once.
+      const pool = await poolRow(poolId);
+      const winnerDriverId = pool.driverId;
+      expect([SEED_IDS.jashim, SEED_IDS.rahim]).toContain(winnerDriverId);
+      expect(pool.vehicleId).toBe(
+        winnerDriverId === SEED_IDS.jashim ? SEED_IDS.bullet : SEED_IDS.tesla3,
+      );
+      expect(pool.acceptedAt).not.toBeNull();
+    } finally {
+      await clientA.end();
+      await clientB.end();
+    }
+  });
+
+  it("two concurrent accepts on the same pool by the same driver both succeed idempotently (single accepted_at)", async () => {
     const n = await rides.createRequest(NUSRAT, booking());
     const poolId = n.ride.pool!.id;
 
@@ -971,34 +1198,27 @@ describeDb("driver workflow (Phase 6)", () => {
     const serviceB = createRideService(drizzle(clientB));
 
     try {
-      // Bullet is online; a booking and an offline toggle race. The shared
-      // serialization point is Bullet's row: one of the two commits first.
-      const [offline, book] = await Promise.allSettled([
+      // ADR-022 decoupled the two: matching never selects a Tesla, so the
+      // booking lands in an UNASSIGNED wait pool no matter what. The offline
+      // toggle is never blocked by it (unassigned pools carry driver_id NULL),
+      // so BOTH succeed regardless of commit order — no serialization point,
+      // no contingency branches.
+      const [offline, book] = await Promise.all([
         serviceA.setAvailability(JASHIM.id, false),
         serviceB.createRequest(NUSRAT, booking()),
       ]);
+      expect(offline).toBeUndefined();
+      expect(book.ride.status).toBe("MATCHED");
+      expect((await poolRow(book.ride.pool!.id)).vehicleId).toBeNull();
 
-      const isOnline = (await bulletRow()).isOnline;
-      if (offline.status === "rejected") {
-        // The booking created a pool first; the offline toggle was refused by
-        // DRIVER_HAS_ACTIVE_POOL (which is why it rejected).
-        expect(book.status).toBe("fulfilled");
-        expect((book as PromiseFulfilledResult<Awaited<ReturnType<typeof serviceB.createRequest>>>).value.ride.status).toBe("MATCHED");
-        expect(isOnline).toBe(true);
-      } else {
-        // The toggle won the lock; the booking saw an offline Tesla.
-        expect(isOnline).toBe(false);
-        expect(book.status).toBe("fulfilled");
-        expect((book as PromiseFulfilledResult<Awaited<ReturnType<typeof serviceB.createRequest>>>).value.ride.status).toBe("REQUESTED");
-      }
-      // The invariant either way: an offline Bullet holds no non-terminal pool.
-      const activePools = await db
+      // The invariant either way: Bullet is offline and holds no pool at all —
+      // the wait pool references no Tesla by construction.
+      await expect(bulletRow()).resolves.toMatchObject({ isOnline: false });
+      const bulletPools = await db
         .select()
         .from(pools)
         .where(eq(pools.vehicleId, SEED_IDS.bullet));
-      if (!isOnline) {
-        expect(activePools).toHaveLength(0);
-      }
+      expect(bulletPools).toHaveLength(0);
     } finally {
       await clientA.end();
       await clientB.end();
