@@ -1,39 +1,47 @@
 // Pooling service (Phase 5): deterministic matching + the seat-claim
 // transaction that makes pool capacity race-safe without any distributed
-// machinery (ADR-016/017, docs/database.md §5.5).
+// machinery (ADR-016/017, docs/database.md §5.5). Phase 9 (ADR-022) decoupled
+// driver assignment from matching: pools are born UNASSIGNED wait pools and an
+// eligibly driver claims them atomically (accept). This file keeps BOTH
+// concurrency domains:
 //
-// Concurrency contract (the design that survives the Nusrat-vs-Shirin final
-// seat race):
+// Passenger seat-claim contract (the critical invariant, unchanged by ADR-022):
 //   - Occupancy is DERIVED each claim from ACTIVE pool_members rows — there is
 //     no cached available-seats counter to desync.
 //   - A claim locks its candidate pool row with `SELECT ... FOR UPDATE`, then
 //     re-derives occupancy UNDER the lock and only joins when
 //     occupied + seats <= capacity_snapshot. The 1-seat capacity invariant
 //     therefore holds on disk, not just in memory.
-//   - Pool creation uses `INSERT ... ON CONFLICT DO NOTHING RETURNING` against
-//     the partial unique index pools_single_active_per_vehicle. ON CONFLICT DO
-//     NOTHING waits for any racing transaction on the same Tesla and then skips
-//     with an EMPTY result, while our transaction stays alive (a plain INSERT
-//     would abort the whole transaction with 23505). An empty result means a
-//     concurrent winner is committed-visible, so we do ONE bounded re-evaluation
-//     (re-scan + lock + capacity check + join) and stop — no retry loop.
+//   - A passenger may join any MATCHED pool (assigned or not) while seats
+//     remain; acceptance keeps the pool MATCHED, so a claim racing a driver
+//     acceptance serializes on the same pool-row lock.
 //   - Lock protocol: every transaction that writes both a ride row and a pool
 //     row acquires the RIDE row lock first, the POOL row lock second
 //     (createRequest already holds the ride lock from its INSERT). Consistent
 //     ordering ⇒ no deadlock between match, cancel, and force-cancel.
-//   - Driver-flow hardening (Phase 6, ADR-019/020): the new-pool Tesla pick
-//     takes the vehicle row `FOR UPDATE` so a match and a concurrent offline
-//     toggle serialize on the vehicle row (a match can never land a pool on a
-//     Tesla that just went offline); and a claim re-verifies the POOL is still
-//     MATCHED under its row lock, so a lifecycle transition that committed
-//     meanwhile cannot have a passenger grafted onto a trip that already left
-//     MATCHED.
+//
+// Driver-acceptance contract (Phase 9, ADR-022):
+//   - Pools are created without a driver or Tesla (driver_id NULL, vehicle_id
+//     NULL, status MATCHED, capacity_snapshot = 3). Automatch never reserves a
+//     Tesla, so a wait pool cannot tie up a driver (requirements.md §21.M).
+//   - Acceptance is the FIRST-WINS assignment of driver_id, vehicle_id and
+//     accepted_at in ONE transaction. Lock order: the caller's VEHICLE rows
+//     FOR UPDATE (id-ascending) → the POOL row FOR UPDATE. The pool-row lock
+//     serializes the cross-driver race on the SAME pool (exactly one winner,
+//     losers get 409 POOL_ALREADY_ACCEPTED); the vehicle lock serializes
+//     accept against the offline toggle and against a same-driver second
+//     accept on another pool. The partial unique indexes
+//     pools_single_accepted_per_driver/vehicle (migration 0007) backstop the
+//     "one active accepted pool per driver" invariant on disk.
+//   - A driver may hold at most ONE accepted non-terminal pool; completing or
+//     cancelling it (status terminal) frees the driver to accept again.
 //   - Match order within a transaction: same pickup zone, all-pairs drop-off
 //     spread <= POOL_DEST_SPREAD_KM, then fullest pool first
 //     (occupiedSeats DESC, createdAt ASC, id ASC). See src/matching/rules.ts.
 
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
+import { isUniqueViolation } from "../../db/postgres-errors.js";
 import type { AppDatabase } from "../../db/index.js";
 import {
   poolMembers,
@@ -57,6 +65,7 @@ import {
   DriverHasActivePoolError,
   PoolNotFoundError,
   PoolNotAcceptableError,
+  PoolAlreadyAcceptedError,
   VehicleOfflineError,
 } from "../errors.js";
 import {
@@ -67,6 +76,12 @@ import {
 
 const destinationZone = alias(zones, "destination_zone");
 const pickupZone = alias(zones, "pickup_zone");
+
+// MVP Tesla capacity (PRD: three-seat battery "Teslas"). Every pool is born
+// with capacity_snapshot = TESLA_CAPACITY and an accepting vehicle must have
+// capacity >= that snapshot, so the pool can never grow beyond what its driver
+// can carry (ADR-022).
+const TESLA_CAPACITY = 3;
 
 interface MatchCandidate {
   ride: typeof rideRequests.$inferSelect;
@@ -97,7 +112,14 @@ export interface DriverPoolView {
   capacitySnapshot: number;
   // Occupancy of ACTIVE members, derived per read — no cached counter.
   occupiedSeats: number;
-  vehicle: { id: string; name: string; capacity: number; isOnline: boolean };
+  // The assigned Tesla. NULL while the pool is an UNASSIGNED wait pool in the
+  // driver lobby (ADR-022); set once a driver accepts.
+  vehicle: {
+    id: string;
+    name: string;
+    capacity: number;
+    isOnline: boolean;
+  } | null;
   acceptedAt: Date | null;
   startedAt: Date | null;
   completedAt: Date | null;
@@ -138,18 +160,31 @@ export interface PoolingService {
   // Force (driver/admin) cancellation: same pool semantics PLUS a full refund —
   // the ride's fare is written back to zero via its discount term.
   forceCancelRide(rideId: string): Promise<void>;
-  // Driver flow (Phase 6, ADR-019): online/offline and pool lifecycle. All
+  // Driver flow (Phase 6, ADR-019); Phase 9, ADR-022 redefined accept. All
   // methods take the driver identity ONLY from the authenticated caller.
-  // Going offline is refused while ANY of the driver's pools is non-terminal
-  // (requirements.md §21.J, strict). Maps to 409 DRIVER_HAS_ACTIVE_POOL.
+  // Going offline is refused while the driver holds an ACCEPTED non-terminal
+  // pool (requirements.md §21.J, strict). Unassigned wait pools carry
+  // driver_id NULL and so never block the toggle. Maps to
+  // 409 DRIVER_HAS_ACTIVE_POOL.
   setAvailability(driverId: string, isOnline: boolean): Promise<void>;
   // Read-only snapshot of online state for the dashboard toggle: true when
   // every owned Tesla is online (mirrors what setAvailability produced).
   getAvailabilityForDriver(driverId: string): Promise<{ isOnline: boolean }>;
-  // Confirmation of the pool automatched to this driver: records accepted_at
-  // (MATCHED preserved, idempotent); requires the pool's Tesla online
-  // (409 VEHICLE_OFFLINE) and the pool still MATCHED (409 POOL_NOT_ACCEPTABLE);
-  // not-owned-or-unknown is a plain 404. Returns the driver hub view.
+  // The driver lobby: every UNASSIGNED MATCHED pool (driver_id NULL) that is
+  // waiting for an eligible driver to claim it, newest first. Identical for
+  // every DRIVER-role caller — the lobby cannot be personalized, so it takes
+  // no driver identity. No driver or Tesla is reserved by a wait pool
+  // (ADR-022).
+  getAvailablePools(): Promise<DriverPoolView[]>;
+  // FIRST-WINS acceptance of an unassigned pool (ADR-022): atomically writes
+  // driver_id, vehicle_id and accepted_at. Requires the caller to be a DRIVER
+  // route (role guard), have an online Tesla with capacity for the pool, and
+  // hold no accepted non-terminal pool (409 DRIVER_HAS_ACTIVE_POOL). Two
+  // drivers racing the same pool: exactly one wins, the loser gets
+  // 409 POOL_ALREADY_ACCEPTED. Re-accepting a pool this driver already accepted
+  // is idempotent (200) while it stays MATCHED. A pool that left MATCHED is
+  // 409 POOL_NOT_ACCEPTABLE; an unknown id is a plain 404. Returns the driver
+  // hub view.
   acceptPool(driverId: string, poolId: string): Promise<DriverPoolView>;
   // Driver has arrived. Gated on acceptance (P2): arriving before accepting is
   // 409 POOL_NOT_ACCEPTABLE; a pool/ride that cannot move to DRIVER_ARRIVED is
@@ -209,9 +244,12 @@ export function createPoolingService(
     };
   }
 
-  // Every claimable pool right now: status MATCHED on a Tesla that is online
-  // and driven by an active driver; occupancy and drop-off geometry are derived
-  // from its ACTIVE members.
+  // Every claimable pool right now: status MATCHED. A pool is claimable
+  // whether or not a driver has accepted it (acceptance keeps MATCHED, and an
+  // accepted driver cannot go offline while their pool is non-terminal, so
+  // every MATCHED pool is ride-worthy); occupancy and drop-off geometry are
+  // derived from its ACTIVE members. Unassigned wait pools are just as
+  // claimable as assigned ones (ADR-022).
   async function loadCandidatePools(
     tx: DbTransaction,
   ): Promise<CandidatePool[]> {
@@ -222,15 +260,7 @@ export function createPoolingService(
         createdAt: pools.createdAt,
       })
       .from(pools)
-      .innerJoin(vehicles, eq(vehicles.id, pools.vehicleId))
-      .innerJoin(users, eq(users.id, pools.driverId))
-      .where(
-        and(
-          eq(pools.status, "MATCHED"),
-          eq(vehicles.isOnline, true),
-          eq(users.active, true),
-        ),
-      );
+      .where(eq(pools.status, "MATCHED"));
     if (poolRows.length === 0) return [];
 
     const memberRows = await tx
@@ -300,31 +330,6 @@ export function createPoolingService(
     });
   }
 
-  // The single online, active-driven Tesla with no non-terminal pool.
-  // Deterministic: name ASC, then id ASC.
-  async function pickAvailableTesla(
-    tx: DbTransaction,
-  ): Promise<typeof vehicles.$inferSelect | undefined> {
-    const [row] = await tx
-      .select({ vehicle: vehicles })
-      .from(vehicles)
-      .innerJoin(users, eq(users.id, vehicles.driverId))
-      .where(
-        and(
-          eq(vehicles.isOnline, true),
-          eq(users.active, true),
-          sql`not exists (select 1 from ${pools} where ${pools.vehicleId} = ${vehicles.id} and ${pools.status} not in ('COMPLETED', 'CANCELLED'))`,
-        ),
-      )
-      .orderBy(asc(vehicles.name), asc(vehicles.id))
-      .limit(1)
-      // Phase 6: lock the chosen Tesla so a concurrent offline-toggle (which
-      // also takes the vehicle row lock) cannot win between our eligibility
-      // read and the pool INSERT (ADR-020).
-      .for("update");
-    return row?.vehicle;
-  }
-
   async function claimSeatIn(
     tx: DbTransaction,
     candidate: MatchCandidate,
@@ -390,40 +395,36 @@ export function createPoolingService(
     const candidate = await loadMatchCandidate(tx, rideId);
     if (!candidate) return false;
 
-    // 1. Join the best eligible EXISTING pool when one fits. pickBestPool is
-    //    deterministic: fullest first (occupied DESC), then created_at ASC,
-    //    then id ASC (docs/requirements.md §21.A).
+    // 1. Join the best eligible EXISTING pool when one fits AND the claim wins.
+    //    pickBestPool is deterministic: fullest first (occupied DESC), then
+    //    created_at ASC, then id ASC (docs/requirements.md §21.A). A pool that
+    //    was already accepted by a driver is equally eligible while it stays
+    //    MATCHED. A failed claim means the pool filled (or left MATCHED)
+    //    between the lock-free read and the row lock — never an error.
     const poolsNow = await loadCandidatePools(tx);
     const chosen = pickBestPool(poolsNow, toDropOffCandidate(candidate));
-    if (chosen) {
-      return claimSeatIn(tx, candidate, chosen.id);
+    if (chosen && (await claimSeatIn(tx, candidate, chosen.id))) {
+      return true;
     }
 
-    // 2. Otherwise start a pool on an available Tesla. Deterministic pick
-    //    (name, id), so concurrent requests for the same destination set race
-    //    onto the same Tesla instead of scattering.
-    const tesla = await pickAvailableTesla(tx);
-    if (!tesla) return false;
-
+    // 2. Otherwise (no eligible pool, or the claim lost to a concurrent seat
+    //    grab) the request never stalls REQUESTED: it starts its own UNASSIGNED
+    //    wait pool (approved "always create a wait pool" model, ADR-022). No
+    //    driver or Tesla is selected here — driver_id NULL / vehicle_id NULL /
+    //    status MATCHED, waiting in the driver lobby. capacity_snapshot is the
+    //    MVP's fixed three-seat Tesla capacity; an accepting vehicle must
+    //    satisfy it. This is the documented outcome for far drop-offs and for
+    //    the loser of the final-seat race.
     const [created] = await tx
       .insert(pools)
       .values({
-        vehicleId: tesla.id,
-        driverId: tesla.driverId,
+        driverId: null,
+        vehicleId: null,
         status: "MATCHED",
-        capacitySnapshot: tesla.capacity,
+        capacitySnapshot: TESLA_CAPACITY,
       })
-      .onConflictDoNothing()
       .returning();
-    if (!created) {
-      // A concurrent transaction won the Tesla first (its row is now
-      // committed-visible — ON CONFLICT DO NOTHING waits on the racing INSERT).
-      // Bounded re-evaluation: re-scan and join the winner's pool if it fits.
-      const retryPools = await loadCandidatePools(tx);
-      const retryPool = pickBestPool(retryPools, toDropOffCandidate(candidate));
-      if (!retryPool) return false;
-      return claimSeatIn(tx, candidate, retryPool.id);
-    }
+    if (!created) return false;
 
     return claimSeatIn(tx, candidate, created.id);
   }
@@ -467,18 +468,21 @@ export function createPoolingService(
 
   // Driver online/offline (Phase 6, ADR-019). Identity comes from the caller,
   // never the client. Going online simply flips the driver's Teslas; going
-  // offline is REFUSED while any of the driver's pools is non-terminal
+  // offline is REFUSED while the driver holds an ACCEPTED non-terminal pool
   // (requirements.md §21.J — a driver in an ACCEPTED..STARTED trip cannot duck
-  // the work by flipping the switch).
+  // the work by flipping the switch). Unassigned wait pools carry driver_id
+  // NULL and so never block the toggle (ADR-022); they simply stop being
+  // visible to this driver once offline, and no Tesla is reserved by them.
   async function setAvailability(
     driverId: string,
     isOnline: boolean,
   ): Promise<void> {
     await database.transaction(async (tx) => {
       // Lock this driver's Tesla rows FOR UPDATE first (deterministic id
-      // order): the shared serialization point with the match-time vehicle
-      // lock and with the driver lifecycle transitions (ADR-020). No pool rows
-      // are ever locked here, so this cannot deadlock against a match.
+      // order): the shared serialization point with accept and with arrivals
+      // (every driver transition takes the vehicle lock first, ADR-020). No
+      // pool rows are ever locked here, so this cannot deadlock against a
+      // passenger match/cancel (ride → pool).
       await tx
         .select()
         .from(vehicles)
@@ -495,9 +499,10 @@ export function createPoolingService(
         return;
       }
 
-      // Counted under the vehicle lock: a concurrent match creating a pool on
-      // the same Tesla holds that vehicle row until its pool INSERT commits,
-      // so this count can never miss a pool that is about to exist.
+      // Counted under the vehicle lock: a concurrent acceptance holding a
+      // vehicle row writes driver_id + accepted_at on its pool in the same
+      // transaction, so this count can never miss a pool that is about to be
+      // accepted (ADR-022).
       const [active] = await tx
         .select({ count: sql<number>`count(*)::int` })
         .from(pools)
@@ -518,16 +523,19 @@ export function createPoolingService(
   }
 
   // -------------------------------------------------------------------------
-  // Driver lifecycle (Phase 6, ADR-019/020).
+  // Driver lifecycle (Phase 6, ADR-019/020; Phase 9, ADR-022).
   //
   // Lock order for every transition: driver's VEHICLE rows FOR UPDATE →
   // the pool's member RIDE rows FOR UPDATE → the POOL row FOR UPDATE. The
-  // vehicle lock is the shared serialization point with a concurrent match or
-  // offline toggle; rides-before-pool keeps the global ride → pool order so a
-  // driver transition can never deadlock against a passenger cancel
-  // (passenger cancels lock ride → pool). Every action runs on a COMMITTED
-  // pool (READ COMMITTED), so it can never collide with the reconstructing
-  // match that created it.
+  // vehicle lock is the shared serialization point with accept and the offline
+  // toggle; rides-before-pool keeps the global ride → pool order so a driver
+  // transition can never deadlock against a passenger cancel (passenger
+  // cancels lock ride → pool). Acceptance adds the cross-driver first-wins
+  // serialization on the contested POOL row (ADR-022): after taking the
+  // vehicle lock, the winner's pool-row lock blocks the loser's read of the
+  // same row until acceptance commits, so exactly one driver ever sees it
+  // UNASSIGNED. Every action runs on a COMMITTED pool (READ COMMITTED), so it
+  // can never collide with the reconstructing match that created it.
   // -------------------------------------------------------------------------
 
   // Lock the driver's Tesla rows in deterministic id order (and discard them —
@@ -563,8 +571,10 @@ export function createPoolingService(
     return pool;
   }
 
-  // The driver hub's pool + ACTIVE members view, read from either the
+  // The driver surface's pool + ACTIVE members view, read from either the
   // application handle or inside a transaction. Null when the pool is gone.
+  // Vehicle is LEFT-joined and NULL for an UNASSIGNED wait pool (ADR-022);
+  // the driver surface renders it as "waiting for a driver".
   async function loadDriverPoolView(
     source: PoolReadSource,
     poolId: string,
@@ -572,7 +582,7 @@ export function createPoolingService(
     const [row] = await source
       .select({ pool: pools, vehicle: vehicles })
       .from(pools)
-      .innerJoin(vehicles, eq(vehicles.id, pools.vehicleId))
+      .leftJoin(vehicles, eq(vehicles.id, pools.vehicleId))
       .where(eq(pools.id, poolId))
       .limit(1);
     if (!row) return null;
@@ -604,12 +614,14 @@ export function createPoolingService(
       status: row.pool.status,
       capacitySnapshot: row.pool.capacitySnapshot,
       occupiedSeats: members.reduce((sum, member) => sum + member.seats, 0),
-      vehicle: {
-        id: row.vehicle.id,
-        name: row.vehicle.name,
-        capacity: row.vehicle.capacity,
-        isOnline: row.vehicle.isOnline,
-      },
+      vehicle: row.vehicle
+        ? {
+            id: row.vehicle.id,
+            name: row.vehicle.name,
+            capacity: row.vehicle.capacity,
+            isOnline: row.vehicle.isOnline,
+          }
+        : null,
       acceptedAt: row.pool.acceptedAt,
       startedAt: row.pool.startedAt,
       completedAt: row.pool.completedAt,
@@ -619,25 +631,98 @@ export function createPoolingService(
     };
   }
 
-  // "Accept" is a CONFIRMATION of the pool the automatch already assigned to
-  // this driver (ADR-016): it records accepted_at while the pool stays MATCHED
-  // and is idempotent (a repeated accept is a harmless 200). The pool's OWN
-  // Tesla must be online; a pool that already left MATCHED is not acceptable.
+  // Pick the Tesla that will carry this pool from the driver's (already
+  // vehicle-locked) fleet. Deterministic: name ASC then id ASC. Eligibility:
+  // online AND capacity >= pool.capacity_snapshot — the pool must fit the
+  // WHOLE ride, not just today's occupancy, or a later joiner could oversell
+  // the car. capacity_snapshot is the born-with TESLA_CAPACITY, so in the MVP
+  // this is capacity >= 3: a 2-seater cannot be accepted for a 3-seat pool.
+  async function pickDriverVehicle(
+    tx: DbTransaction,
+    driverId: string,
+    capacitySnapshot: number,
+  ): Promise<typeof vehicles.$inferSelect | undefined> {
+    const [row] = await tx
+      .select({ vehicle: vehicles })
+      .from(vehicles)
+      .where(
+        and(
+          eq(vehicles.driverId, driverId),
+          eq(vehicles.isOnline, true),
+          sql`${vehicles.capacity} >= ${capacitySnapshot}`,
+        ),
+      )
+      .orderBy(asc(vehicles.name), asc(vehicles.id))
+      .limit(1);
+    return row?.vehicle;
+  }
+
+  // "Accept" is the FIRST-WINS assignment of an UNASSIGNED wait pool to this
+  // driver (Phase 9, ADR-022): it atomically writes driver_id, vehicle_id and
+  // accepted_at in one transaction, removing the pool from the driver lobby.
+  // Re-accepting a pool this driver already accepted stays idempotent (200)
+  // while it is MATCHED. A pool already accepted by ANOTHER driver is
+  // 409 POOL_ALREADY_ACCEPTED (the loser of the race); a pool that left
+  // MATCHED is 409 POOL_NOT_ACCEPTABLE; no online Tesla with capacity for the
+  // pool → 409 VEHICLE_OFFLINE; already holding an accepted non-terminal pool
+  // → 409 DRIVER_HAS_ACTIVE_POOL; unknown id → plain 404.
   async function acceptPool(
     driverId: string,
     poolId: string,
   ): Promise<DriverPoolView> {
     return await database.transaction(async (tx) => {
+      // VEHICLE rows FOR UPDATE first (deterministic id order). Serializes
+      // against the offline toggle: it re-reads the accepted-pool count under
+      // the same vehicle lock, so an offline flip can never commit between our
+      // eligibility read and our accepted-pool write (ADR-020).
       await lockDriverVehicles(tx, driverId);
-      const pool = await lockOwnedPool(tx, poolId, driverId);
 
-      const [vehicle] = await tx
+      // A driver can hold at most one accepted non-terminal pool — the same
+      // count setAvailability enforces on the offline path, checked under the
+      // vehicle lock (migration 0007's partial unique index backstops it on
+      // disk). Wait pools carry driver_id NULL and never count here. The pool
+      // being (re-)accepted is EXCLUDED so an idempotent re-accept by the
+      // owning driver is not blocked by its own row (ADR-022: re-accepting an
+      // already-accepted pool is 200 while it stays MATCHED).
+      const [active] = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(pools)
+        .where(
+          and(
+            eq(pools.driverId, driverId),
+            sql`${pools.status} not in ('COMPLETED', 'CANCELLED')`,
+            ne(pools.id, poolId),
+          ),
+        );
+      if ((active?.count ?? 0) > 0) {
+        throw new DriverHasActivePoolError();
+      }
+
+      // The contested POOL row lock is the first-wins point: the winner locks
+      // it first, reads driver_id NULL, assigns itself and commits; when the
+      // loser's SELECT ... FOR UPDATE unblocks it reads the committed
+      // assignment and gets POOL_ALREADY_ACCEPTED. Exactly one winner.
+      const [pool] = await tx
         .select()
-        .from(vehicles)
-        .where(eq(vehicles.id, pool.vehicleId))
-        .limit(1);
-      if (!vehicle?.isOnline) {
-        throw new VehicleOfflineError();
+        .from(pools)
+        .where(eq(pools.id, poolId))
+        .for("update");
+
+      if (!pool) throw new PoolNotFoundError();
+      if (pool.driverId !== null) {
+        if (pool.driverId !== driverId) {
+          throw new PoolAlreadyAcceptedError();
+        }
+        // Idempotent re-accept by the owning driver: harmless 200 while the
+        // pool is still in a state this action accepts.
+        if (pool.status !== "MATCHED") {
+          throw new PoolNotAcceptableError(
+            `pool ${poolId} is ${pool.status}; only a MATCHED pool can be accepted`,
+          );
+        }
+        const existing = await loadDriverPoolView(tx, poolId);
+        if (!existing) throw new PoolNotFoundError();
+        return existing;
       }
       if (pool.status !== "MATCHED") {
         throw new PoolNotAcceptableError(
@@ -645,12 +730,35 @@ export function createPoolingService(
         );
       }
 
-      if (pool.acceptedAt === null) {
-        const now = new Date();
+      const vehicle = await pickDriverVehicle(
+        tx,
+        driverId,
+        pool.capacitySnapshot,
+      );
+      if (!vehicle) {
+        throw new VehicleOfflineError();
+      }
+
+      const now = new Date();
+      try {
         await tx
           .update(pools)
-          .set({ acceptedAt: now, updatedAt: now })
-          .where(eq(pools.id, pool.id));
+          .set({
+            driverId,
+            vehicleId: vehicle.id,
+            acceptedAt: now,
+            updatedAt: now,
+          })
+          .where(eq(pools.id, poolId));
+      } catch (error) {
+        // Backstop for the one-active-accepted-pool invariant: under the
+        // vehicle lock a racing acceptance cannot pass the pre-check, but the
+        // partial unique index is the final word — surface a raw 23505 as the
+        // documented conflict instead of leaking SQL.
+        if (isUniqueViolation(error)) {
+          throw new DriverHasActivePoolError();
+        }
+        throw error;
       }
 
       const view = await loadDriverPoolView(tx, poolId);
@@ -659,9 +767,14 @@ export function createPoolingService(
     });
   }
 
-  // Driver has arrived. Gated on acceptance (P2): a pool the driver never
-  // accepted cannot be "arrived at". Aggregate transition: the pool AND every
-  // MATCHED member ride move to DRIVER_ARRIVED together, each ride journaled.
+  // Driver has arrived. Gated on acceptance (P2), now via ownership: a pool the
+  // driver never accepted belongs to NOBODY until it is assigned (driver_id
+  // NULL), so it 404s exactly like a pool owned by another driver — ownership
+  // is only established by acceptance (ADR-022). The acceptedAt-null guard is
+  // defensive belt-and-braces: the assignment CHECK (migration 0007) makes
+  // an owned-but-unaccepted pool impossible on disk. Aggregate transition: the
+  // pool AND every MATCHED member ride move to DRIVER_ARRIVED together, each
+  // ride journaled.
   async function arrivePool(
     driverId: string,
     poolId: string,
@@ -824,9 +937,33 @@ export function createPoolingService(
     };
   }
 
-  // The driver hub's open pools: every non-terminal pool this driver owns,
-  // newest first (created_at then id desc, so ordering is deterministic even
-  // without second-precision timestamps). Lock-free read.
+  // The driver lobby (Phase 9, ADR-022): every UNASSIGNED MATCHED pool
+  // (driver_id NULL) still waiting for an eligible driver, newest first. No
+  // driver or Tesla is reserved by a wait pool — this list is purely derived
+  // state, so an accept just drops the pool out of it. Lock-free read; the
+  // driver's own accepted pools show up via listDriverPools, not here.
+  async function getAvailablePools(): Promise<DriverPoolView[]> {
+    const rows = await database
+      .select()
+      .from(pools)
+      .where(and(isNull(pools.driverId), eq(pools.status, "MATCHED")))
+      .orderBy(desc(pools.createdAt), desc(pools.id));
+    if (rows.length === 0) return [];
+    const poolRows = rows.map((pool) => ({
+      pool,
+      // Unassigned by construction (driver_id NULL ⇒ vehicle_id NULL): the
+      // lobby is the only surface where a pool has no vehicle at all.
+      vehicle: null as typeof vehicles.$inferSelect | null,
+    }));
+    return hydratePoolViews(
+      poolRows,
+      await loadMembersForPools(poolRows.map((row) => row.pool.id)),
+    );
+  }
+
+  // The driver hub's open pools: every accepted non-terminal pool this driver
+  // owns, newest first (created_at then id desc, so ordering is deterministic
+  // even without second-precision timestamps). Lock-free read.
   async function listDriverPools(driverId: string): Promise<DriverPoolView[]> {
     const poolRows = await database
       .select({ pool: pools, vehicle: vehicles })
@@ -900,7 +1037,10 @@ export function createPoolingService(
   }
 
   function hydratePoolViews(
-    poolRows: { pool: typeof pools.$inferSelect; vehicle: typeof vehicles.$inferSelect }[],
+    poolRows: {
+      pool: typeof pools.$inferSelect;
+      vehicle: typeof vehicles.$inferSelect | null;
+    }[],
     memberRows: Awaited<ReturnType<typeof loadMembersForPools>>,
   ): DriverPoolView[] {
     const membersByPool = new Map<string, (typeof memberRows)[number][]>();
@@ -917,12 +1057,14 @@ export function createPoolingService(
         status: row.pool.status,
         capacitySnapshot: row.pool.capacitySnapshot,
         occupiedSeats: members.reduce((sum, member) => sum + member.seats, 0),
-        vehicle: {
-          id: row.vehicle.id,
-          name: row.vehicle.name,
-          capacity: row.vehicle.capacity,
-          isOnline: row.vehicle.isOnline,
-        },
+        vehicle: row.vehicle
+          ? {
+              id: row.vehicle.id,
+              name: row.vehicle.name,
+              capacity: row.vehicle.capacity,
+              isOnline: row.vehicle.isOnline,
+            }
+          : null,
         acceptedAt: row.pool.acceptedAt,
         startedAt: row.pool.startedAt,
         completedAt: row.pool.completedAt,
@@ -1036,6 +1178,7 @@ export function createPoolingService(
     forceCancelRide,
     setAvailability,
     getAvailabilityForDriver,
+    getAvailablePools,
     acceptPool,
     arrivePool,
     startPool,

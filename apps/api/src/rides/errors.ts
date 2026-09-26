@@ -63,15 +63,17 @@ export class PoolNotFoundError extends Error {
   }
 }
 
-// A driver action that requires the pool's Tesla to be online (Phase 6). The
-// pool's own vehicle row is authoritative, so accepting for another (offline)
-// Tesla of the same driver is rejected too. Maps to 409.
+// Accepting a pool when the driver has no ONLINE Tesla that can carry it
+// (Phase 9, ADR-022): the lobby's unassigned pools have no vehicle of their
+// own, so the accepting driver must supply one — a 2-seater cannot carry a
+// 3-seat pool. A driver whose fleet is entirely offline (or who owns no Tesla
+// at all) gets this. Maps to 409.
 export class VehicleOfflineError extends Error {
   readonly code = "VEHICLE_OFFLINE";
   readonly statusCode = 409;
 
   constructor() {
-    super("The Tesla for this pool is offline.");
+    super("No online Tesla can carry this pool.");
     this.name = "VehicleOfflineError";
   }
 }
@@ -86,6 +88,19 @@ export class PoolNotAcceptableError extends Error {
   constructor(message = "Pool is not in a state this action accepts.") {
     super(message);
     this.name = "PoolNotAcceptableError";
+  }
+}
+
+// Two drivers raced to accept the same unassigned pool and the caller lost: the
+// pool is already assigned to another driver (Phase 9, ADR-022). Deterministic
+// first-wins conflict — maps to 409.
+export class PoolAlreadyAcceptedError extends Error {
+  readonly code = "POOL_ALREADY_ACCEPTED";
+  readonly statusCode = 409;
+
+  constructor() {
+    super("This pool was already accepted by another driver.");
+    this.name = "PoolAlreadyAcceptedError";
   }
 }
 

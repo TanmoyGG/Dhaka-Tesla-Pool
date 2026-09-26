@@ -21,6 +21,10 @@ import { alias } from "drizzle-orm/pg-core";
 import type { AuthUser } from "../auth/identity.js";
 import type { AppDatabase } from "../db/index.js";
 import {
+  isUniqueViolation,
+  violatedConstraintName,
+} from "../db/postgres-errors.js";
+import {
   fares,
   poolMembers,
   pools,
@@ -82,17 +86,19 @@ export interface FareView {
 }
 
 // Summary of the pool a ride belongs to (null while the request is
-// REQUESTED). Phase 5 pools are only ever MATCHED or CANCELLED.
+// REQUESTED). A pool is born UNASSIGNED (Phase 9, ADR-022): driver and Tesla
+// are NULL until an eligible driver accepts, so the passenger sees the ride as
+// "waiting for a driver" until then.
 export interface RidePoolView {
   id: string;
   status: typeof pools.$inferSelect["status"];
   capacitySnapshot: number;
   // Derived occupancy (ACTIVE members only), recomputed per read.
   occupiedSeats: number;
-  vehicleId: string;
-  vehicleName: string;
-  driverId: string;
-  driverName: string;
+  vehicleId: string | null;
+  vehicleName: string | null;
+  driverId: string | null;
+  driverName: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -117,24 +123,8 @@ export interface CreateRideResult {
 }
 
 // postgres-js surfaces constraint violations as an error whose .cause is the
-// PostgresError carrying the SQLSTATE code (23505 = unique_violation).
-function isUniqueViolation(error: unknown): boolean {
-  const code =
-    (error as { code?: string } | undefined)?.code ??
-    (error as { cause?: { code?: string } } | undefined)?.cause?.code;
-  return code === "23505";
-}
-
-// The name of the violated constraint, when postgres-js exposes it (also
-// nested under .cause). Used to tell the two partial unique indexes on
-// ride_requests apart when a race reaches the database.
-function violatedConstraintName(error: unknown): string | null {
-  const direct = (error as { constraint_name?: string } | undefined)
-    ?.constraint_name;
-  const nested = (error as { cause?: { constraint_name?: string } } | undefined)
-    ?.cause?.constraint_name;
-  return direct ?? nested ?? null;
-}
+// PostgresError carrying the SQLSTATE code (23505 = unique_violation) and the
+// violated constraint name; the unpacking helpers live in db/postgres-errors.ts.
 
 function zoneView(zone: typeof zones.$inferSelect): ZoneView {
   return {
@@ -197,16 +187,17 @@ function toPoolView(
 ): RidePoolView | null {
   // All fields come from the same left-joined row: id present ⇒ the rest are
   // too (the nullable typing is drizzle's join-bookkeeping, not real data).
+  // driver/vehicle stay NULL for an unassigned wait pool (ADR-022).
   if (!pool?.id) return null;
   return {
     id: pool.id,
     status: pool.status!,
     capacitySnapshot: pool.capacitySnapshot!,
     occupiedSeats: pool.occupiedSeats!,
-    vehicleId: pool.vehicleId!,
-    vehicleName: pool.vehicleName!,
-    driverId: pool.driverId!,
-    driverName: pool.driverName!,
+    vehicleId: pool.vehicleId,
+    vehicleName: pool.vehicleName,
+    driverId: pool.driverId,
+    driverName: pool.driverName,
     createdAt: pool.createdAt!,
     updatedAt: pool.updatedAt!,
   };

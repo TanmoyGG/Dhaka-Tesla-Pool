@@ -75,9 +75,18 @@ export const driverRoutes: FastifyPluginAsync<DriverRoutesOptions> = async (
       availability: await options.driver.getAvailability(request.auth!.user.id),
     }));
 
-    // The driver hub: every non-terminal pool this driver owns, newest first.
+    // The driver hub: every accepted non-terminal pool this driver owns,
+    // newest first.
     scope.get("/driver/pools", async (request) => ({
       pools: await options.driver.listDriverPools(request.auth!.user.id),
+    }));
+
+    // The driver lobby (Phase 9, ADR-022): every UNASSIGNED MATCHED pool
+    // waiting for an eligible driver, newest first. Identical for every driver,
+    // so no identity is needed. Registered before the :poolId route for the
+    // same reason as /history.
+    scope.get("/driver/pools/available", async () => ({
+      pools: await options.driver.getAvailablePools(),
     }));
 
     // Completed-trip history, newest first. Registered BEFORE the :poolId
@@ -99,7 +108,7 @@ export const driverRoutes: FastifyPluginAsync<DriverRoutesOptions> = async (
       },
     );
 
-    // Lifecycle actions. Idempotent where documented (accept), else 409 on a
+    // Lifecycle actions. First-wins where documented (accept), else 409 on a
     // premature/illegal move. The pool view is returned after each action.
     const lifecycle = (
       action: (driverId: string, poolId: string) => Promise<unknown>,
