@@ -1,0 +1,3 @@
+ALTER TABLE "pools" ADD COLUMN "accepted_at" timestamp with time zone;--> statement-breakpoint
+CREATE INDEX "driver_pools_accept_idx" ON "pools" USING btree ("accepted_at") WHERE "pools"."accepted_at" is not null;--> statement-breakpoint
+ALTER TABLE "pools" ADD CONSTRAINT "pools_accepted_progression" CHECK ("pools"."accepted_at" is not null or "pools"."status" not in ('DRIVER_ARRIVED', 'STARTED', 'COMPLETED'));

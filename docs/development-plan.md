@@ -179,15 +179,44 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 
 ## Phase 6 — Driver flow
 
+> **Status: COMPLETE** (branch `feature/driver-workflow`; merged, validation
+> 152/152). Drivers get an online/offline switch and hands-on control of the
+> pool the automatch assigned: **accept → arrive → start → complete**, plus a
+> fare-free hub (their pools, members, seats, zones). **Scope changes vs. the
+> plan:** (1) accept is a **confirmation** that records `pools.accepted_at`
+> while the pool stays MATCHED (idempotent), not a reservation — automatch per
+> ADR-016 stays the allocation, ADR-019; (2) the offline rule is **strict**
+> (§21.J): refused while ANY pool is non-terminal (`409 DRIVER_HAS_ACTIVE_POOL`);
+> (3) passenger cancellation is extended to stay legal through DRIVER_ARRIVED
+> (P8); (4) migration 0005 (`pools.accepted_at` + CHECK
+> `pools_accepted_progression` + partial index) — additive only.
+
 - **Objective:** Driver online/offline, accepts a ride/pool, marks
   `ARRIVED → STARTED → COMPLETED`, sees seats/history.
-- **Deliverables:** driver dashboard endpoints, accept, mark-arrived, start,
-  complete; busy-vehicle guard; online/offline state.
+- **Deliverables:** `apps/api/src/driver/` (routes + thin `DriverService`
+  facade); `POST /api/driver/availability` (204); `GET /api/driver/pools`;
+  `GET /api/driver/pools/:poolId`; `POST /api/driver/pools/:poolId/{accept,
+  arrive,start,complete}` → pool view; driver lifecycle lock order **vehicle →
+  rides → pool** (ADR-020); count-based busy-vehicle guard; deterministic
+  vehicle-first serialization with the automatch/offline toggle.
 - **Dependencies:** Phases 4, 5.
-- **Risks:** state machine enforcement; driver seeing only their own vehicles.
-- **Tests:** full happy-path lifecycle; invalid transitions rejected
-  (e.g., STARTED before ARRIVED); offline driver cannot take new work; going
-  offline with an active ride is blocked.
+- **Risks:** state machine enforcement; driver seeing only their own vehicles
+  (interloper = 404, existence hidden); deadlock-free lock ordering with the
+  passenger cancel path (vehicle lock + ride-before-pool).
+- **Tests:** `test/driver.test.ts` (new, 30 tests): full happy-path lifecycle
+  with timestamps + per-ride journals; accept idempotency/idempotent-concurrent;
+  `VEHICLE_OFFLINE`; `POOL_NOT_ACCEPTABLE` (accept-after-move, arrive-before-
+  accept); illegal transitions (`arrive twice`, `start before arrive`,
+  `complete before start`) → 409; interloper 404 on all four actions + detail;
+  offline guard at MATCHED and STARTED; offline allowed after terminal; offline
+  Tesla → new booking stays REQUESTED; completion frees Bullet for a fresh pool;
+  P8 cancel at DRIVER_ARRIVED (seat freed, fare recomputed, emptied pool
+  terminates) and refused at STARTED; hub list/detail semantics (own pools only,
+  fare-free, ACTIVE members, ordering); HTTP role guards (401/403) and full
+  lifecycle over HTTP; three true concurrency races (double accept → one
+  `accepted_at`; double arrive → one winner; double complete → one winner +
+  Tesla freed; offline-vs-booking invariant) on two independent connections —
+  full suite **152 passing**.
 
 ## Phase 7 — Fare calculation
 

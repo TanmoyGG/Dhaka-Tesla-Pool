@@ -198,6 +198,12 @@ export const pools = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
+    // When the driver confirmed the auto-assigned pool (Phase 6, ADR-019).
+    // Pools are born MATCHED (ADR-016); "accept" is a confirmation that records
+    // when it happened, it does not change the status. Set while MATCHED and
+    // never cleared: a pool that reaches DRIVER_ARRIVED/STARTED/COMPLETED must
+    // have been accepted (CHECK pools_accepted_progression).
+    acceptedAt: timestamp("accepted_at", { withTimezone: true }),
     startedAt: timestamp("started_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
   },
@@ -205,6 +211,14 @@ export const pools = pgTable(
     check(
       "pools_capacity_snapshot_positive",
       sql`${table.capacitySnapshot} > 0`,
+    ),
+    // A pool that reaches the driver-flow states must have been accepted
+    // first. CANCELLED is NOT guarded: a MATCHED pool may be cancelled without
+    // ever being accepted (the MATCHED → CANCELLED arm stays legal), and a
+    // cancelled trip no longer needs its acceptance marker (migration 0005).
+    check(
+      "pools_accepted_progression",
+      sql`${table.acceptedAt} is not null or ${table.status} not in ('DRIVER_ARRIVED', 'STARTED', 'COMPLETED')`,
     ),
     // started_at is only ever set once the trip actually started.
     check(
@@ -230,6 +244,11 @@ export const pools = pgTable(
     index("pools_vehicle_idx").on(table.vehicleId),
     index("pools_driver_idx").on(table.driverId),
     index("pools_status_idx").on(table.status),
+    // Driver-side "which of my pools have I accepted / am working" reads
+    // (Phase 6, ADR-019); partial because accepted pools are the interesting set.
+    index("driver_pools_accept_idx")
+      .on(table.acceptedAt)
+      .where(sql`${table.acceptedAt} is not null`),
   ],
 );
 

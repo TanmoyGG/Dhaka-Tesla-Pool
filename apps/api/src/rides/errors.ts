@@ -50,3 +50,53 @@ export class InvalidStateTransitionError extends Error {
     this.name = "InvalidStateTransitionError";
   }
 }
+
+// A pool the caller is not entitled to act on (including one that does not
+// exist at all — an observer must not be able to distinguish). Maps to 404.
+export class PoolNotFoundError extends Error {
+  readonly code = "NOT_FOUND";
+  readonly statusCode = 404;
+
+  constructor() {
+    super("Pool not found.");
+    this.name = "PoolNotFoundError";
+  }
+}
+
+// A driver action that requires the pool's Tesla to be online (Phase 6). The
+// pool's own vehicle row is authoritative, so accepting for another (offline)
+// Tesla of the same driver is rejected too. Maps to 409.
+export class VehicleOfflineError extends Error {
+  readonly code = "VEHICLE_OFFLINE";
+  readonly statusCode = 409;
+
+  constructor() {
+    super("The Tesla for this pool is offline.");
+    this.name = "VehicleOfflineError";
+  }
+}
+
+// Accept/arrive on a pool that is not in the actionable state (Phase 6): e.g.
+// accepting a pool that already left MATCHED, or arriving before accepting.
+// Maps to 409.
+export class PoolNotAcceptableError extends Error {
+  readonly code = "POOL_NOT_ACCEPTABLE";
+  readonly statusCode = 409;
+
+  constructor(message = "Pool is not in a state this action accepts.") {
+    super(message);
+    this.name = "PoolNotAcceptableError";
+  }
+}
+
+// A driver tried to go offline while any of their pools is non-terminal
+// (Phase 6, strict rule — requirements.md §21.J). Maps to 409.
+export class DriverHasActivePoolError extends Error {
+  readonly code = "DRIVER_HAS_ACTIVE_POOL";
+  readonly statusCode = 409;
+
+  constructor() {
+    super("Cannot go offline while a pool is active.");
+    this.name = "DriverHasActivePoolError";
+  }
+}
