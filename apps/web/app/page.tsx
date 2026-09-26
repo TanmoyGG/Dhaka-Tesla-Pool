@@ -13,6 +13,7 @@ export default function HomePage() {
           <SignUpButton />
         </Show>
         <Show when="signed-in">
+          <Link href="/rides">Your rides</Link>
           <Link href="/account">Account</Link>
           <UserButton />
         </Show>

@@ -74,6 +74,10 @@ export default function AccountPage() {
       )}
 
       <p>
+        <Link href="/rides">Book a ride</Link>
+      </p>
+
+      <p>
         <Link href="/">Back to home</Link>
       </p>
     </main>
