@@ -32,7 +32,7 @@
 //     spread <= POOL_DEST_SPREAD_KM, then fullest pool first
 //     (occupiedSeats DESC, createdAt ASC, id ASC). See src/matching/rules.ts.
 
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { AppDatabase } from "../../db/index.js";
 import {
@@ -51,7 +51,11 @@ import {
   type DropOffCandidate,
 } from "../../matching/rules.js";
 import { invalidTransitionReason } from "../state.js";
-import { RideNotFoundError, InvalidStateTransitionError } from "../errors.js";
+import {
+  RideNotFoundError,
+  InvalidStateTransitionError,
+  DriverHasActivePoolError,
+} from "../errors.js";
 import {
   recomputeActivePoolFares,
   refundFare,
@@ -59,6 +63,7 @@ import {
 } from "./fare.js";
 
 const destinationZone = alias(zones, "destination_zone");
+const pickupZone = alias(zones, "pickup_zone");
 
 interface MatchCandidate {
   ride: typeof rideRequests.$inferSelect;
@@ -92,6 +97,11 @@ export interface PoolingService {
   // Force (driver/admin) cancellation: same pool semantics PLUS a full refund —
   // the ride's fare is written back to zero via its discount term.
   forceCancelRide(rideId: string): Promise<void>;
+  // Driver flow (Phase 6, ADR-019): online/offline and pool lifecycle. All
+  // methods take the driver identity ONLY from the authenticated caller.
+  // Going offline is refused while ANY of the driver's pools is non-terminal
+  // (requirements.md §21.J, strict). Maps to 409 DRIVER_HAS_ACTIVE_POOL.
+  setAvailability(driverId: string, isOnline: boolean): Promise<void>;
 }
 
 export function createPoolingService(
@@ -383,6 +393,58 @@ export function createPoolingService(
     });
   }
 
+  // Driver online/offline (Phase 6, ADR-019). Identity comes from the caller,
+  // never the client. Going online simply flips the driver's Teslas; going
+  // offline is REFUSED while any of the driver's pools is non-terminal
+  // (requirements.md §21.J — a driver in an ACCEPTED..STARTED trip cannot duck
+  // the work by flipping the switch).
+  async function setAvailability(
+    driverId: string,
+    isOnline: boolean,
+  ): Promise<void> {
+    await database.transaction(async (tx) => {
+      // Lock this driver's Tesla rows FOR UPDATE first (deterministic id
+      // order): the shared serialization point with the match-time vehicle
+      // lock and with the driver lifecycle transitions (ADR-020). No pool rows
+      // are ever locked here, so this cannot deadlock against a match.
+      await tx
+        .select()
+        .from(vehicles)
+        .where(eq(vehicles.driverId, driverId))
+        .orderBy(asc(vehicles.id))
+        .for("update");
+
+      const now = new Date();
+      if (isOnline) {
+        await tx
+          .update(vehicles)
+          .set({ isOnline: true, updatedAt: now })
+          .where(eq(vehicles.driverId, driverId));
+        return;
+      }
+
+      // Counted under the vehicle lock: a concurrent match creating a pool on
+      // the same Tesla holds that vehicle row until its pool INSERT commits,
+      // so this count can never miss a pool that is about to exist.
+      const [active] = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(pools)
+        .where(
+          and(
+            eq(pools.driverId, driverId),
+            sql`${pools.status} not in ('COMPLETED', 'CANCELLED')`,
+          ),
+        );
+      if ((active?.count ?? 0) > 0) {
+        throw new DriverHasActivePoolError();
+      }
+      await tx
+        .update(vehicles)
+        .set({ isOnline: false, updatedAt: now })
+        .where(eq(vehicles.driverId, driverId));
+    });
+  }
+
   // Shared cancellation core. The ride row is already locked (ride-before-pool
   // lock order); cancelledAt/status/cancelled history are written here, and a
   // MATCHED ride's seat is freed with in-place fare recompute for the members
@@ -460,5 +522,5 @@ export function createPoolingService(
     }
   }
 
-  return { matchRide, cancelRide, forceCancelRide };
+  return { matchRide, cancelRide, forceCancelRide, setAvailability };
 }
