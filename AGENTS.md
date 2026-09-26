@@ -59,8 +59,12 @@ placeholders.
   shadcn/ui, TanStack Query, React Hook Form, Zod, Leaflet + OpenStreetMap.
 - **Backend:** Node.js, Fastify, TypeScript, REST API, Zod, Pino.
 - **Database:** PostgreSQL, Drizzle ORM.
-- **Authentication:** application-owned cookie-based sessions, Argon2id password
-  hashing, role-based authorization (passenger / driver).
+- **Authentication:** Clerk at the edge — the web app uses `@clerk/nextjs`
+  (sign-in/sign-up, route middleware), and the API verifies Clerk bearer
+  tokens and maps them to local application users via `users.clerk_user_id`
+  (ADR-013/014). No passwords or sessions are stored in the app DB.
+  Role-based authorization (passenger / driver) is enforced from the database
+  role on every request.
 - **Testing:** Vitest, Fastify integration/API tests, Playwright for important
   end-to-end flows.
 - **Infrastructure:** Docker, Docker Compose, GitHub Actions.
