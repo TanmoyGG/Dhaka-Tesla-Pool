@@ -50,6 +50,13 @@
       "when": 1790443019838,
       "tag": "0006_warm_karnak",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1790463083553,
+      "tag": "0007_outstanding_sugar_man",
+      "breakpoints": true
     }
   ]
 }

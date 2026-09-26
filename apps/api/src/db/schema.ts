@@ -175,22 +175,32 @@ export const zones = pgTable(
 );
 
 // ---------------------------------------------------------------------------
-// pools — one Tesla serving a set of matched ride requests.
+// pools — a group of matched ride requests. Every pool starts as an
+// UNASSIGNED wait pool: driver_id/vehicle_id are NULL until an eligible driver
+// accepts it (Phase 9, ADR-022). Accepting records the driver + their chosen
+// Tesla + accepted_at atomically (a first-wins claim); the pool stays MATCHED
+// until DRIVER_ARRIVED. A terminal pool frees its driver for new acceptance.
 // ---------------------------------------------------------------------------
 export const pools = pgTable(
   "pools",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    vehicleId: uuid("vehicle_id")
-      .notNull()
-      .references(() => vehicles.id, { onDelete: "restrict" }),
-    driverId: uuid("driver_id")
-      .notNull()
-      .references(() => users.id, { onDelete: "restrict" }),
+    // NULL until a driver accepts. The driver's chosen Tesla is written at
+    // acceptance time — never reserved at pool creation (ADR-022).
+    vehicleId: uuid("vehicle_id").references(() => vehicles.id, {
+      onDelete: "restrict",
+    }),
+    // NULL until a driver accepts. The assigned driver is the pool's owner
+    // for the driver lifecycle transitions (Phase 6, ADR-019).
+    driverId: uuid("driver_id").references(() => users.id, {
+      onDelete: "restrict",
+    }),
     // Carries the full PRD lifecycle REQUESTED → ... → COMPLETED/+CANCELLED.
     status: rideStatusEnum("status").notNull().default("REQUESTED"),
     // Snapshot of the vehicle capacity when the pool was created, so history
-    // stays understandable even if the vehicle is reconfigured later.
+    // stays understandable even if the vehicle is reconfigured later. MVP
+    // Teslas are fixed 3-seat, so a wait pool is born with capacity 3 and an
+    // accepting vehicle must satisfy it (verified at acceptance).
     capacitySnapshot: integer("capacity_snapshot").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
@@ -198,11 +208,10 @@ export const pools = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
-    // When the driver confirmed the auto-assigned pool (Phase 6, ADR-019).
-    // Pools are born MATCHED (ADR-016); "accept" is a confirmation that records
-    // when it happened, it does not change the status. Set while MATCHED and
-    // never cleared: a pool that reaches DRIVER_ARRIVED/STARTED/COMPLETED must
-    // have been accepted (CHECK pools_accepted_progression).
+    // When the driver ACCEPTED the unassigned pool (Phase 9, ADR-022). Set
+    // together with driver_id/vehicle_id at acceptance; never cleared. A pool
+    // that reaches DRIVER_ARRIVED/STARTED/COMPLETED must have been accepted
+    // (CHECK pools_accepted_progression).
     acceptedAt: timestamp("accepted_at", { withTimezone: true }),
     startedAt: timestamp("started_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
@@ -230,17 +239,40 @@ export const pools = pgTable(
       "pools_complete_timestamp",
       sql`(${table.status} = 'COMPLETED') = (${table.completedAt} is not null)`,
     ),
+    // A pool can be assigned only as a whole: driver and vehicle are written
+    // together at acceptance, or both stay NULL for a wait pool. A partially
+    // assigned pool is a data anomaly (ADR-022).
+    check(
+      "pools_assignment_consistent",
+      sql`(${table.driverId} is null) = (${table.vehicleId} is null)`,
+    ),
+    // A driver is assigned only by accepting: driver_id non-null implies the
+    // acceptance timestamp is set. There is no "assigned but not accepted"
+    // state (ADR-022).
+    check(
+      "pools_driver_implies_accepted",
+      sql`${table.driverId} is null or ${table.acceptedAt} is not null`,
+    ),
     // A pool cannot complete without having started.
     check(
       "pools_complete_requires_started",
       sql`${table.status} <> 'COMPLETED' or ${table.startedAt} is not null`,
     ),
-    // One active (non-terminal) pool per vehicle: exactly the integrity rule
-    // that makes "occupied seats" a per-pool aggregate meaningful. See
-    // docs/database.md §5.5 (concurrency) for how this composes with locking.
-    uniqueIndex("pools_single_active_per_vehicle")
+    // One active ACCEPTED pool per driver: exactly the integrity rule that
+    // frees a driver only when their pool becomes terminal. Unassigned wait
+    // pools carry driver_id NULL and so never contend here (ADR-022,
+    // docs/database.md §5.5). The vehicle-level twin is defense-in-depth (a
+    // vehicle belongs to one driver, but the constraint is nearly free).
+    uniqueIndex("pools_single_accepted_per_driver")
+      .on(table.driverId)
+      .where(
+        sql`${table.driverId} is not null and ${table.status} not in ('COMPLETED', 'CANCELLED')`,
+      ),
+    uniqueIndex("pools_single_accepted_per_vehicle")
       .on(table.vehicleId)
-      .where(sql`${table.status} not in ('COMPLETED', 'CANCELLED')`),
+      .where(
+        sql`${table.vehicleId} is not null and ${table.status} not in ('COMPLETED', 'CANCELLED')`,
+      ),
     index("pools_vehicle_idx").on(table.vehicleId),
     index("pools_driver_idx").on(table.driverId),
     index("pools_status_idx").on(table.status),
