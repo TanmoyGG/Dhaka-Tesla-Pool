@@ -71,6 +71,18 @@ accept/arrive/complete and offline-vs-booking. Migration 0005 adds
 `pools.accepted_at` + a progression CHECK (additive). Full suite **152/152**
 across 9 test files. See [Driver workflow](#driver-workflow-phase-6) below.
 
+**Phase 9 — Passenger frontend: in progress (`feature/passenger-ui`).** The
+browser now exposes the passenger flow on top of the complete API: book a ride
+(Banani → Mohakhali, seats 1–3), view the live fare estimate and the pooled
+fare with the full breakdown, follow the ride status badge
+(REQUESTED → MATCHED → DRIVER_ARRIVED → STARTED → COMPLETED), see the assigned
+pool (driver name, Tesla name, occupied/capacity), and cancel while that is
+legally possible. Implemented in `apps/web` with React Hook Form + Zod
+(mirroring the API's strict validation) and TanStack Query for server state;
+the ride-detail page shows every fare component. No polling timers, no map
+(Leaflet/OSM deferred), no driver UI yet — the driver flow remains API-only
+until `feature/driver-ui`.
+
 ## Project Description
 
 A ride-pooling MVP for Dhaka. Battery-powered, three-seat "Teslas" (easy-bike
@@ -281,9 +293,9 @@ Authentication is managed by [Clerk](https://clerk.com) (ADR-013) — the
 application does **not** store passwords or sessions.
 
 - **Web (`@clerk/nextjs`):** `ClerkProvider` in the root layout, sign-in /
-  sign-up pages, a protected `/account` page, and `middleware.ts` route policy
-  (`/`, `/sign-in*`, `/sign-up*` public; `/account*` requires a signed-in user
-  and redirects to `/sign-in`).
+  sign-up pages, protected passenger pages, and `middleware.ts` route policy
+  (`/`, `/sign-in*`, `/sign-up*` public; `/account*`, `/rides*`, and
+  `/driver*` require a signed-in user and redirect to `/sign-in`).
 - **API (`@clerk/backend`):** Fastify verifies every request under `/api` with
   `authenticateRequest()` (bearer token). `apps/api/src/auth/` implements the
   flow as three injectable boundaries — `SessionVerifier` (token → Clerk
@@ -338,6 +350,56 @@ UPDATE users SET clerk_user_id = '<clerk-user-id>' WHERE email = 'nusrat@example
 
 Real Clerk IDs cannot collide with placeholders (`user_...` vs
 `dev-only::seed::...`).
+
+The four Development-cluster cast identities (below) are applied for you by the
+ready-made development-only script
+[`apps/api/scripts/map-cast-clerk-ids.sql`](apps/api/scripts/map-cast-clerk-ids.sql);
+it only updates `clerk_user_id` on the exact seeded rows and preserves every
+role.
+
+### Demo guide (local)
+
+A complete local demo of the passenger flow (roles come from the seed — they
+are never derived from email):
+
+1. **Start PostgreSQL (Docker):**
+   ```bash
+   docker compose up db
+   ```
+2. **Run migrations:**
+   ```bash
+   npm run db:migrate -w @dhaka-tesla-pool/api
+   ```
+3. **Run seed** (idempotent — adds Jashim, Nusrat, Rafiq, Shirin, Bullet, and
+   the 8 zones):
+   ```bash
+   npm run db:seed -w @dhaka-tesla-pool/api
+   ```
+4. **Map the four seeded cast users to their real Clerk Development
+   identities.** These four users are **Development-instance test users** (the
+   IDs are not secrets, but a matching `CLERK_SECRET_KEY` is required to verify
+   their sessions). The script preserves the seeded roles exactly:
+   ```bash
+   docker compose exec -T db psql -U postgres -d dhaka_tesla_pool -f - `
+     < apps/api/scripts/map-cast-clerk-ids.sql
+   ```
+   Result — `jashim@example.com` → DRIVER; `nusrat@example.com`, `rafiq@example.com`,
+   `shirin@example.com` → PASSENGER.
+5. **Sign in through Clerk** at `http://localhost:3000` with one of the four
+   Development accounts (any brand-new identity is provisioned automatically).
+6. **Scripted story:**
+   - Nusrat → book **Banani → Mohakhali** and watch the fare estimate.
+   - Rafiq → book **Banani → Gulshan 1** on Bullet → verify the pooled fare
+     (both riders see the 25% discount).
+   - Shirin → grab Bullet's **last seat** after it is 2/3 full — the
+     concurrency/capacity case.
+   - Jashim → driver work (availability + accept/arrive/start/complete) once
+     `feature/driver-ui` lands; until then, drive via the API (see
+     [Driver workflow](#driver-workflow-phase-6)).
+
+No passwords appear in the README, source, seed, script, or git history. The
+four Clerk accounts are **Development-instance** test users in the project's
+dev Clerk application; any production instance uses separate real identities.
 
 ## API
 

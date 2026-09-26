@@ -189,7 +189,7 @@ flowchart LR
 | `POST /api/rides/:rideId/cancel` (API) | `PASSENGER` (owner); 404 or 409 otherwise | `requireAuth` + `requireRole(["PASSENGER"])` + owner/state checks (Phase 5) |
 | `GET /api/zones` (API) | Signed-in user (any role) | Auth plugin preHandler (bearer token) + `requireAuth` |
 | `/` , `/sign-in`, `/sign-up` (web) | **Public** | Clerk middleware (no protection) |
-| `/account*` (web) | Signed-in user | Clerk middleware redirects to `/sign-in` |
+| `/account*`, `/rides*`, `/driver*` (web) | Signed-in user | Clerk middleware redirects to `/sign-in` |
 
 Unauthenticated API requests fail closed with `401 AUTH_UNAUTHENTICATED`.
 Role-protected routes add `requireRole([...])`; the role comes from the
