@@ -21,6 +21,13 @@
 //     row acquires the RIDE row lock first, the POOL row lock second
 //     (createRequest already holds the ride lock from its INSERT). Consistent
 //     ordering ⇒ no deadlock between match, cancel, and force-cancel.
+//   - Driver-flow hardening (Phase 6, ADR-019/020): the new-pool Tesla pick
+//     takes the vehicle row `FOR UPDATE` so a match and a concurrent offline
+//     toggle serialize on the vehicle row (a match can never land a pool on a
+//     Tesla that just went offline); and a claim re-verifies the POOL is still
+//     MATCHED under its row lock, so a lifecycle transition that committed
+//     meanwhile cannot have a passenger grafted onto a trip that already left
+//     MATCHED.
 //   - Match order within a transaction: same pickup zone, all-pairs drop-off
 //     spread <= POOL_DEST_SPREAD_KM, then fullest pool first
 //     (occupiedSeats DESC, createdAt ASC, id ASC). See src/matching/rules.ts.
@@ -228,7 +235,11 @@ export function createPoolingService(
         ),
       )
       .orderBy(asc(vehicles.name), asc(vehicles.id))
-      .limit(1);
+      .limit(1)
+      // Phase 6: lock the chosen Tesla so a concurrent offline-toggle (which
+      // also takes the vehicle row lock) cannot win between our eligibility
+      // read and the pool INSERT (ADR-020).
+      .for("update");
     return row?.vehicle;
   }
 
@@ -244,6 +255,13 @@ export function createPoolingService(
       .where(eq(pools.id, poolId))
       .for("update");
     if (!lockedPool) return false;
+
+    // Phase 6 hardening (ADR-020): the pool was listed as a candidate by a
+    // PRIOR, lock-free read. Re-verify its status under the lock — a driver
+    // transition (accept/arrive/start/complete) or an emptying cancel that
+    // committed meanwhile must not let a passenger join a trip that already
+    // left MATCHED.
+    if (lockedPool.status !== "MATCHED") return false;
 
     const [occupancy] = await tx
       .select({
