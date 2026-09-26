@@ -353,7 +353,7 @@ describeDb("driver workflow (Phase 6)", () => {
 
   it("runs the full lifecycle and completes every ride with timestamps + histories", async () => {
     const n = await rides.createRequest(NUSRAT, booking());
-    const r = await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
+    await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
     const poolId = n.ride.pool!.id;
 
     const accepted = await driver.acceptPool(JASHIM.id, poolId);
@@ -525,7 +525,7 @@ describeDb("driver workflow (Phase 6)", () => {
 
   it("lists only the driver's own non-terminal pools, newest first, fare-free", async () => {
     const n = await rides.createRequest(NUSRAT, booking());
-    const r = await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
+    await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
     const poolId = n.ride.pool!.id;
 
     const list = await driver.listDriverPools(JASHIM.id);
@@ -688,7 +688,7 @@ describeDb("driver workflow (Phase 6)", () => {
 
     try {
       const n = await rides.createRequest(NUSRAT, booking());
-      const r = await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
+      await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
       const poolId = n.ride.pool!.id;
       const jashim = { authorization: `Bearer ${TOKENS.jashim}` };
       const karim = { authorization: `Bearer ${TOKENS.karim}` };
