@@ -43,6 +43,13 @@
       "when": 1790417751983,
       "tag": "0005_powerful_johnny_storm",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790443019838,
+      "tag": "0006_warm_karnak",
+      "breakpoints": true
     }
   ]
 }

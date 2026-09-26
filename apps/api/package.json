@@ -17,7 +17,8 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
-    "db:check": "tsx src/db/check.ts"
+    "db:check": "tsx src/db/check.ts",
+    "db:cleanup-rides": "tsx scripts/cleanup-dev-rides.ts"
   },
   "dependencies": {
     "@clerk/backend": "^3.20.0",

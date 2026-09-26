@@ -670,6 +670,101 @@ describeDb("driver workflow (Phase 6)", () => {
       });
       expect(badBody.statusCode).toBe(400);
       expect(badBody.json().error.code).toBe("VALIDATION_ERROR");
+
+      // The GET mirror returns the same state the toggle just produced.
+      const snapshot = await app.inject({
+        method: "GET",
+        url: "/api/driver/availability",
+        headers: { authorization: `Bearer ${TOKENS.jashim}` },
+      });
+      expect(snapshot.statusCode).toBe(200);
+      expect(snapshot.json().availability).toEqual({ isOnline: true });
+
+      const passengerGets = await app.inject({
+        method: "GET",
+        url: "/api/driver/availability",
+        headers: { authorization: `Bearer ${TOKENS.nusrat}` },
+      });
+      expect(passengerGets.statusCode).toBe(403);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("getAvailability mirrors the toggle state (all owned Teslas online)", async () => {
+    await setBulletOnline(false);
+    expect(await driver.getAvailability(JASHIM.id)).toEqual({ isOnline: false });
+    await driver.setAvailability(JASHIM.id, true);
+    expect(await driver.getAvailability(JASHIM.id)).toEqual({ isOnline: true });
+    await driver.setAvailability(JASHIM.id, false);
+    expect(await driver.getAvailability(JASHIM.id)).toEqual({ isOnline: false });
+    await driver.setAvailability(JASHIM.id, true);
+  });
+
+  it("listDriverHistory returns COMPLETED pools newest first, never active ones", async () => {
+    // Two completed trips...
+    const n1 = await rides.createRequest(NUSRAT, booking());
+    const poolA = n1.ride.pool!.id;
+    for (const step of ["accept", "arrive", "start", "complete"] as const) {
+      await driver[`${step}Pool`](JASHIM.id, poolA);
+    }
+    const n2 = await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
+    const poolB = n2.ride.pool!.id;
+    for (const step of ["accept", "arrive", "start", "complete"] as const) {
+      await driver[`${step}Pool`](JASHIM.id, poolB);
+    }
+
+    const history = await driver.listDriverHistory(JASHIM.id);
+    expect(history).toHaveLength(2);
+    // Newest completed first; both COMPLETED with the members projection.
+    expect(history[0]!.id).toBe(poolB);
+    expect(history[1]!.id).toBe(poolA);
+    expect(history[0]!.status).toBe("COMPLETED");
+    expect(history[0]!.completedAt).not.toBeNull();
+    expect(history[0]!.occupiedSeats).toBe(1);
+    expect(history[0]!.members[0]!.passengerName).toBe("Rafiq Rahman");
+
+    // Active pools are NOT history.
+    await rides.createRequest(SHIRIN, booking());
+    expect(await driver.listDriverHistory(JASHIM.id)).toHaveLength(2);
+  });
+
+  it("exposes the completed-trip history endpoint over HTTP (403 for passengers)", async () => {
+    const app: FastifyInstance = buildApp({
+      auth: {
+        verifySession: async (token: string) => TOKEN_TO_CLERK[token] ?? null,
+        resolveLocalUser: async (clerkId: string) =>
+          CLERK_TO_USER.get(clerkId) ?? null,
+        provisionLocalUser: async () => null,
+      },
+      driver: createDriverService(db),
+    });
+
+    try {
+      const n = await rides.createRequest(NUSRAT, booking());
+      const poolId = n.ride.pool!.id;
+      await driver.acceptPool(JASHIM.id, poolId);
+      await driver.arrivePool(JASHIM.id, poolId);
+      await driver.startPool(JASHIM.id, poolId);
+      await driver.completePool(JASHIM.id, poolId);
+
+      const res = await app.inject({
+        method: "GET",
+        url: "/api/driver/pools/history",
+        headers: { authorization: `Bearer ${TOKENS.jashim}` },
+      });
+      expect(res.statusCode).toBe(200);
+      const { pools: history } = res.json();
+      expect(history).toHaveLength(1);
+      expect(history[0].id).toBe(poolId);
+      expect(history[0].status).toBe("COMPLETED");
+
+      const passenger = await app.inject({
+        method: "GET",
+        url: "/api/driver/pools/history",
+        headers: { authorization: `Bearer ${TOKENS.nusrat}` },
+      });
+      expect(passenger.statusCode).toBe(403);
     } finally {
       await app.close();
     }

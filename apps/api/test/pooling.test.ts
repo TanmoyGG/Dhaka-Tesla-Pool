@@ -29,6 +29,7 @@ import {
   pools,
   rideRequests,
   rideStatusHistory,
+  users,
   vehicles,
 } from "../src/db/schema.js";
 import type { AuthUser } from "../src/auth/identity.js";
@@ -61,6 +62,13 @@ function passenger(id: string, name: string, email: string): AuthUser {
 const NUSRAT = passenger(SEED_IDS.nusrat, "Nusrat Haque", "nusrat@example.com");
 const RAFIQ = passenger(SEED_IDS.rafiq, "Rafiq Rahman", "rafiq@example.com");
 const SHIRIN = passenger(SEED_IDS.shirin, "Shirin Islam", "shirin@example.com");
+// FAISA is a TEST-LOCAL fourth passenger (never in the seed cast — the seed has
+// exactly three passengers). Inserted directly like driver.test.ts inserts
+// KARIM, she is who grabs *Bullet's* last seat after Nusrat/Rafiq/Shirin filled
+// it: under the one-active-ride rule (ADR-021) Nusrat may NOT book a second
+// time, so a fourth claimer must be a distinct user.
+const FAISA_ID = "a1000000-0000-4000-8000-000000000008";
+const FAISA = passenger(FAISA_ID, "Faisa Akter", "faisa@example.com");
 
 const BOOK_NUSRAT = {
   pickupZoneId: Z.banani,
@@ -83,6 +91,12 @@ const BOOK_SHIRIN = {
 const BOOK_DHANMONDI = {
   pickupZoneId: Z.banani,
   destinationZoneId: Z.dhanmondi,
+  requestedSeats: 1,
+  clientRequestId: null,
+};
+const BOOK_FAISA = {
+  pickupZoneId: Z.banani,
+  destinationZoneId: Z.gulshan,
   requestedSeats: 1,
   clientRequestId: null,
 };
@@ -145,6 +159,20 @@ describeDb("pooling (Phase 5)", () => {
     client = postgres(testUrl, { max: 1 });
     db = drizzle(client);
     await runSeed(db);
+    // Faisa is a test-local fourth passenger (the three-seat cast fills the
+    // pool with only three passengers alive at once under the one-active-ride
+    // rule). Inserted directly, like driver.test.ts inserts KARIM.
+    await db
+      .insert(users)
+      .values({
+        id: FAISA_ID,
+        clerkUserId: FAISA.clerkUserId,
+        name: FAISA.name,
+        email: FAISA.email,
+        role: "PASSENGER",
+        active: true,
+      })
+      .onConflictDoNothing();
     rides = createRideService(db);
   });
 
@@ -218,8 +246,11 @@ describeDb("pooling (Phase 5)", () => {
     // The final booking's view reflects the settled pool: 3/3 seats taken.
     expect(third.ride.pool?.occupiedSeats).toBe(3);
 
-    // 3/3 seats taken — a fourth 1-seat request must stay REQUESTED.
-    const fourth = await rides.createRequest(NUSRAT, booking(BOOK_SHIRIN));
+    // 3/3 seats taken — a FOURTH passenger's 1-seat request must stay
+    // REQUESTED. (It is FAISA who claims now: Nusrat already holds an ACTIVE
+    // ride and the one-active-ride rule would reject her second booking with
+    // 409 before pooling even runs — see the concurrency suite below.)
+    const fourth = await rides.createRequest(FAISA, booking(BOOK_FAISA));
     expect(fourth.ride.status).toBe("REQUESTED");
     expect(fourth.ride.pool).toBeNull();
 
@@ -566,6 +597,47 @@ describeDb("pooling (Phase 5)", () => {
         .from(fares)
         .where(eq(fares.rideRequestId, a.ride.id));
       expect(faresN[0]?.poolDiscountPaisa).toBe(1483);
+    } finally {
+      await clientA.end();
+      await clientB.end();
+    }
+  });
+
+  it("races the SAME passenger on two connections without a key: one ride, one 409 (ADR-021)", async () => {
+    // The strictest form of the one-active-ride rule: the same passenger
+    // submits twice at once, no idempotency key, on two truly parallel
+    // connections. The partial unique index
+    // ride_requests_one_active_per_passenger is the arbiter: exactly one
+    // booking persists, the loser surfaces 409 ACTIVE_RIDE_EXISTS (whether it
+    // collides at the service pre-check or inside the transaction on the
+    // index itself — both leave exactly one ride).
+    const clientA = postgres(testUrl, { max: 1 });
+    const clientB = postgres(testUrl, { max: 1 });
+    const serviceA = createRideService(drizzle(clientA));
+    const serviceB = createRideService(drizzle(clientB));
+
+    try {
+      const [a, b] = await Promise.allSettled([
+        serviceA.createRequest(NUSRAT, booking()),
+        serviceB.createRequest(NUSRAT, booking()),
+      ]);
+
+      const fulfilled = a.status === "fulfilled" ? a.value : b.status === "fulfilled" ? b.value : null;
+      const rejected = a.status === "rejected" ? a : b;
+      expect(fulfilled).not.toBeNull();
+      expect(fulfilled!.ride.status).toBe("MATCHED");
+      expect(rejected.status).toBe("rejected");
+      expect(rejected.reason).toMatchObject({
+        code: "ACTIVE_RIDE_EXISTS",
+        statusCode: 409,
+      });
+
+      // Exactly ONE ride row for Nusrat — never two double-booked rides.
+      const rows = await db
+        .select()
+        .from(rideRequests)
+        .where(eq(rideRequests.passengerId, SEED_IDS.nusrat));
+      expect(rows).toHaveLength(1);
     } finally {
       await clientA.end();
       await clientB.end();

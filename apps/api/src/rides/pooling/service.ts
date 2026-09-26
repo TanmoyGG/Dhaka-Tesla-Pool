@@ -143,6 +143,9 @@ export interface PoolingService {
   // Going offline is refused while ANY of the driver's pools is non-terminal
   // (requirements.md §21.J, strict). Maps to 409 DRIVER_HAS_ACTIVE_POOL.
   setAvailability(driverId: string, isOnline: boolean): Promise<void>;
+  // Read-only snapshot of online state for the dashboard toggle: true when
+  // every owned Tesla is online (mirrors what setAvailability produced).
+  getAvailabilityForDriver(driverId: string): Promise<{ isOnline: boolean }>;
   // Confirmation of the pool automatched to this driver: records accepted_at
   // (MATCHED preserved, idempotent); requires the pool's Tesla online
   // (409 VEHICLE_OFFLINE) and the pool still MATCHED (409 POOL_NOT_ACCEPTABLE);
@@ -165,6 +168,9 @@ export interface PoolingService {
   // Every non-terminal pool the driver owns, newest first (deterministic
   // created_at desc, id desc tiebreak). No fares, ACTIVE members only.
   listDriverPools(driverId: string): Promise<DriverPoolView[]>;
+  // Completed-trip history: pools the driver COMPLETED, newest first (limited,
+  // default 10). Same projection as listDriverPools; no fares.
+  listDriverHistory(driverId: string, limit?: number): Promise<DriverPoolView[]>;
   // A single pool by id; anything that isn't the caller's pool is a plain 404
   // (existence hidden 1:1).
   getDriverPool(driverId: string, poolId: string): Promise<DriverPoolView>;
@@ -802,6 +808,22 @@ export function createPoolingService(
     });
   }
 
+  // Driver online/offline SNAPSHOT for the dashboard toggle (read-only; the
+  // toggle itself is setAvailability/ADR-019). A driver is "online" when every
+  // owned Tesla is online — the toggle sets them all at once, so the snapshot
+  // must mirror exactly what the toggle last produced.
+  async function getAvailabilityForDriver(
+    driverId: string,
+  ): Promise<{ isOnline: boolean }> {
+    const rows = await database
+      .select({ isOnline: vehicles.isOnline })
+      .from(vehicles)
+      .where(eq(vehicles.driverId, driverId));
+    return {
+      isOnline: rows.length > 0 && rows.every((vehicle) => vehicle.isOnline),
+    };
+  }
+
   // The driver hub's open pools: every non-terminal pool this driver owns,
   // newest first (created_at then id desc, so ordering is deterministic even
   // without second-precision timestamps). Lock-free read.
@@ -818,8 +840,37 @@ export function createPoolingService(
       )
       .orderBy(desc(pools.createdAt), desc(pools.id));
     if (poolRows.length === 0) return [];
+    return hydratePoolViews(
+      poolRows,
+      await loadMembersForPools(poolRows.map((row) => row.pool.id)),
+    );
+  }
 
-    const memberRows = await database
+  // The driver hub's completed-trip history (PRD driver: "see history").
+  // SAME projection as listDriverPools but restricted to COMPLETED pools,
+  // most recently completed first — covers the MVP's trip-history need
+  // without a separate source.
+  async function listDriverHistory(
+    driverId: string,
+    limit = 10,
+  ): Promise<DriverPoolView[]> {
+    const poolRows = await database
+      .select({ pool: pools, vehicle: vehicles })
+      .from(pools)
+      .innerJoin(vehicles, eq(vehicles.id, pools.vehicleId))
+      .where(and(eq(pools.driverId, driverId), eq(pools.status, "COMPLETED")))
+      .orderBy(desc(pools.completedAt), desc(pools.createdAt), desc(pools.id))
+      .limit(limit);
+    if (poolRows.length === 0) return [];
+    return hydratePoolViews(
+      poolRows,
+      await loadMembersForPools(poolRows.map((row) => row.pool.id)),
+    );
+  }
+
+  async function loadMembersForPools(poolIds: string[]) {
+    if (poolIds.length === 0) return [];
+    return await database
       .select({
         poolId: poolMembers.poolId,
         rideRequestId: rideRequests.id,
@@ -841,15 +892,17 @@ export function createPoolingService(
       )
       .where(
         and(
-          inArray(
-            poolMembers.poolId,
-            poolRows.map((row) => row.pool.id),
-          ),
+          inArray(poolMembers.poolId, poolIds),
           eq(poolMembers.status, "ACTIVE"),
         ),
       )
       .orderBy(asc(poolMembers.joinedAt), asc(poolMembers.id));
+  }
 
+  function hydratePoolViews(
+    poolRows: { pool: typeof pools.$inferSelect; vehicle: typeof vehicles.$inferSelect }[],
+    memberRows: Awaited<ReturnType<typeof loadMembersForPools>>,
+  ): DriverPoolView[] {
     const membersByPool = new Map<string, (typeof memberRows)[number][]>();
     for (const member of memberRows) {
       const list = membersByPool.get(member.poolId) ?? [];
@@ -982,11 +1035,13 @@ export function createPoolingService(
     cancelRide,
     forceCancelRide,
     setAvailability,
+    getAvailabilityForDriver,
     acceptPool,
     arrivePool,
     startPool,
     completePool,
     listDriverPools,
+    listDriverHistory,
     getDriverPool,
   };
 }

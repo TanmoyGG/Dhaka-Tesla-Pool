@@ -328,6 +328,15 @@ export const rideRequests = pgTable(
     uniqueIndex("ride_requests_client_request_id_key")
       .on(table.passengerId, table.clientRequestId)
       .where(sql`${table.clientRequestId} is not null`),
+    // One ACTIVE (non-terminal) ride per passenger at a time — the DB-level
+    // invariant behind the single-active-ride rule (requirements.md §21.L,
+    // migration 0006, ADR-021). A passenger cannot hold two REQUESTED..STARTED
+    // rides; the service maps a violation to 409 ACTIVE_RIDE_EXISTS, and a
+    // COMPLETED or CANCELLED ride drops out of the partial index so a
+    // passenger can book again.
+    uniqueIndex("ride_requests_one_active_per_passenger")
+      .on(table.passengerId)
+      .where(sql`${table.status} not in ('COMPLETED', 'CANCELLED')`),
     // matching: scan for requests awaiting a driver.
     index("ride_requests_status_idx").on(table.status),
     // reverse lookup: which requests ride in this pool (FK support too).

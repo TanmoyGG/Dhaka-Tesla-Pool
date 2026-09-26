@@ -100,3 +100,19 @@ export class DriverHasActivePoolError extends Error {
     this.name = "DriverHasActivePoolError";
   }
 }
+
+// A passenger tried to book a second ride while a previous one is still
+// non-terminal (one active ride per passenger — documented assumption,
+// requirements.md §21.L; enforced by the partial unique index
+// ride_requests_one_active_per_passenger, migration 0006). Maps to 409.
+export class ActiveRideExistsError extends Error {
+  readonly code = "ACTIVE_RIDE_EXISTS";
+  readonly statusCode = 409;
+
+  constructor() {
+    super(
+      "You already have an active ride. Complete or cancel it before booking another.",
+    );
+    this.name = "ActiveRideExistsError";
+  }
+}

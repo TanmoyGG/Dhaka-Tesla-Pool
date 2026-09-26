@@ -69,9 +69,22 @@ export const driverRoutes: FastifyPluginAsync<DriverRoutesOptions> = async (
       return reply.code(204).send();
     });
 
+    // Availability snapshot for the dashboard toggle (read mirror of the
+    // toggle: true when every owned Tesla is online).
+    scope.get("/driver/availability", async (request) => ({
+      availability: await options.driver.getAvailability(request.auth!.user.id),
+    }));
+
     // The driver hub: every non-terminal pool this driver owns, newest first.
     scope.get("/driver/pools", async (request) => ({
       pools: await options.driver.listDriverPools(request.auth!.user.id),
+    }));
+
+    // Completed-trip history, newest first. Registered BEFORE the :poolId
+    // route (Fastify prefers a static route over a parametric one anyway, but
+    // the ordering also makes the intent explicit).
+    scope.get("/driver/pools/history", async (request) => ({
+      pools: await options.driver.listDriverHistory(request.auth!.user.id),
     }));
 
     scope.get<{ Params: { poolId: string } }>(

@@ -14,7 +14,7 @@
 // CI runs these tests against a Postgres service container.
 
 import { eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { config } from "../src/config.js";
 import { isReservedClerkUserId, seedClerkUserId } from "../src/auth/identity.js";
 import {
@@ -67,6 +67,22 @@ async function insertRideRequest(overrides: Partial<typeof rideRequests.$inferIn
     .returning();
 }
 
+// The one-active-ride partial unique index (migration 0006, ADR-021) forbids
+// a passenger from holding two non-terminal rows even when rows are inserted
+// DIRECTLY through the database, so every test starts from an empty ride
+// surface (children first). Vehicles other than the seeded Bullet are
+// test-created pools' parents and are wiped too.
+async function wipeRideSurface(): Promise<void> {
+  await db.transaction(async (tx) => {
+    await tx.delete(rideStatusHistory);
+    await tx.delete(poolMembers);
+    await tx.delete(fares);
+    await tx.delete(rideRequests);
+    await tx.delete(pools);
+    await tx.delete(vehicles).where(sql`${vehicles.id} <> ${SEED_IDS.bullet}`);
+  });
+}
+
 describeDb("database schema (Phases 2 + 3)", () => {
   beforeAll(async () => {
     testUrl = await resetTestDatabase(config.databaseUrl);
@@ -78,6 +94,10 @@ describeDb("database schema (Phases 2 + 3)", () => {
 
   afterAll(async () => {
     await client.end();
+  });
+
+  beforeEach(async () => {
+    await wipeRideSurface();
   });
 
   it("migration creates all expected tables", async () => {
@@ -687,6 +707,31 @@ describeDb("database schema (Phases 2 + 3)", () => {
         fromStatus: "REQUESTED",
         status: "MATCHED",
       }),
+    ).resolves.toBeDefined();
+  });
+
+  it("enforces the one-active-ride rule at the DB level (partial unique index, migration 0006)", async () => {
+    const idx = await db.execute<{ indexname: string }>(
+      sql`select indexname from pg_indexes
+          where schemaname = 'public' and tablename = 'ride_requests'
+            and indexname = 'ride_requests_one_active_per_passenger'`,
+    );
+    expect(idx).toHaveLength(1);
+
+    // A first non-terminal ride for Nusrat is fine.
+    await expect(insertRideRequest()).resolves.toBeDefined();
+    // A SECOND non-terminal row for the same passenger is rejected at the
+    // database itself — strictly stronger than the service pre-check.
+    await expect(insertRideRequest()).rejects.toMatchObject(
+      rejectionCode("23505"),
+    );
+    // A COMPLETED ride drops out of the partial index, so Nusrat can hold a
+    // terminal row as history without colliding.
+    await expect(
+      insertRideRequest({ status: "COMPLETED", completedAt: new Date() }),
+    ).resolves.toBeDefined();
+    await expect(
+      insertRideRequest({ status: "CANCELLED", cancelledAt: new Date() }),
     ).resolves.toBeDefined();
   });
 });
