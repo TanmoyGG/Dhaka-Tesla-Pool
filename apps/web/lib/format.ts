@@ -20,3 +20,14 @@ const STATUS_LABELS: Record<RideStatus, string> = {
 export function formatStatus(status: RideStatus): string {
   return STATUS_LABELS[status];
 }
+
+const DATE_FORMAT = new Intl.DateTimeFormat(undefined, {
+  dateStyle: "medium",
+  timeStyle: "short",
+});
+
+export function formatDateTime(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  return DATE_FORMAT.format(date);
+}

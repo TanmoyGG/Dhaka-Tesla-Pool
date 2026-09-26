@@ -5,6 +5,8 @@ import { CancelRideButton } from "./cancel-ride-button";
 import { StatusBadge } from "./status-badge";
 
 export function RideCard({ ride }: { ride: RideView }) {
+  const shared = ride.pool && ride.pool.occupiedSeats > 1;
+
   return (
     <article className="card">
       <div className="row space-between">
@@ -17,16 +19,20 @@ export function RideCard({ ride }: { ride: RideView }) {
       <p className="card-seats text-muted">
         {ride.requestedSeats} seat{ride.requestedSeats === 1 ? "" : "s"} ·{" "}
         {ride.pool
-          ? `${ride.pool.occupiedSeats}/${ride.pool.capacitySnapshot} seats filled`
+          ? `${ride.pool.occupiedSeats}/${ride.pool.capacitySnapshot} seats filled · ${ride.pool.vehicleName} (${ride.pool.driverName})`
           : "not matched yet"}
       </p>
+
+      {shared && (
+        <p className="text-small text-ok">Shared ride — 25% pool discount applied</p>
+      )}
 
       <div className="row space-between">
         <p className="card-fare">
           {formatPaisa(ride.fare.perSeatFarePaisa)}/seat · total{" "}
           <strong>{formatPaisa(ride.fare.estimatedTotalPaisa)}</strong>
         </p>
-        <Link className="btn btn-secondary" href={`/rides/${ride.id}`}>
+        <Link className="btn btn-secondary btn-sm" href={`/rides/${ride.id}`}>
           Details
         </Link>
       </div>

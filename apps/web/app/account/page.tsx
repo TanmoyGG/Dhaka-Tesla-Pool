@@ -1,85 +1,63 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import Link from "next/link";
-import { UserButton, useAuth } from "@clerk/nextjs";
-import { apiGet, ApiError } from "@/lib/api";
-
-interface MeResponse {
-  user: {
-    id: string;
-    name: string;
-    email: string;
-    role: string;
-    active: boolean;
-  };
-}
+import { UserButton } from "@clerk/nextjs";
+import { ErrorCard, LoadingState } from "@/components/state-components";
+import { useMe } from "@/lib/queries";
 
 export default function AccountPage() {
-  const { isLoaded, getToken } = useAuth();
-  const [user, setUser] = useState<MeResponse["user"] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function load() {
-      if (!isLoaded) return;
-      try {
-        const me = await apiGet<MeResponse>("/api/me", getToken);
-        if (!cancelled) setUser(me.user);
-      } catch (err) {
-        if (!cancelled) {
-          setError(
-            err instanceof ApiError
-              ? `${err.code}: ${err.message}`
-              : err instanceof Error
-                ? err.message
-                : "Something went wrong",
-          );
-        }
-      }
-    }
-
-    void load();
-    return () => {
-      cancelled = true;
-    };
-  }, [isLoaded, getToken]);
+  const me = useMe();
 
   return (
-    <main>
-      <h1>Your account</h1>
-      <UserButton />
-      <p>
-        This identity is provided by Clerk; the role shown below is stored in
-        the application database (PostgreSQL) and granted by the project owner.
-      </p>
+    <main className="container">
+      <h1 className="page-header">Your account</h1>
 
-      {error && <p style={{ color: "red" }}>Error: {error}</p>}
+      <div className="card">
+        <div className="row space-between">
+          <p className="text-muted">
+            Identity from Clerk; role from the application database
+            (PostgreSQL), granted by the project owner.
+          </p>
+          <UserButton />
+        </div>
 
-      {user ? (
-        <dl>
-          <dt>Name</dt>
-          <dd>{user.name}</dd>
-          <dt>Email</dt>
-          <dd>{user.email}</dd>
-          <dt>Role</dt>
-          <dd>{user.role}</dd>
-          <dt>Active</dt>
-          <dd>{user.active ? "yes" : "no"}</dd>
-        </dl>
-      ) : (
-        !error && <p>Loading…</p>
-      )}
+        {me.isLoading && <LoadingState label="Loading your profile…" />}
+        {me.isError && <ErrorCard error={me.error} />}
 
-      <p>
-        <Link href="/rides">Book a ride</Link>
-      </p>
+        {me.data && (
+          <dl className="dl">
+            <div>
+              <dt>Name</dt>
+              <dd>{me.data.name}</dd>
+            </div>
+            <div>
+              <dt>Email</dt>
+              <dd>{me.data.email}</dd>
+            </div>
+            <div>
+              <dt>Role</dt>
+              <dd>{me.data.role}</dd>
+            </div>
+            <div>
+              <dt>Active</dt>
+              <dd>{me.data.active ? "Yes" : "No"}</dd>
+            </div>
+          </dl>
+        )}
+      </div>
 
-      <p>
-        <Link href="/">Back to home</Link>
-      </p>
+      <nav aria-label="Quick links" className="row">
+        {me.data?.role === "DRIVER" && (
+          <Link className="btn btn-secondary" href="/driver">
+            Driver hub
+          </Link>
+        )}
+        {(me.data?.role === "PASSENGER" || me.data?.role === "ADMIN") && (
+          <Link className="btn btn-secondary" href="/rides">
+            Book a ride
+          </Link>
+        )}
+      </nav>
     </main>
   );
 }

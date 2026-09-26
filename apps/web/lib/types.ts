@@ -1,6 +1,8 @@
 // TypeScript mirror of the backend API contract (source of truth:
-// apps/api/src/rides/service.ts RideView / ZoneView / FareView / RidePoolView,
-// and from the API error envelope in apps/api/src/app.ts).
+// apps/api/src/rides/service.ts RideView / ZoneView / FareView /
+// RidePoolView, apps/api/src/rides/pooling/service.ts DriverPoolView /
+// DriverPoolMemberView, apps/api/src/auth/routes.ts /me, and the API error
+// envelope in apps/api/src/app.ts).
 //
 // These shapes match what the JSON API returns. Backend Date fields serialize
 // to ISO-8601 strings on the wire, so they are typed as `string` here.
@@ -14,6 +16,17 @@ export type RideStatus =
   | "CANCELLED";
 
 export type UserRole = "PASSENGER" | "DRIVER" | "ADMIN";
+
+// Statuses that can no longer change. Polling stops once a ride/pool lands
+// here (no pointless long-poll — the trip is over).
+export const TERMINAL_STATUSES: ReadonlySet<RideStatus> = new Set([
+  "COMPLETED",
+  "CANCELLED",
+]);
+
+export function isTerminal(status: RideStatus): boolean {
+  return TERMINAL_STATUSES.has(status);
+}
 
 export interface ZoneView {
   id: string;
@@ -32,6 +45,7 @@ export interface FareView {
   estimatedTotalPaisa: number;
 }
 
+// The pool a PASSENGER rides in (rides/service.ts): driver + Tesla + fill.
 export interface RidePoolView {
   id: string;
   status: RideStatus;
@@ -57,6 +71,34 @@ export interface RideView {
   updatedAt: string;
 }
 
+// The pool view the DRIVER sees (pooling/service.ts): the passenger members,
+// NO per-passenger fares (P9). Deliberately a different surface from
+// RidePoolView.
+export interface DriverPoolMemberView {
+  rideRequestId: string;
+  passengerId: string;
+  passengerName: string;
+  pickupZoneId: string;
+  pickupZoneName: string;
+  destinationZoneId: string;
+  destinationZoneName: string;
+  seats: number;
+}
+
+export interface DriverPoolView {
+  id: string;
+  status: RideStatus;
+  capacitySnapshot: number;
+  occupiedSeats: number;
+  vehicle: { id: string; name: string; capacity: number; isOnline: boolean };
+  acceptedAt: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  members: DriverPoolMemberView[];
+}
+
 export interface MeResponse {
   user: {
     id: string;
@@ -77,6 +119,22 @@ export interface RidesResponse {
 
 export interface RideResponse {
   ride: RideView;
+}
+
+export interface EstimateResponse {
+  fare: FareView;
+}
+
+export interface DriverPoolsResponse {
+  pools: DriverPoolView[];
+}
+
+export interface DriverPoolResponse {
+  pool: DriverPoolView;
+}
+
+export interface DriverAvailabilityResponse {
+  availability: { isOnline: boolean };
 }
 
 // Cancellation is only legal while the ride is still cancellable

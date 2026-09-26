@@ -72,13 +72,26 @@ export async function apiPost<T>(
 }
 
 // Maps an ApiError to a user-facing message. Non-ApiError failures get a
-// generic fallback. INVALID_STATE_TRANSITION is a normal race condition in
-// the pooled ride domain (e.g. the driver started the ride between render
-// and submit), so it gets a calm, actionable message instead of the raw code.
+// generic fallback. The "normal race" codes (INVALID_STATE_TRANSITION,
+// ACTIVE_RIDE_EXISTS, DRIVER_HAS_ACTIVE_POOL) are expected in this domain and
+// get calm, actionable messages instead of raw server text:
+//   - INVALID_STATE_TRANSITION: the pool moved on between render and submit.
+//   - ACTIVE_RIDE_EXISTS: passenger already owns a non-terminal ride; the UI
+//     usually hides the booking form first (defense-in-depth for the race).
+//   - DRIVER_HAS_ACTIVE_POOL: going offline while a trip is open is refused.
 export function describeApiError(error: unknown): string {
   if (error instanceof ApiError) {
     if (error.code === "INVALID_STATE_TRANSITION") {
       return "This ride changed before the action finished. Refresh to see the current status, then try again.";
+    }
+    if (error.code === "ACTIVE_RIDE_EXISTS") {
+      return "You already have an active ride. Complete or cancel it before booking another.";
+    }
+    if (error.code === "DRIVER_HAS_ACTIVE_POOL") {
+      return "You have an active trip. Finish or cancel it before going offline.";
+    }
+    if (error.code === "VEHICLE_OFFLINE") {
+      return "This Tesla is offline. Go online in your dashboard before accepting the ride.";
     }
     if (error.code === "FORBIDDEN") {
       return "You do not have permission to do that.";
