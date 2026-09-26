@@ -32,7 +32,7 @@
 //     spread <= POOL_DEST_SPREAD_KM, then fullest pool first
 //     (occupiedSeats DESC, createdAt ASC, id ASC). See src/matching/rules.ts.
 
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { AppDatabase } from "../../db/index.js";
 import {
@@ -161,6 +161,13 @@ export interface PoolingService {
   // member ride to COMPLETED together; frees the Tesla for new matching via
   // the partial unique index. Fares/occupancy are left untouched.
   completePool(driverId: string, poolId: string): Promise<DriverPoolView>;
+  // Read surface for the driver hub.
+  // Every non-terminal pool the driver owns, newest first (deterministic
+  // created_at desc, id desc tiebreak). No fares, ACTIVE members only.
+  listDriverPools(driverId: string): Promise<DriverPoolView[]>;
+  // A single pool by id; anything that isn't the caller's pool is a plain 404
+  // (existence hidden 1:1).
+  getDriverPool(driverId: string, poolId: string): Promise<DriverPoolView>;
 }
 
 export function createPoolingService(
@@ -795,6 +802,101 @@ export function createPoolingService(
     });
   }
 
+  // The driver hub's open pools: every non-terminal pool this driver owns,
+  // newest first (created_at then id desc, so ordering is deterministic even
+  // without second-precision timestamps). Lock-free read.
+  async function listDriverPools(driverId: string): Promise<DriverPoolView[]> {
+    const poolRows = await database
+      .select({ pool: pools, vehicle: vehicles })
+      .from(pools)
+      .innerJoin(vehicles, eq(vehicles.id, pools.vehicleId))
+      .where(
+        and(
+          eq(pools.driverId, driverId),
+          sql`${pools.status} not in ('COMPLETED', 'CANCELLED')`,
+        ),
+      )
+      .orderBy(desc(pools.createdAt), desc(pools.id));
+    if (poolRows.length === 0) return [];
+
+    const memberRows = await database
+      .select({
+        poolId: poolMembers.poolId,
+        rideRequestId: rideRequests.id,
+        passengerId: users.id,
+        passengerName: users.name,
+        pickupZoneId: pickupZone.id,
+        pickupZoneName: pickupZone.name,
+        destinationZoneId: destinationZone.id,
+        destinationZoneName: destinationZone.name,
+        seats: poolMembers.seats,
+      })
+      .from(poolMembers)
+      .innerJoin(rideRequests, eq(rideRequests.id, poolMembers.rideRequestId))
+      .innerJoin(users, eq(users.id, poolMembers.passengerId))
+      .innerJoin(pickupZone, eq(pickupZone.id, rideRequests.pickupZoneId))
+      .innerJoin(
+        destinationZone,
+        eq(destinationZone.id, rideRequests.destinationZoneId),
+      )
+      .where(
+        and(
+          inArray(
+            poolMembers.poolId,
+            poolRows.map((row) => row.pool.id),
+          ),
+          eq(poolMembers.status, "ACTIVE"),
+        ),
+      )
+      .orderBy(asc(poolMembers.joinedAt), asc(poolMembers.id));
+
+    const membersByPool = new Map<string, (typeof memberRows)[number][]>();
+    for (const member of memberRows) {
+      const list = membersByPool.get(member.poolId) ?? [];
+      list.push(member);
+      membersByPool.set(member.poolId, list);
+    }
+
+    return poolRows.map((row) => {
+      const members = membersByPool.get(row.pool.id) ?? [];
+      return {
+        id: row.pool.id,
+        status: row.pool.status,
+        capacitySnapshot: row.pool.capacitySnapshot,
+        occupiedSeats: members.reduce((sum, member) => sum + member.seats, 0),
+        vehicle: {
+          id: row.vehicle.id,
+          name: row.vehicle.name,
+          capacity: row.vehicle.capacity,
+          isOnline: row.vehicle.isOnline,
+        },
+        acceptedAt: row.pool.acceptedAt,
+        startedAt: row.pool.startedAt,
+        completedAt: row.pool.completedAt,
+        createdAt: row.pool.createdAt,
+        updatedAt: row.pool.updatedAt,
+        members,
+      };
+    });
+  }
+
+  // A single pool for the driver hub by id. Ownership hides existence 1:1: a
+  // pool that isn't the caller's responds exactly like one that doesn't exist
+  // (404 NOT_FOUND, same envelope, no details leaked).
+  async function getDriverPool(
+    driverId: string,
+    poolId: string,
+  ): Promise<DriverPoolView> {
+    const [owned] = await database
+      .select({ id: pools.id })
+      .from(pools)
+      .where(and(eq(pools.id, poolId), eq(pools.driverId, driverId)))
+      .limit(1);
+    if (!owned) throw new PoolNotFoundError();
+    const view = await loadDriverPoolView(database, poolId);
+    if (!view) throw new PoolNotFoundError();
+    return view;
+  }
   // Shared cancellation core. The ride row is already locked (ride-before-pool
   // lock order); cancelledAt/status/cancelled history are written here, and a
   // MATCHED ride's seat is freed with in-place fare recompute for the members
@@ -817,7 +919,10 @@ export function createPoolingService(
       status: "CANCELLED",
     });
 
-    if (ride.status === "MATCHED" && ride.poolId) {
+    if (
+      (ride.status === "MATCHED" || ride.status === "DRIVER_ARRIVED") &&
+      ride.poolId
+    ) {
       await freeSeatInPool(tx, ride.id, ride.poolId, now);
     }
   }
@@ -881,5 +986,7 @@ export function createPoolingService(
     arrivePool,
     startPool,
     completePool,
+    listDriverPools,
+    getDriverPool,
   };
 }

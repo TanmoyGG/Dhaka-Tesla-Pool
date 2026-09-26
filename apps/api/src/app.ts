@@ -10,6 +10,8 @@ import type { AuthDependencies } from "./auth/identity.js";
 import { db } from "./db/index.js";
 import { ridesRoutes } from "./rides/routes.js";
 import { createRideService, type RideService } from "./rides/service.js";
+import { driverRoutes } from "./driver/routes.js";
+import { createDriverService, type DriverService } from "./driver/service.js";
 import { healthRoutes } from "./routes/health.js";
 
 export interface BuildAppOptions {
@@ -21,6 +23,9 @@ export interface BuildAppOptions {
   // Injectable ride service (tests bind it to the disposable test database).
   // Defaults to the real PostgreSQL-backed service.
   rides?: RideService;
+  // Injectable driver service (Phase 6, tests bind it to the disposable test
+  // database). Defaults to the real PostgreSQL-backed service.
+  driver?: DriverService;
 }
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
@@ -86,6 +91,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   app.register(ridesRoutes, {
     deps: authDeps,
     rides: options.rides ?? createRideService(db),
+  });
+  app.register(driverRoutes, {
+    deps: authDeps,
+    driver: options.driver ?? createDriverService(db),
   });
 
   return app;
