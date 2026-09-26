@@ -153,6 +153,14 @@ export interface PoolingService {
   // 409 INVALID_STATE_TRANSITION. Transitions the pool and every MATCHED
   // member ride together, per-ride journaled.
   arrivePool(driverId: string, poolId: string): Promise<DriverPoolView>;
+  // Trip on. Transitions the pool (started_at set) and every DRIVER_ARRIVED
+  // member ride to STARTED together; invalid moves are 409
+  // INVALID_STATE_TRANSITION.
+  startPool(driverId: string, poolId: string): Promise<DriverPoolView>;
+  // Trip finished. Transitions the pool (completed_at set) and every STARTED
+  // member ride to COMPLETED together; frees the Tesla for new matching via
+  // the partial unique index. Fares/occupancy are left untouched.
+  completePool(driverId: string, poolId: string): Promise<DriverPoolView>;
 }
 
 export function createPoolingService(
@@ -689,6 +697,104 @@ export function createPoolingService(
     });
   }
 
+  // The trip is on. Aggregate transition: pool + every DRIVER_ARRIVED member
+  // ride move to STARTED together (pool gets started_at), each ride journaled.
+  async function startPool(
+    driverId: string,
+    poolId: string,
+  ): Promise<DriverPoolView> {
+    return await database.transaction(async (tx) => {
+      await lockDriverVehicles(tx, driverId);
+      const memberRides = await tx
+        .select()
+        .from(rideRequests)
+        .where(
+          and(
+            eq(rideRequests.poolId, poolId),
+            eq(rideRequests.status, "DRIVER_ARRIVED"),
+          ),
+        )
+        .orderBy(asc(rideRequests.id))
+        .for("update");
+
+      const pool = await lockOwnedPool(tx, poolId, driverId);
+      const reason = invalidTransitionReason(pool.status, "STARTED");
+      if (reason) throw new InvalidStateTransitionError(reason);
+
+      const now = new Date();
+      await tx
+        .update(pools)
+        .set({ status: "STARTED", startedAt: now, updatedAt: now })
+        .where(eq(pools.id, pool.id));
+      for (const ride of memberRides) {
+        await tx
+          .update(rideRequests)
+          .set({ status: "STARTED", updatedAt: now })
+          .where(eq(rideRequests.id, ride.id));
+        await tx.insert(rideStatusHistory).values({
+          rideRequestId: ride.id,
+          fromStatus: "DRIVER_ARRIVED",
+          status: "STARTED",
+        });
+      }
+
+      const view = await loadDriverPoolView(tx, poolId);
+      if (!view) throw new PoolNotFoundError();
+      return view;
+    });
+  }
+
+  // Trip finished. Aggregate transition: pool + every STARTED member ride move
+  // to COMPLETED together (pool gets completed_at, each ride gets its own
+  // completed_at), ride histories journaled. Seats/membership and fares are
+  // left untouched — the record must stay explainable (requirements §21.I).
+  // status=COMPLETED drops the pool out of pools_single_active_per_vehicle,
+  // freeing the Tesla for new matching.
+  async function completePool(
+    driverId: string,
+    poolId: string,
+  ): Promise<DriverPoolView> {
+    return await database.transaction(async (tx) => {
+      await lockDriverVehicles(tx, driverId);
+      const memberRides = await tx
+        .select()
+        .from(rideRequests)
+        .where(
+          and(
+            eq(rideRequests.poolId, poolId),
+            eq(rideRequests.status, "STARTED"),
+          ),
+        )
+        .orderBy(asc(rideRequests.id))
+        .for("update");
+
+      const pool = await lockOwnedPool(tx, poolId, driverId);
+      const reason = invalidTransitionReason(pool.status, "COMPLETED");
+      if (reason) throw new InvalidStateTransitionError(reason);
+
+      const now = new Date();
+      await tx
+        .update(pools)
+        .set({ status: "COMPLETED", completedAt: now, updatedAt: now })
+        .where(eq(pools.id, pool.id));
+      for (const ride of memberRides) {
+        await tx
+          .update(rideRequests)
+          .set({ status: "COMPLETED", completedAt: now, updatedAt: now })
+          .where(eq(rideRequests.id, ride.id));
+        await tx.insert(rideStatusHistory).values({
+          rideRequestId: ride.id,
+          fromStatus: "STARTED",
+          status: "COMPLETED",
+        });
+      }
+
+      const view = await loadDriverPoolView(tx, poolId);
+      if (!view) throw new PoolNotFoundError();
+      return view;
+    });
+  }
+
   // Shared cancellation core. The ride row is already locked (ride-before-pool
   // lock order); cancelledAt/status/cancelled history are written here, and a
   // MATCHED ride's seat is freed with in-place fare recompute for the members
@@ -773,5 +879,7 @@ export function createPoolingService(
     setAvailability,
     acceptPool,
     arrivePool,
+    startPool,
+    completePool,
   };
 }
