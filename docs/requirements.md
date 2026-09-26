@@ -309,20 +309,21 @@ the ambiguity is explained, and one reasonable MVP assumption is proposed.
 ### B. Cancellation rules ("cancel while valid")
 - PRD: "cancel while valid" (passenger).
 - Ambiguity: What cancellations are valid, by whom, and under what state conditions?
-- MVP assumption (finalized in Phase 5, ADR-016/017): A passenger may cancel
-  their own ride while it is `REQUESTED` or `MATCHED`; cancellation is rejected
-  for every other state (`409 INVALID_STATE_TRANSITION`) and for any ride the
+- MVP assumption (finalized in Phase 5, ADR-016/017; **extended in Phase 6,
+  ADR-019/P8**): A passenger may cancel **their own** ride while it is
+  `REQUESTED`, `MATCHED`, or `DRIVER_ARRIVED`; cancellation is rejected for
+  every other state (`409 INVALID_STATE_TRANSITION`) and for any ride the
   caller does not own (`404 NOT_FOUND`, never a leak). A `REQUESTED` cancel
-  just terminates the request. A `MATCHED` cancel frees the seats by flipping
-  the membership to `LEFT` (recorded with `left_at`), recomputes the remaining
-  members' fares in place, and terminates the pool when it becomes empty. No
-  `cancel_reason` column (the PRD only requires "cancel while valid" — a reason
-  would be speculative UI). **Forced cancellation** (driver/admin action,
-  `forceCancelRide`, no route yet) applies the same pool semantics plus a
-  **full refund**: the cancelled ride's fare is written back to zero via its
-  discount term (`final = base + distance − discount`, all CHECKs satisfied).
-  This assumption supersedes the earlier draft that always required a recorded
-  reason.
+  just terminates the request. A `MATCHED`/`DRIVER_ARRIVED` cancel frees the
+  seats by flipping the membership to `LEFT` (recorded with `left_at`),
+  recomputes the remaining members' fares in place, and terminates the pool
+  when it becomes empty. Once the trip has STARTED the seat is committed and
+  cancellation is refused. No `cancel_reason` column (the PRD only requires
+  "cancel while valid" — a reason would be speculative UI). **Forced
+  cancellation** (driver/admin action, `pooling.forceCancelRide`, no HTTP
+  route in Phase 6) applies the same pool semantics plus a **full refund**: the
+  cancelled ride's fare is written back to zero via its discount term
+  (`final = base + distance − discount`, all CHECKs satisfied).
 
 ### C. Pool creation timing ("Multiple requests may share one Tesla")
 - PRD: Pool is a first-class actor; a ride may contain multiple passengers.
@@ -349,7 +350,12 @@ the ambiguity is explained, and one reasonable MVP assumption is proposed.
 ### E. Driver ownership of vehicles ("Own a Tesla with fixed capacity")
 - PRD: Driver owns a Tesla with fixed capacity.
 - Ambiguity: One or many vehicles per driver?
-- MVP assumption: A driver can own **one or more** Teslas (users ↔ vehicles 1:N), but for the MVP a driver operates one Tesla at a time (an active/selected vehicle). This keeps the schema honest without over-building.
+- MVP assumption (**realized in Phase 6, ADR-019**): A driver can own **one or
+  more** Teslas (users ↔ vehicles 1:N). The availability switch is per-driver
+  and flips **all** of the driver's Teslas (online/offline), which is the
+  minimal honest MVP; a per-vehicle selector is future work. The matching phase
+  picks a single online Tesla deterministically (ADR-016), so a driver with
+  several Teslas never needs a manual "which vehicle" step in the MVP.
 
 ### F. Session expiration policy
 - PRD: Auth required; no policy specified.
@@ -386,7 +392,16 @@ the ambiguity is explained, and one reasonable MVP assumption is proposed.
 ### J. Driver going offline with active rides
 - PRD: driver can go online/offline.
 - Ambiguity: Behavior when a driver with an accepted/active ride goes offline.
-- MVP assumption: A driver cannot go offline with an active (ACCEPTED → STARTED) ride; the API rejects the transition. Eventual behavior (auto-cancel vs. keep active) is documented and flagged for confirmation.
+- MVP assumption (**realized in Phase 6, ADR-019/020, strict**): A driver
+  **cannot** go offline while **any** of their pools is non-terminal — the
+  toggle is refused (`409 DRIVER_HAS_ACTIVE_POOL`) for a pool in
+  MATCHED → STARTED. This is deliberately strict: a pool the *system* matched
+  to the driver (ADR-016) is assigned work, and flipping the switch must not
+  be a way to duck it. The transition locks the driver's vehicle rows first
+  (ADR-020) so a racing booking can never strand a pool on an offline Tesla.
+  Going offline is allowed only when every pool is terminal (COMPLETED /
+  CANCELLED). No auto-cancel semantics exist (a non-terminal pool blocks the
+  toggle, so nothing is silently cancelled).
 
 ### K. Seats requested per passenger ("…seats" in request)
 - PRD: "Request ride: pickup, destination, seats."

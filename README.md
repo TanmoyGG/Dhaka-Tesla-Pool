@@ -54,6 +54,23 @@ including two real concurrent-claim races. See
 Drivers and the driver-flow transitions are the next phase per
 [docs/development-plan.md](docs/development-plan.md).
 
+**Phase 6 — Driver workflow: complete.** Implemented on
+`feature/driver-workflow` and merged to `master` (ADR-019/020). Drivers get an online/offline switch (`POST
+/api/driver/availability`, refused while any pool is non-terminal — strict
+requirements §21.J) and hands-on control of the pool the automatch assigned:
+`accept` records `pools.accepted_at` (idempotent, pool stays MATCHED),
+then `arrive` → `start` → `complete`, each moving the pool **and** every member
+ride together with per-ride journaling and timestamps. The driver hub lists
+their open pools with passengers, seats, and zones — deliberately **no fares**.
+Completion frees Bullet for a new pool. Passenger cancellation stays legal
+through DRIVER_ARRIVED (P8) and is refused once the trip has STARTED. Driver
+identity always comes from the session (never the body); interloper/unknown
+pools are a plain 404. Concurrency is database-transactional on a canonical
+lock order **vehicle → rides → pool** (ADR-020) — real races proven for double
+accept/arrive/complete and offline-vs-booking. Migration 0005 adds
+`pools.accepted_at` + a progression CHECK (additive). Full suite **152/152**
+across 9 test files. See [Driver workflow](#driver-workflow-phase-6) below.
+
 ## Project Description
 
 A ride-pooling MVP for Dhaka. Battery-powered, three-seat "Teslas" (easy-bike
@@ -334,8 +351,15 @@ All `/api` routes require a Clerk session **bearer token**
 | `POST /api/rides` | `PASSENGER` | create a ride request; automatically matched & pooled (Phase 5) |
 | `GET /api/rides` | `PASSENGER` | the caller's own requests, newest first |
 | `GET /api/rides/:rideId` | `PASSENGER` (owner) | 404 for unknown/another user's ride |
-| `POST /api/rides/:rideId/cancel` | `PASSENGER` (owner) | cancel own ride while REQUESTED/MATCHED (409 otherwise) |
+| `POST /api/rides/:rideId/cancel` | `PASSENGER` (owner) | cancel own ride while REQUESTED/MATCHED/DRIVER_ARRIVED (409 otherwise) |
 | `GET /api/zones` | any signed-in user | pickup/destination pick-list (8 zones) |
+| `POST /api/driver/availability` | `DRIVER` | switch the driver's Teslas online/offline (`{ "isOnline": boolean }` → 204; refused while any pool is non-terminal) |
+| `GET /api/driver/pools` | `DRIVER` | the caller's non-terminal pools (newest first) |
+| `GET /api/driver/pools/:poolId` | `DRIVER` (owner) | one pool with passengers/seats/zones — no fares; 404 if not theirs or unknown |
+| `POST /api/driver/pools/:poolId/accept` | `DRIVER` (owner) | confirm the assigned pool (idempotent; requires Tesla online) |
+| `POST /api/driver/pools/:poolId/arrive` | `DRIVER` (owner) | requires accept first (else 409) |
+| `POST /api/driver/pools/:poolId/start` | `DRIVER` (owner) | requires arrival first |
+| `POST /api/driver/pools/:poolId/complete` | `DRIVER` (owner) | requires start first; frees the Tesla for a new pool |
 
 `POST /api/rides` body (Zod, strict — unknown keys rejected, identity/role is
 taken from the session, never from the body):
@@ -402,10 +426,49 @@ finalFarePaisa    = baseFare + distanceCharge − poolDiscount         // same r
 
 Pooled values are pinned in `test/pooling.test.ts`, `test/rides.test.ts`, and
 `test/fare.test.ts`. `POST /api/rides/:rideId/cancel` (owner-only) cancels
-`REQUESTED`/`MATCHED` rides, frees the seats, recomputes remaining members'
-fares in place, and cancels a pool that empties (403/409/404 semantics in
-`test/pooling.test.ts`). The last-seat and first-pool races are covered by real
-concurrent tests against two database connections.
+`REQUESTED`/`MATCHED`/`DRIVER_ARRIVED` rides (P8, Phase 6), frees the seats,
+recomputes remaining members' fares in place, and cancels a pool that empties
+(403/409/404 semantics in `test/pooling.test.ts`). The last-seat and first-pool
+races are covered by real concurrent tests against two database connections.
+
+### Driver workflow (Phase 6)
+
+Drivers hold no session-visible data themselves — every route is
+`requireRole(["DRIVER"])` and derives identity purely from the bearer session
+(`request.auth`), never from the body. Endpoints:
+
+- `POST /api/driver/availability` body `{ "isOnline": true|false }` → **204**.
+  Flips all of the driver's Teslas. Refused while** any** non-terminal pool
+  exists (`409 DRIVER_HAS_ACTIVE_POOL`, strict §21.J); a driver may not go
+  offline mid-pool, and a pool on an offline Tesla can never be created.
+  Idempotent — setting the already-current state succeeds.
+- `GET /api/driver/pools` → `{ "pools": [...] }`: the driver's own non-terminal
+  pools, `created_at DESC, id DESC`. Each view is fare-free: `pool` fields plus
+  ACTIVE `members[]` (`passengerName`, `seats`, `pickupZone`/`destinationZone`
+  names).
+- `GET /api/driver/pools/:poolId` → `{ "pool": {...} }`, same shape as a list
+  item; **404** for an unknown or another driver's pool (existence hidden 1:1).
+- `POST /api/driver/pools/:poolId/accept|arrive|start|complete` → `{ "pool": ... }`.
+  - `accept` records `pools.accepted_at` and is **idempotent** — the pool stays
+    `MATCHED`; `409 VEHICLE_OFFLINE` if the Tesla was switched offline, `409
+    POOL_NOT_ACCEPTABLE` if the pool already moved past MATCHED.
+  - `arrive` requires an accepted MATCHED pool; the pool and every member ride
+    move together (per-ride `ride_status_history` rows).
+  - `start` → `STARTED`; `complete` → `COMPLETED` and the Tesla is free for a
+    new pool (terminal status drops it out of the per-vehicle unique index —
+    no separate "release" action).
+  - Every driver action locks **vehicle rows → member rides → pool** (ADR-020)
+    so concurrent actions serialize: two `accept`s both succeed (one
+    `accepted_at`), two `arrive`s/`complete`s have exactly one winner.
+- Passenger-facing consequence (P8): `POST /api/rides/:rideId/cancel` is legal
+  while the pool is `MATCHED` **or `DRIVER_ARRIVED`** (seat freed, remaining
+  fares recomputed); refused once the trip is `STARTED` or `COMPLETED`.
+
+No fares appear on any driver endpoint by design (P9): fare breakdown is a
+passenger concern. Migration `0005` (`pools.accepted_at` + progression CHECK +
+accept partial index) is additive; `test/driver.test.ts` (30 tests) is pinned
+against the seed cast — Jashim drives Bullet, Nusrat/Rafiq book the pool, and
+Shirin's concurrent grab is the canonical capacity race.
 
 ## Docker (full stack, reproducible)
 

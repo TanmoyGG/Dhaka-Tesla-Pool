@@ -561,3 +561,108 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   the PRD requires only "cancel while valid"; adding speculative reason UX is
   decoration. If a driver/admin force-cancel UI appears, the refund + reason
   semantics extend this service without a schema change.
+
+## ADR-019: Driver workflow — availability switch + lifecycle (Phase 6)
+
+- **Status:** Implemented in `apps/api/src/driver/` (routes + facade),
+  `apps/api/src/rides/pooling/service.ts`, migration 0005, `POST
+  /api/driver/*`; covered in `test/driver.test.ts`.
+- **Decision:** give the driver an explicit **online/offline switch** and
+  hands-on control of the assigned pool's lifecycle: accept → arrive → start →
+  complete. The pool is still created by the deterministic automatch
+  (ADR-016) — the driver confirms/operates it, never hunts for it. Identity
+  comes **only** from the authenticated request (`request.auth`), and every
+  driver route is `requireRole(["DRIVER"])` (401 unauthenticated, 403 for
+  passengers).
+- **Accept = confirmation (not reservation):** automatch already committed the
+  pool (MATCHED, seats held under ADR-017's pool-row lock). `accept` records
+  `pools.accepted_at` while the pool **stays MATCHED** — the acceptance is
+  idempotent (repeat accept → no-op 200) and never creates a pending-hold
+  state. A pool whose Tesla is offline is rejected (`409 VEHICLE_OFFLINE`,
+  guard reads the pool's **own** vehicle row); a pool that already left
+  MATCHED is `409 POOL_NOT_ACCEPTABLE`. Not-owned-or-unknown is a plain 404
+  (existence hidden 1:1, same envelope as rides).
+- **Lifecycle semantics (PRD §4):** `arrive` requires a prior accept
+  (`409 POOL_NOT_ACCEPTABLE` otherwise, ADR-017's documented improvement);
+  the *aggregate* (pool **and** every member ride together) moves
+  MATCHED→DRIVER_ARRIVED→STARTED→COMPLETED, each ride journaled in
+  `ride_status_history`, with pool `started_at`/`completed_at` and per-ride
+  `completed_at` timestamps. Every step validates the state machine first —
+  an illegal move (arrive twice, start before arrive, complete before start)
+  is a `409 INVALID_STATE_TRANSITION`, never a silent write. Completing a pool
+  drops it out of `pools_single_active_per_vehicle` (status terminal) and
+  thereby **frees the Tesla** for new matching — no separate "release" action.
+- **Offline switch (strict §21.J):** going offline while **any** of the
+  driver's pools is non-terminal is refused (`409 DRIVER_HAS_ACTIVE_POOL`).
+  This is strict: a driver whose pool the *system* matched cannot duck the
+  trip by flipping the switch. Going online merely flips the vehicle(s).
+- **Driver surface excludes fares (P9):** the driver hub lists member names,
+  seats, and zone names — never per-passenger fare amounts. Individual fares
+  are the passenger's view (ADR-015); the driver learns only who is aboard and
+  where they go.
+- **Passenger cancellation stays legal through DRIVER_ARRIVED (P8):** after
+  the driver arrives but *before* the trip starts a passenger may still cancel
+  (free up the seat, recompute remaining fares, or terminate a now-empty pool),
+  honoring the PRD's cancellation-validity view; from STARTED onward
+  cancellation is rejected (the trip is committed).
+- **Migration 0005:** `pools.accepted_at TIMESTAMPTZ NULL` + CHECK
+  `pools_accepted_progression` (`accepted_at IS NOT NULL OR status NOT IN
+  ('DRIVER_ARRIVED','STARTED','COMPLETED')`) so a progressed pool can never
+  lack an acceptance — while `MATCHED → CANCELLED` (Phase 5 semantics) stays
+  fully legal. Partial index `driver_pools_accept_idx` covers the progression
+  audit read. No per-driver single-active-pool index (defensive decoration:
+  the vehicle-level invariant already bounds it, ADR-017's switch note).
+- **Why a thin `DriverService` facade:** driver routes get exactly the seven
+  driver operations and cannot (by typing) reach the passenger-facing
+  match/cancel/force-cancel surface. It is a narrowing, not an abstraction —
+  all rules, locks, and errors live in the pooling service.
+- **Alternatives rejected:** accept-as-reservation (MATCHED→"RESERVED" hold)
+  — reintroduces unhandled pending-state handling and a second wait; GPS/QR
+  "arrival proof" — out of MVP scope, adds hardware; a webhook push to the
+  driver — the driver hub polls, matching everything else in README/AGENTS
+  (no queues, no Redis).
+- **Switch later if:** real routing/geo turns ARRIVAL into a verifiable event,
+  or payment gates require the driver to confirm fares before starting.
+
+## ADR-020: Driver lifecycle lock order — vehicle → rides → pool (Phase 6)
+
+- **Status:** implemented across `apps/api/src/rides/pooling/service.ts`
+  (`lockDriverVehicles`, `lockOwnedPool`, `byId`-ordered ride locks);
+  exercised by `test/driver.test.ts` (concurrent accept/arrive/complete races,
+  offline-vs-booking race).
+- **Decision:** every driver lifecycle transition acquires locks in a fixed
+  order: **driver's VEHICLE rows `FOR UPDATE` (id-ascending) → the pool's
+  member RIDE rows `FOR UPDATE` (id-ascending) → the POOL row `FOR UPDATE`**.
+  The availability toggle locks only vehicle rows and then COUNTs pools
+  (never waits on a pool row). This keeps the whole system deadlock-free with
+  the Phase 5 order:
+  - Passengers (cancel/match) already take **ride → pool** (ADR-017), so the
+    driver's rides-before-pool tail cannot cycle with them.
+  - The **vehicle lock is the shared serialization point** for the driver: the
+    automatch's Tesla pick (commit 2 of Phase 6) locks the same vehicle rows,
+    so an offline toggle and a racing new-booking serialize on Bullet's row —
+    a pool can never be created on a Tesla that is (committed) offline, and an
+    offline toggle can never strand a pool on an offline Tesla
+    (requirements §15, tested).
+  - The availability toggle never locks pool rows, so it cannot deadlock with
+    a transition that holds a pool row.
+- **Why not a single pool-row lock only:** the driver's own offline/online
+  transition needs the vehicle serialization the pool row does not mediate
+  (a pool may not exist yet while a booking races it), and ownership checks on
+  the pool alone would leave a race where two drivers of the same vehicle
+  could act interleaved. Vehicle-then-pool is the one canonical order the
+  data model supports.
+- **READ COMMITTED is sufficient:** every transition acts on a pool that
+  already committed (automatch committed its whole create+match transaction),
+  so an action never needs to "see" an uncommitted pool. The recheck under the
+  pool lock (status still the actionable state) is what makes the loser of a
+  concurrent arrive/complete see a clean `409 INVALID_STATE_TRANSITION`
+  instead of writing on stale state.
+- **Tests:** two independent postgres connections race accept (both succeed
+  idempotently, one `accepted_at`), arrive (exactly one wins), complete (one
+  wins, Tesla freed), and offline-vs-booking (the invariant holds either way:
+  an offline Bullet holds no non-terminal pool).
+- **Switch later if:** the system grows to many API instances with one driver
+  contested from multiple hot paths — then per-vehicle advisory locks or a
+  reservation table (`FOR UPDATE SKIP LOCKED`) would spread the serialization
+  point; the order documented here stays the ordering rule either way.

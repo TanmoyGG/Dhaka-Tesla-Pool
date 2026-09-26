@@ -135,6 +135,7 @@ A set of matched ride requests being served by **one Tesla**.
 | `driver_id` | uuid → `users.id` | RESTRICT; must equal the vehicle's driver (app-enforced) |
 | `status` | `ride_status` NOT NULL DEFAULT `REQUESTED` | pool carries the same lifecycle |
 | `capacity_snapshot` | integer NOT NULL | CHECK `> 0`; vehicle capacity copied at pool creation |
+| `accepted_at` | timestamptz NULL | **added in migration 0005** (Phase 6); driver accept records the confirmation (ADR-019) |
 | `created_at` / `updated_at` | timestamptz | |
 | `started_at` | timestamptz NULL | CHECK: set only for `STARTED`/`COMPLETED` |
 | `completed_at` | timestamptz NULL | CHECK: set exactly when `COMPLETED`; requires `started_at` |
@@ -142,6 +143,17 @@ A set of matched ride requests being served by **one Tesla**.
 **Partial unique index:** `pools_single_active_per_vehicle` — a vehicle can
 have at most one pool in a non-terminal state (`NOT IN ('COMPLETED','CANCELLED')`).
 This is a first-class capacity/concurrency invariant at the DB layer.
+
+**Check `pools_accepted_progression`** (migration 0005, Phase 6): a pool that
+has progressed (DRIVER_ARRIVED/STARTED/COMPLETED) must carry an
+`accepted_at` (`accepted_at IS NOT NULL OR status NOT IN
+('DRIVER_ARRIVED','STARTED','COMPLETED')`). Deliberately NOT
+`accepted_at ⇒ status = MATCHED`: accept records the driver's confirmation
+while the pool stays MATCHED, so progression and a legal `MATCHED →
+CANCELLED` (Phase 5 semantics) both keep working.
+
+**Partial index `driver_pools_accept_idx`** (migration 0005): covers the
+progression/audit read (`WHERE accepted_at IS NOT NULL`).
 
 ### 3.7 `pool_members`
 
@@ -503,6 +515,20 @@ the ride lock from its own INSERT; cancel/force-cancel `FOR UPDATE` the ride
 first, then the pool). Consistent ordering ⇒ no deadlock cycle between match,
 cancel, and force-cancel.
 
+**Driver lifecycle ordering (Phase 6, ADR-020):** every driver transition
+accepts an additional order — **VEHICLE rows `FOR UPDATE` (id-ascending) →
+member RIDE rows `FOR UPDATE` (id-ascending) → POOL row `FOR UPDATE`**. The
+vehicle lock is the shared serialization point between the automatch's Tesla
+pick, the driver's offline toggle, and the lifecycle actions; rides-before-pool
+keeps the global ride → pool order, so no cycle is possible with a passenger's
+cancel/match. The availability toggle locks ONLY vehicle rows and COUNTs
+non-terminal pools under that lock — it never waits on a pool row. This is what
+makes "two concurrent arrivals → exactly one wins" and "offline toggle racing a
+new booking" deterministic (both proven in `test/driver.test.ts`).
+Completing a pool leaves the status terminal, which drops it out of
+`pools_single_active_per_vehicle` — **the Tesla is freed for a new pool by the
+same partial unique index** (no "release" action).
+
 Why this is safe here:
 - The **partial unique index** `pools_single_active_per_vehicle` already blocks a
   second active pool on the same Tesla, so all claims funnel through one pool row
@@ -533,7 +559,12 @@ notes in `docs/requirements.md` §15. No Redis/mutex/queue is used or planned
   unique index `ride_requests_client_request_id_key` — ADR-015 idempotency).
   Phase 5 added `0004_spotty_harrier.sql` (**additive only**:
   `ALTER TABLE fares ADD COLUMN updated_at timestamptz NOT NULL DEFAULT now()`
-  — ADR-017 auditability of the in-place pooling recompute). The pool/pool_members
+  — ADR-017 auditability of the in-place pooling recompute). Phase 6 added
+  `0005_powerful_johnny_storm.sql` (**additive only**, ADR-019):
+  `pools.accepted_at` (driver accept confirmation) + CHECK
+  `pools_accepted_progression` (a progressed pool must have been accepted)
+  + partial index `driver_pools_accept_idx` (`WHERE accepted_at IS NOT NULL`).
+  The pool/pool_members
   tables and their partial unique indexes already existed from 0000 (ADR-012), so
   no other schema change was needed for pooling.
   Generated SQL was reviewed and is committed **unmodified** — no manual edits
@@ -614,3 +645,11 @@ npm run db:seed   -w @dhaka-tesla-pool/api    # idempotent cast seed
     supplied — partial unique index `ride_requests_client_request_id_key`
     (migration 0003); a retry replays the existing ride, never creates a new
     one. ✔ DB + App
+17. A pool that has progressed (DRIVER_ARRIVED/STARTED/COMPLETED) must have
+    been accepted — CHECK `pools_accepted_progression` (migration 0005); accept
+    itself keeps the pool MATCHED and is idempotent (Phase 6, ADR-019). ✔ DB + App
+18. A non-terminal pool keeps its Tesla online — the driver offline toggle is
+    refused (`409 DRIVER_HAS_ACTIVE_POOL`) under the vehicle lock (Phase 6,
+    ADR-019/020, requirements §21.J strict). ✔ App
+19. A completed pool frees its Tesla for a new pool — terminal status drops the
+    pool out of `pools_single_active_per_vehicle` (Phase 6, ADR-019). ✔ DB
