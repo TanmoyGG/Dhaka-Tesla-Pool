@@ -32,7 +32,7 @@
 //     spread <= POOL_DEST_SPREAD_KM, then fullest pool first
 //     (occupiedSeats DESC, createdAt ASC, id ASC). See src/matching/rules.ts.
 
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { AppDatabase } from "../../db/index.js";
 import {
@@ -50,11 +50,14 @@ import {
   type CandidatePool,
   type DropOffCandidate,
 } from "../../matching/rules.js";
-import { invalidTransitionReason } from "../state.js";
+import { invalidTransitionReason, type RideStatus } from "../state.js";
 import {
   RideNotFoundError,
   InvalidStateTransitionError,
   DriverHasActivePoolError,
+  PoolNotFoundError,
+  PoolNotAcceptableError,
+  VehicleOfflineError,
 } from "../errors.js";
 import {
   recomputeActivePoolFares,
@@ -69,6 +72,44 @@ interface MatchCandidate {
   ride: typeof rideRequests.$inferSelect;
   destinationPoint: { latitude: number; longitude: number };
 }
+
+// ---------------------------------------------------------------------------
+// Driver hub views (Phase 6, ADR-019). Deliberately NO fares and NO other
+// drivers' data: the driver sees who is riding with them (name, seats, zones)
+// so they can run the trip — individual per-passenger fares stay off the
+// driver surface (P9).
+// ---------------------------------------------------------------------------
+
+export interface DriverPoolMemberView {
+  rideRequestId: string;
+  passengerId: string;
+  passengerName: string;
+  pickupZoneId: string;
+  pickupZoneName: string;
+  destinationZoneId: string;
+  destinationZoneName: string;
+  seats: number;
+}
+
+export interface DriverPoolView {
+  id: string;
+  status: RideStatus;
+  capacitySnapshot: number;
+  // Occupancy of ACTIVE members, derived per read — no cached counter.
+  occupiedSeats: number;
+  vehicle: { id: string; name: string; capacity: number; isOnline: boolean };
+  acceptedAt: Date | null;
+  startedAt: Date | null;
+  completedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+  // ACTIVE members only: a LEFT member is history, not a passenger on board.
+  members: DriverPoolMemberView[];
+}
+
+// A read that can run on either the application handle or a transaction handle
+// (both expose the same Drizzle select).
+type PoolReadSource = Pick<AppDatabase, "select">;
 
 function toDropOffCandidate(candidate: MatchCandidate): DropOffCandidate {
   return {
@@ -102,6 +143,16 @@ export interface PoolingService {
   // Going offline is refused while ANY of the driver's pools is non-terminal
   // (requirements.md §21.J, strict). Maps to 409 DRIVER_HAS_ACTIVE_POOL.
   setAvailability(driverId: string, isOnline: boolean): Promise<void>;
+  // Confirmation of the pool automatched to this driver: records accepted_at
+  // (MATCHED preserved, idempotent); requires the pool's Tesla online
+  // (409 VEHICLE_OFFLINE) and the pool still MATCHED (409 POOL_NOT_ACCEPTABLE);
+  // not-owned-or-unknown is a plain 404. Returns the driver hub view.
+  acceptPool(driverId: string, poolId: string): Promise<DriverPoolView>;
+  // Driver has arrived. Gated on acceptance (P2): arriving before accepting is
+  // 409 POOL_NOT_ACCEPTABLE; a pool/ride that cannot move to DRIVER_ARRIVED is
+  // 409 INVALID_STATE_TRANSITION. Transitions the pool and every MATCHED
+  // member ride together, per-ride journaled.
+  arrivePool(driverId: string, poolId: string): Promise<DriverPoolView>;
 }
 
 export function createPoolingService(
@@ -445,6 +496,199 @@ export function createPoolingService(
     });
   }
 
+  // -------------------------------------------------------------------------
+  // Driver lifecycle (Phase 6, ADR-019/020).
+  //
+  // Lock order for every transition: driver's VEHICLE rows FOR UPDATE →
+  // the pool's member RIDE rows FOR UPDATE → the POOL row FOR UPDATE. The
+  // vehicle lock is the shared serialization point with a concurrent match or
+  // offline toggle; rides-before-pool keeps the global ride → pool order so a
+  // driver transition can never deadlock against a passenger cancel
+  // (passenger cancels lock ride → pool). Every action runs on a COMMITTED
+  // pool (READ COMMITTED), so it can never collide with the reconstructing
+  // match that created it.
+  // -------------------------------------------------------------------------
+
+  // Lock the driver's Tesla rows in deterministic id order (and discard them —
+  // the point is the lock, not the rows).
+  async function lockDriverVehicles(
+    tx: DbTransaction,
+    driverId: string,
+  ): Promise<void> {
+    await tx
+      .select()
+      .from(vehicles)
+      .where(eq(vehicles.driverId, driverId))
+      .orderBy(asc(vehicles.id))
+      .for("update");
+  }
+
+  // Lock a pool row and verify the caller owns it. The interloper 404s with
+  // the exact same error as "does not exist" — an observer cannot tell the
+  // difference (ride-isolation convention, applied to pools).
+  async function lockOwnedPool(
+    tx: DbTransaction,
+    poolId: string,
+    driverId: string,
+  ): Promise<typeof pools.$inferSelect> {
+    const [pool] = await tx
+      .select()
+      .from(pools)
+      .where(eq(pools.id, poolId))
+      .for("update");
+    if (!pool || pool.driverId !== driverId) {
+      throw new PoolNotFoundError();
+    }
+    return pool;
+  }
+
+  // The driver hub's pool + ACTIVE members view, read from either the
+  // application handle or inside a transaction. Null when the pool is gone.
+  async function loadDriverPoolView(
+    source: PoolReadSource,
+    poolId: string,
+  ): Promise<DriverPoolView | null> {
+    const [row] = await source
+      .select({ pool: pools, vehicle: vehicles })
+      .from(pools)
+      .innerJoin(vehicles, eq(vehicles.id, pools.vehicleId))
+      .where(eq(pools.id, poolId))
+      .limit(1);
+    if (!row) return null;
+
+    const members = await source
+      .select({
+        rideRequestId: rideRequests.id,
+        passengerId: users.id,
+        passengerName: users.name,
+        pickupZoneId: pickupZone.id,
+        pickupZoneName: pickupZone.name,
+        destinationZoneId: destinationZone.id,
+        destinationZoneName: destinationZone.name,
+        seats: poolMembers.seats,
+      })
+      .from(poolMembers)
+      .innerJoin(rideRequests, eq(rideRequests.id, poolMembers.rideRequestId))
+      .innerJoin(users, eq(users.id, poolMembers.passengerId))
+      .innerJoin(pickupZone, eq(pickupZone.id, rideRequests.pickupZoneId))
+      .innerJoin(
+        destinationZone,
+        eq(destinationZone.id, rideRequests.destinationZoneId),
+      )
+      .where(and(eq(poolMembers.poolId, poolId), eq(poolMembers.status, "ACTIVE")))
+      .orderBy(asc(poolMembers.joinedAt), asc(poolMembers.id));
+
+    return {
+      id: row.pool.id,
+      status: row.pool.status,
+      capacitySnapshot: row.pool.capacitySnapshot,
+      occupiedSeats: members.reduce((sum, member) => sum + member.seats, 0),
+      vehicle: {
+        id: row.vehicle.id,
+        name: row.vehicle.name,
+        capacity: row.vehicle.capacity,
+        isOnline: row.vehicle.isOnline,
+      },
+      acceptedAt: row.pool.acceptedAt,
+      startedAt: row.pool.startedAt,
+      completedAt: row.pool.completedAt,
+      createdAt: row.pool.createdAt,
+      updatedAt: row.pool.updatedAt,
+      members,
+    };
+  }
+
+  // "Accept" is a CONFIRMATION of the pool the automatch already assigned to
+  // this driver (ADR-016): it records accepted_at while the pool stays MATCHED
+  // and is idempotent (a repeated accept is a harmless 200). The pool's OWN
+  // Tesla must be online; a pool that already left MATCHED is not acceptable.
+  async function acceptPool(
+    driverId: string,
+    poolId: string,
+  ): Promise<DriverPoolView> {
+    return await database.transaction(async (tx) => {
+      await lockDriverVehicles(tx, driverId);
+      const pool = await lockOwnedPool(tx, poolId, driverId);
+
+      const [vehicle] = await tx
+        .select()
+        .from(vehicles)
+        .where(eq(vehicles.id, pool.vehicleId))
+        .limit(1);
+      if (!vehicle?.isOnline) {
+        throw new VehicleOfflineError();
+      }
+      if (pool.status !== "MATCHED") {
+        throw new PoolNotAcceptableError(
+          `pool ${poolId} is ${pool.status}; only a MATCHED pool can be accepted`,
+        );
+      }
+
+      if (pool.acceptedAt === null) {
+        const now = new Date();
+        await tx
+          .update(pools)
+          .set({ acceptedAt: now, updatedAt: now })
+          .where(eq(pools.id, pool.id));
+      }
+
+      const view = await loadDriverPoolView(tx, poolId);
+      if (!view) throw new PoolNotFoundError();
+      return view;
+    });
+  }
+
+  // Driver has arrived. Gated on acceptance (P2): a pool the driver never
+  // accepted cannot be "arrived at". Aggregate transition: the pool AND every
+  // MATCHED member ride move to DRIVER_ARRIVED together, each ride journaled.
+  async function arrivePool(
+    driverId: string,
+    poolId: string,
+  ): Promise<DriverPoolView> {
+    return await database.transaction(async (tx) => {
+      await lockDriverVehicles(tx, driverId);
+      // Ride rows before the pool row (global ride → pool lock order).
+      const memberRides = await tx
+        .select()
+        .from(rideRequests)
+        .where(
+          and(eq(rideRequests.poolId, poolId), eq(rideRequests.status, "MATCHED")),
+        )
+        .orderBy(asc(rideRequests.id))
+        .for("update");
+
+      const pool = await lockOwnedPool(tx, poolId, driverId);
+      if (pool.acceptedAt === null) {
+        throw new PoolNotAcceptableError(
+          "the driver must accept the pool before arriving",
+        );
+      }
+      const reason = invalidTransitionReason(pool.status, "DRIVER_ARRIVED");
+      if (reason) throw new InvalidStateTransitionError(reason);
+
+      const now = new Date();
+      await tx
+        .update(pools)
+        .set({ status: "DRIVER_ARRIVED", updatedAt: now })
+        .where(eq(pools.id, pool.id));
+      for (const ride of memberRides) {
+        await tx
+          .update(rideRequests)
+          .set({ status: "DRIVER_ARRIVED", updatedAt: now })
+          .where(eq(rideRequests.id, ride.id));
+        await tx.insert(rideStatusHistory).values({
+          rideRequestId: ride.id,
+          fromStatus: "MATCHED",
+          status: "DRIVER_ARRIVED",
+        });
+      }
+
+      const view = await loadDriverPoolView(tx, poolId);
+      if (!view) throw new PoolNotFoundError();
+      return view;
+    });
+  }
+
   // Shared cancellation core. The ride row is already locked (ride-before-pool
   // lock order); cancelledAt/status/cancelled history are written here, and a
   // MATCHED ride's seat is freed with in-place fare recompute for the members
@@ -522,5 +766,12 @@ export function createPoolingService(
     }
   }
 
-  return { matchRide, cancelRide, forceCancelRide, setAvailability };
+  return {
+    matchRide,
+    cancelRide,
+    forceCancelRide,
+    setAvailability,
+    acceptPool,
+    arrivePool,
+  };
 }
