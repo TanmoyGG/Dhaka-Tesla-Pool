@@ -5,7 +5,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
-import DriverDashboardPage from "@/app/driver/page";
+import DriverDashboardPage from "@/app/(main)/driver/page";
 import { makeWaitPool } from "./fixtures";
 
 const queries = vi.hoisted(() => ({

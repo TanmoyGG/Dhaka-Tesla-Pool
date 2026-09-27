@@ -192,8 +192,24 @@ Purpose: pitch the product, get the user signed in, link the repo. Nothing else.
   colorInputForeground: <text>, colorPrimaryForeground: <accent-text>,
   colorDanger: <danger>, borderRadius: ... } }}` in `app/layout.tsx` — exactly
   the pattern of ADR-021 §4, with the accent swapped blue→lime.
-- `/sign-in` and `/sign-up` remain **Clerk-hosted components** on dark
-  pages; do not build custom auth forms.
+- **Auth pages own the whole flow (ADR-023).** `/sign-in` and `/sign-up`
+  live in an `(auth)` route group with a centered layout and NO app navbar or
+  duplicate auth controls. They render the **Clerk-hosted** `SignIn`/`SignUp`
+  components using Clerk's catch-all App Router structure
+  (`[[...sign-in]]`/`[[...sign-up]]`) with `routing="path"`, `path`,
+  `signUpUrl`/`signInUrl`, and `fallbackRedirectUrl="/"`, so every step of the
+  flow (including cross-links and sub-steps) stays on this origin — never the
+  accounts.dev instance URLs. `NEXT_PUBLIC_CLERK_SIGN_IN_URL` /
+  `NEXT_PUBLIC_CLERK_SIGN_UP_URL` and the fallback redirects are set in the
+  environment so header buttons, OAuth callbacks, and sign-out resolve to the
+  same local pages. Do not build custom auth forms.
+- **Per-user query isolation.** Every authenticated TanStack key is scoped by
+  the Clerk `userId`, and `SessionCacheSync` clears the query client whenever
+  `userId` changes (logout included). A logout → login as another role can
+  never flash the previous user's data or role-specific UI: the new user's
+  queries start empty (loading frame) and are `enabled` only once an identity
+  exists. The role is resolved from `/api/me` for the CURRENT session and the
+  workspace redirect follows it.
 - The header `UserButton` remains the account affordance once signed in.
 
 ---

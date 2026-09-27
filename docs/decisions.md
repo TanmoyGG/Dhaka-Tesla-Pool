@@ -873,5 +873,36 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   violates "no unnecessary queues/Redis" for a single-node MVP; the pool
   row lock is simpler and correct.
 - **Application-level "first-wins" via a `claimed_by` read-then-write:**
-  racy — two accepts could both pass the check before writing; the DB
+  racy - two accepts could both pass the check before writing; the DB
   transaction is the arbiter (AGENTS data integrity principle).
+
+---
+
+## ADR-023: Clerk-owned auth routing + per-user query isolation (web, follow-up)
+
+- **Decision:** The sign-in/sign-up pages live in an `(auth)` route group with
+  Clerk's catch-all App Router structure (`[[...sign-in]]`/`[[...sign-up]]`),
+  rendered with `routing="path"`, `path`, `signUpUrl`/`signInUrl`, and
+  `fallbackRedirectUrl="/"`; `NEXT_PUBLIC_CLERK_(SIGN_IN|SIGN_UP)_URL` and the
+  fallback-redirect env vars default every Clerk surface (header buttons,
+  OAuth callbacks, sign-out) to our own localhost routes. All authenticated
+  TanStack queries are keyed by the current Clerk `userId`, and a
+  `SessionCacheSync` component clears the query client whenever `userId`
+  changes (logout included).
+- **Why now:** Manual testing found (a) Clerk's internal links navigated to the
+  accounts.dev instance URL instead of `/sign-in`/`/sign-up`; (b) the auth
+  pages inherited the app navbar and duplicated the sign-in/up controls;
+  (c) logout then login as the other canonical actor could briefly show the
+  previous user's role-specific UI (e.g., Nusrat's passenger page after
+  Jashim logged in) because the single, un-namespaced cache served stale data
+  as fresh (`staleTime` 30 s).
+- **Trade-offs:** Query keys gain a user segment everywhere, so mutations must
+  invalidate by prefix (they already do). Role still cannot be resolved in the
+  Clerk edge middleware (the role lives in PostgreSQL behind `/api/me`), so
+  role blocking remains the `RoleGate` UX layer on top of backend 403s — but
+  the redirect target is now always derived from the current session's `userId`
+  and query state, never from cached data of a different user.
+- **Switch later if:** We store role as Clerk session/session-cache metadata
+  and can do middleware-level role redirects without a DB round-trip, or we
+  adopt a server-side SSR data-fetching layer (e.g., React Query SSR) that
+  re-derives identity per request.

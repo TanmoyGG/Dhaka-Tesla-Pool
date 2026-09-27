@@ -2,6 +2,14 @@
 // useAuth() at fetch time and invalidates the relevant query family after
 // mutations so the list, the detail, and the booking result stay consistent.
 //
+// User isolation: EVERY authenticated query key is scoped by the current Clerk
+// `userId` (e.g. ["me", userId], ["rides", userId], ["driver", userId, …]).
+// Different sessions can therefore never share a cache entry — after logout →
+// login as another user, the new user's hooks always start with an EMPTY entry
+// (loading state, never the previous user's role or data). Queries are also
+// `enabled` only once an identity exists, so no request fires mid-transition.
+// SessionCacheSync additionally clears the client whenever `userId` changes.
+//
 // Polling: queries on non-terminal rides/pools use the `refetchInterval`
 // FUNCTION pattern — they poll while ANY returned item is still active and
 // STOP as soon as everything is COMPLETED/CANCELLED (no pointless long-poll).
@@ -51,11 +59,15 @@ function pollWhileActive(second = 5000) {
   };
 }
 
+// Stable key segment while no identity exists yet (queries are disabled then,
+// so the segment only matters to keep the key shape constant).
+const NO_USER = "anonymous";
+
 export function useMe() {
-  const { getToken, isLoaded, isSignedIn } = useAuth();
+  const { getToken, isLoaded, isSignedIn, userId } = useAuth();
   return useQuery({
-    enabled: isLoaded && Boolean(isSignedIn),
-    queryKey: ["me"],
+    enabled: isLoaded && Boolean(isSignedIn) && Boolean(userId),
+    queryKey: ["me", userId ?? NO_USER],
     queryFn: async (): Promise<MeResponse["user"]> => {
       const response = await apiGet<MeResponse>("/api/me", getToken);
       return response.user;
@@ -75,9 +87,10 @@ export function useZones() {
 }
 
 export function useRides() {
-  const { getToken } = useAuth();
+  const { getToken, userId } = useAuth();
   return useQuery({
-    queryKey: ["rides"],
+    enabled: Boolean(userId),
+    queryKey: ["rides", userId ?? NO_USER],
     queryFn: async (): Promise<RideView[]> => {
       const response = await apiGet<RidesResponse>("/api/rides", getToken);
       return response.rides;
@@ -87,10 +100,10 @@ export function useRides() {
 }
 
 export function useRide(rideId: string | undefined) {
-  const { getToken } = useAuth();
+  const { getToken, userId } = useAuth();
   return useQuery({
-    enabled: Boolean(rideId),
-    queryKey: ["rides", rideId ?? "none"],
+    enabled: Boolean(rideId && userId),
+    queryKey: ["rides", userId ?? NO_USER, rideId ?? "none"],
     queryFn: async (): Promise<RideView> => {
       const response = await apiGet<RideResponse>(`/api/rides/${rideId}`, getToken);
       return response.ride;
@@ -136,9 +149,10 @@ export function useCancelRide() {
       );
       return response.ride;
     },
-    onSuccess: (ride) => {
+    onSuccess: () => {
+      // The ["rides"] prefix covers the list, the detail, and the estimate
+      // keys for the current user.
       queryClient.invalidateQueries({ queryKey: ["rides"] });
-      queryClient.invalidateQueries({ queryKey: ["rides", ride.id] });
     },
   });
 }
@@ -152,11 +166,12 @@ export interface EstimateInput {
 // Live "see estimated fare before booking" (PRD): queried once the form is
 // fully valid, refetched on future stale/focus. Nothing is created.
 export function useEstimateRide(input: EstimateInput | null) {
-  const { getToken } = useAuth();
+  const { getToken, userId } = useAuth();
   return useQuery({
-    enabled: Boolean(input),
+    enabled: Boolean(input && userId),
     queryKey: [
       "rides",
+      userId ?? NO_USER,
       "estimate",
       input?.pickupZoneId ?? "none",
       input?.destinationZoneId ?? "none",
@@ -183,9 +198,10 @@ export function useEstimateRide(input: EstimateInput | null) {
 // ---------------------------------------------------------------------------
 
 export function useDriverAvailability() {
-  const { getToken } = useAuth();
+  const { getToken, userId } = useAuth();
   return useQuery({
-    queryKey: ["driver", "availability"],
+    enabled: Boolean(userId),
+    queryKey: ["driver", userId ?? NO_USER, "availability"],
     queryFn: async (): Promise<{ isOnline: boolean }> => {
       const response = await apiGet<DriverAvailabilityResponse>(
         "/api/driver/availability",
@@ -198,26 +214,28 @@ export function useDriverAvailability() {
 
 export function useSetAvailability() {
   const queryClient = useQueryClient();
-  const { getToken } = useAuth();
+  const { getToken, userId } = useAuth();
 
   return useMutation({
     mutationFn: async (isOnline: boolean): Promise<void> => {
       await apiPost<void>("/api/driver/availability", getToken, { isOnline });
     },
     onSuccess: (_, isOnline) => {
+      const scope = ["driver", userId ?? NO_USER];
       queryClient.setQueryData<{ isOnline: boolean }>(
-        ["driver", "availability"],
+        [...scope, "availability"],
         { isOnline },
       );
-      queryClient.invalidateQueries({ queryKey: ["driver", "availability"] });
+      queryClient.invalidateQueries({ queryKey: scope });
     },
   });
 }
 
 export function useDriverPools() {
-  const { getToken } = useAuth();
+  const { getToken, userId } = useAuth();
   return useQuery({
-    queryKey: ["driver", "pools"],
+    enabled: Boolean(userId),
+    queryKey: ["driver", userId ?? NO_USER, "pools"],
     queryFn: async () => {
       const response = await apiGet<DriverPoolsResponse>(
         "/api/driver/pools",
@@ -233,9 +251,10 @@ export function useDriverPools() {
 // eligible driver to claim it first-wins, newest first. Blocking live by
 // construction — the lobby shrinks the moment any driver accepts.
 export function useAvailablePools() {
-  const { getToken } = useAuth();
+  const { getToken, userId } = useAuth();
   return useQuery({
-    queryKey: ["driver", "pools", "available"],
+    enabled: Boolean(userId),
+    queryKey: ["driver", userId ?? NO_USER, "pools", "available"],
     queryFn: async () => {
       const response = await apiGet<DriverPoolsResponse>(
         "/api/driver/pools/available",
@@ -248,10 +267,10 @@ export function useAvailablePools() {
 }
 
 export function useDriverPool(poolId: string | undefined) {
-  const { getToken } = useAuth();
+  const { getToken, userId } = useAuth();
   return useQuery({
-    enabled: Boolean(poolId),
-    queryKey: ["driver", "pools", poolId ?? "none"],
+    enabled: Boolean(poolId && userId),
+    queryKey: ["driver", userId ?? NO_USER, "pools", poolId ?? "none"],
     queryFn: async () => {
       const response = await apiGet<DriverPoolResponse>(
         `/api/driver/pools/${poolId}`,
@@ -265,9 +284,10 @@ export function useDriverPool(poolId: string | undefined) {
 
 // Completed-trip history is immutable — no polling.
 export function useDriverHistory() {
-  const { getToken } = useAuth();
+  const { getToken, userId } = useAuth();
   return useQuery({
-    queryKey: ["driver", "pools", "history"],
+    enabled: Boolean(userId),
+    queryKey: ["driver", userId ?? NO_USER, "pools", "history"],
     queryFn: async () => {
       const response = await apiGet<DriverPoolsResponse>(
         "/api/driver/pools/history",
@@ -282,7 +302,7 @@ export type DriverPoolAction = "accept" | "arrive" | "start" | "complete";
 
 function useDriverPoolAction(action: DriverPoolAction) {
   const queryClient = useQueryClient();
-  const { getToken } = useAuth();
+  const { getToken, userId } = useAuth();
 
   return useMutation({
     mutationFn: async (poolId: string) => {
@@ -292,15 +312,10 @@ function useDriverPoolAction(action: DriverPoolAction) {
       );
       return response.pool;
     },
-    onSuccess: (pool) => {
-      queryClient.invalidateQueries({ queryKey: ["driver", "pools"] });
-      queryClient.invalidateQueries({ queryKey: ["driver", "pools", pool.id] });
-      queryClient.invalidateQueries({ queryKey: ["driver", "pools", "history"] });
-      // Accepting drains the lobby; the prefix above already covers it, but
-      // the explicit key keeps the intent visible (ADR-022).
-      queryClient.invalidateQueries({
-        queryKey: ["driver", "pools", "available"],
-      });
+    onSuccess: () => {
+      // One prefix invalidates everything for the current user: owned pools,
+      // detail, history, and the lobby (ADR-022).
+      queryClient.invalidateQueries({ queryKey: ["driver", userId ?? NO_USER] });
     },
   });
 }

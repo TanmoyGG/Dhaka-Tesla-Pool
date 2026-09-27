@@ -12,7 +12,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const { isSignedIn } = useAuth();
   const me = useMe();
-  const role = me.data?.role;
+  // Role links render only when the CURRENT user's role is resolved
+  // (me.isSuccess). While `me` is loading/refetching after an auth change the
+  // header shows a neutral brand — never the previous session's role links.
+  const role = me.isSuccess ? me.data?.role : undefined;
 
   const isActive = (href: string) =>
     pathname === href || pathname.startsWith(`${href}/`);
@@ -66,7 +69,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 Account
               </Link>
             )}
-            {!isSignedIn && (
+            {!isSignedIn && pathname !== "/" && (
               <span className="nav-auth">
                 <SignInButton>
                   <button type="button" className="btn btn-ghost btn-sm">
