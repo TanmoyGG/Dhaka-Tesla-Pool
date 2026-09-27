@@ -1,16 +1,18 @@
 # Database Design — Dhaka Tesla Pool (MVP)
 
-> **Status:** Phases 2–6 complete. The schema described here is implemented in
-> `apps/api/src/db/schema.ts`, migrated by `apps/api/drizzle/0000_*.sql` through
-> `0005_*.sql`, and exercised by `apps/api/test/database.test.ts` plus the
-> ride/pooling/driver/state suites. The ERD below reflects the **actual**
-> schema: the Phase 3 Clerk adaptation (`users.clerk_user_id`, no `sessions`
-> table, no password hashes), the Phase 4 idempotency key
-> (`ride_requests.client_request_id`, migration 0003), the Phase 5 pooled-fare
-> refresh (`fares.updated_at`, migration 0004), and the Phase 6 driver flow
-> (`pools.accepted_at`, migration 0005). Everything else here is a record of
-> the design decisions, invariants, and planned later-phase behavior (which is
-> marked as such).
+> **Status:** Phases 2–6 complete (incl. the Phase 6/8 ADR-022 follow-up). The
+> schema described here is implemented in `apps/api/src/db/schema.ts`, migrated
+> by `apps/api/drizzle/0000_*.sql` through `0007_*.sql`, and exercised by
+> `apps/api/test/database.test.ts` plus the ride/pooling/driver/state suites.
+> The ERD below reflects the **actual** schema: the Phase 3 Clerk adaptation
+> (`users.clerk_user_id`, no `sessions` table, no password hashes), the Phase 4
+> idempotency key (`ride_requests.client_request_id`, migration 0003), the
+> Phase 5 pooled-fare refresh (`fares.updated_at`, migration 0004), the Phase 6
+> driver flow (`pools.accepted_at`, migration 0005), the one-active-ride index
+> (`ride_requests_one_active_per_passenger`, migration 0006), and the ADR-022
+> wait-pool model (nullable `pools.driver_id`/`vehicle_id`, migration 0007).
+> Everything else here is a record of the design decisions, invariants, and
+> planned later-phase behavior (which is marked as such).
 
 ## 1. Design Goals
 
@@ -294,10 +296,11 @@ erDiagram
     }
     pools {
         uuid id PK
-        uuid vehicle_id FK
-        uuid driver_id FK
+        uuid vehicle_id FK "nullable until a driver accepts (ADR-022)"
+        uuid driver_id FK "nullable until a driver accepts (ADR-022)"
         ride_status status
         int capacity_snapshot "vehicle capacity at creation"
+        timestamptz accepted_at "set by the first-wins accept (ADR-022)"
         timestamptz created_at
         timestamptz updated_at
         timestamptz started_at

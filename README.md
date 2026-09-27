@@ -240,7 +240,9 @@ Defaults work for local development with Docker Postgres. For live Clerk
 flows you must put real Clerk keys in `.env` (see [Authentication](#authentication)).
 Without them the stack still starts, but authenticated API routes fail with a
 clear `AUTH_CONFIGURATION` error and the web `/account` redirect targets
-`/sign-in` (its route policy is unchanged).
+`/sign-in` (its route policy is unchanged). Both `npm run dev` scripts
+(API and web) auto-load the repo-root `.env` via Node's `--env-file`, so no
+manual `export` is needed locally.
 
 ### 3. Start PostgreSQL (Docker)
 
@@ -524,9 +526,12 @@ the seed coordinates, so any drift is a test failure. See ADR-015 and
 
 `POST /api/rides` now runs the match inside its own create transaction
 (ADR-016/017). A request joins the best **eligible** pool — same pickup zone,
-all-pairs drop-off spread ≤ **2.0 km**, enough seats — or starts a new one on an
-online, available Tesla; either way it responds `MATCHED` with an additive
-`pool` object on the ride (vehicle, driver, `capacitySnapshot`, `occupiedSeats`).
+all-pairs drop-off spread ≤ **2.0 km**, enough seats — or, when no eligible
+pool exists, is placed into a new **unassigned wait pool** (`driver_id`/
+`vehicle_id` NULL) that any online driver claims first-wins from the lobby
+(ADR-022). Either way it responds `MATCHED` with an additive `pool` object on
+the ride (`capacitySnapshot`, `occupiedSeats`; `vehicle`/`driver` are `null`
+until a driver accepts the pool).
 Nusrat + Rafiq pool (drop-off spread ≈ 1.906 km); `Banani → Dhanmondi`
 (≈ 4.6 km away) does not.
 
@@ -599,6 +604,25 @@ pool, Shirin's concurrent grab is the canonical capacity race, and Karim/Rahim/
 Faruq (Tesla 2/3/4, all online) cover the cross-driver race and multi-pool
 accept cases (the no-Tesla `VEHICLE_OFFLINE` case uses a dedicated non-cast
 driver fixture).
+
+## Known Limitations (accepted — not fixed in this phase)
+
+Two minor runtime behaviors are known and intentionally left unfixed — neither
+affects data integrity or backend-enforced business rules.
+
+- **Driver online/offline toggle can surface `Failed to execute 'json' on
+  'Response': Unexpected end of JSON input`.** The switched state is still
+  applied and becomes visible on refresh. Suspected cause: the web API client
+  eagerly parses the JSON body of the toggle's `204 No Content` response
+  (`POST /api/driver/availability`). A future fix should make the client's
+  `request()` skip JSON parsing for empty 2xx responses.
+- **An offline driver can still *see* waiting requests in the lobby.**
+  `GET /api/driver/pools/available` lists every unassigned pool regardless of
+  the caller's availability; the backend correctly refuses such an accept with
+  `409 VEHICLE_OFFLINE` (the security boundary is the API, never the UI). A
+  future UX improvement could hide the lobby (or gray out Accept) while the
+  driver is offline; optionally the backend could filter the list by the
+  caller's availability.
 
 ## Docker (full stack, reproducible)
 

@@ -41,7 +41,7 @@ flowchart LR
 
     CLERK[Clerk - identity provider<br/>sessions, sign-in/sign-up UI, tokens]
 
-    subgraph Web[apps/web - Next.js/React/Tailwind/shadcn]
+    subgraph Web[apps/web - Next.js/React, always-dark plain-CSS]
         UI[React UI]
         CLRP[<@clerk/nextjs><br/>ClerkProvider + middleware]
         RF[React Hook Form + Zod validation]
