@@ -5,18 +5,16 @@ import Link from "next/link";
 import { BookingArea } from "@/components/booking-area";
 import { FareBreakdown } from "@/components/fare-breakdown";
 import { PoolInfo } from "@/components/pool-info";
-import { RideCard } from "@/components/ride-card";
 import { RoleGate } from "@/components/role-gate";
 import { StatusBadge } from "@/components/status-badge";
-import { EmptyState, ErrorCard, LoadingState } from "@/components/state-components";
 import { formatPaisa } from "@/lib/format";
 import { useRides } from "@/lib/queries";
 import { isTerminal, type RideView } from "@/lib/types";
 
-// Passenger landing: book while no ride is active (BookingArea enforces the
-// one-active-ride rule in the UI), see the confirmed booking with its live
-// pool, and browse ride history. The list and details poll on 5s while any
-// ride is still changing and stop once everything is terminal.
+// Passenger workspace: book while no ride is active (BookingArea enforces the
+// one-active-ride rule in the UI) and see the confirmed booking with its live
+// pool. Ride history lives behind the header menu on /rides/history
+// (docs/frontend-design.md §5.5 / §7), not on this page.
 export default function RidesPage() {
   const rides = useRides();
   const [booked, setBooked] = useState<RideView | null>(null);
@@ -50,24 +48,6 @@ export default function RidesPage() {
             </p>
           </section>
         )}
-
-        <section aria-labelledby="history-heading">
-          <h2 id="history-heading">Ride history</h2>
-          {rides.isLoading && <LoadingState label="Loading rides…" />}
-          {rides.isError && <ErrorCard error={rides.error} />}
-          {rides.data && rides.data.length === 0 && (
-            <EmptyState message="No rides yet — book your first one above." />
-          )}
-          {rides.data && rides.data.length > 0 && (
-            <ul className="ridelist">
-              {rides.data.map((ride) => (
-                <li key={ride.id}>
-                  <RideCard ride={ride} />
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
       </main>
     </RoleGate>
   );

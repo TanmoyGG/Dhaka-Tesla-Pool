@@ -274,10 +274,10 @@ panel / sheet shows, per status:
   history.
 
 ### 5.5 History
-- Behind the hamburger/secondary navigation (§7): a "Your rides" panel fed by
-  the existing `GET /api/rides`, rendered with `RideCard`, newest first.
+- **Dedicated route `/rides/history`** (Phase 2), reached only from the header
+  menu (§7). Fed by the existing `GET /api/rides`, rendered with `RideCard`.
   Tap-through to `/rides/[rideId]` (existing detail page, kept for
-  deep-linking). History never dominates the workspace.
+  deep-linking). History never appears on the `/rides` workspace.
 
 ---
 
@@ -329,26 +329,41 @@ panel / sheet shows, per status:
   write.
 
 ### 6.6 History
-- Behind secondary navigation (§7): completed trips from the existing
+- **Dedicated route `/driver/history`** (Phase 2), reached only from the
+  header menu (§7). Completed trips from the existing
   `GET /api/driver/pools/history` (**capped at 10 by the API** — UI shows the
-  ten newest; see §11 note).
+  ten newest; see §11 note). No history section on the `/driver` workspace.
 
 ---
 
 ## 7. Navigation
 
-- Replace the current top-link nav (`AppShell` — "Driver hub / Book a ride /
-  Account") with a **minimal hamburger** in the workspace header.
-- The hamburger opens a **drawer** with only secondary destinations:
-  - Workspace entry (acts as close / "current ride"),
-  - **History** (passenger trips / driver completed trips — §5.5/§6.6),
-  - **Account** (`/account`, existing),
-  - **GitHub repo** (external).
-- The primary title in the workspace header is always the ride/workspace
-  (`Where to?` for book mode, route for live ride, driver status for driver).
-  `UserButton` stays in the header (single account affordance).
-- No persistent hamburger icon on the landing page (GitHub link serves that
-  corner).
+- **Reworked (Phase 2).** The top-link nav in `AppShell` ("Driver hub / Book a
+  ride / Account") is replaced by a **minimal hamburger** in the sticky header:
+  brand left, the signed-in user's **identity centered**, hamburger right.
+- The centered identity comes from Clerk's session object, preferring the
+  **username** (`fullName` → primary email only as fallbacks) so short names
+  like "Nusrat" or "Jashim" appear instead of full names.
+- The hamburger opens a right-side **drawer** (dark/lime sheet, slide+fade,
+  disabled under `prefers-reduced-motion`) whose items are **role-aware** via
+  `lib/navigation.ts` — the PASSENGER/DRIVER/ADMIN sets never mix:
+  - **PASSENGER:** Book a ride (`/rides`) · Ride history (`/rides/history`) ·
+    Account (`/account`) · Sign out.
+  - **DRIVER:** Driver workspace (`/driver`) · Trip history
+    (`/driver/history`) · Account (`/account`) · Sign out.
+  - **ADMIN:** both workspaces, both histories, Account, Sign out.
+  - Role-unresolved sessions render only Account + Sign out (Phase 1
+    isolation: another role's items can never flash).
+  - The drawer closes on navigation, overlay click, or Escape; page scroll is
+    locked while it is open.
+- **Sign out lives in the menu** and uses Clerk's own flow
+  (`useClerk().signOut()`); the env fallback redirect + `SessionCacheSync`
+  query-clear perform the cleanup. The `UserButton` no longer appears in the
+  header — `/account` keeps one for identity management.
+- History is **removed from the workspaces** and reached only through the menu
+  (dedicated routes — §5.5/§6.6).
+- No hamburger icon while signed out — the landing page's GitHub link serves
+  that corner and the auth pages keep their own layout.
 
 ---
 
@@ -434,8 +449,9 @@ The MVP is deliberately **not** building:
    the existing 44 web tests green and `npm run build -w @dhaka-tesla-pool/web`
    clean:
    1. Token swap (blue→lime) + Clerk retheme + landing simplification +
-      GitHub link.
+      GitHub link. **— done (Phase 1).**
    2. Hamburger/drawer navigation; move history out of the workspace.
+      **— done (Phase 2).**
    3. Workspace skeleton (map + panel/sheet) with map non-blocking.
    4. Passenger book/live/pay flow.
    5. Driver workspace (availability + lobby + open pools + cash flow) with
@@ -467,10 +483,9 @@ changed — each needs a conscious decision:
    show money. **Assumption:** this is accepted follow-up work; the passenger
    flow and §13 UI land without it, driver earnings render when the field
    ships.
-3. **Landing duplicates auth controls today.** Signed-out users see
-   sign-in/up in both `app/page.tsx` and the `AppShell` header. Spec keeps
-   one set (landing) and hides the header auth pair on `/`. **Assumption:
-   single control set is the intended behavior.**
+3. **Landing is the single auth control set.** Signed-out visitors reach
+   auth only from the landing CTAs; the reworked `AppShell` header (Phase 2)
+   no longer renders a sign-in/up pair at all.
 4. **`.page.tsx` has a numbered instruction block to remove**, and the
    passenger `/rides` page stacks booking + history; both are superseded by
    §3/§5/§7.
@@ -497,7 +512,16 @@ changed — each needs a conscious decision:
    wait pool, driver not yet claimed". The UI labels are phrased accordingly
    ("matching you with a driver") rather than inventing a synthetic
    searching state.
-10. **App shell vs workspace.** The existing `AppShell` header/nav is
-    reworked into the minimal hamburger (§7); `/account` and the detail pages
-    (`/rides/[rideId]`, `/driver/[poolId]`) stay reachable for
-    deep-linking/history.
+10. **App shell vs workspace.** Implemented (Phase 2): `AppShell` is now a
+    minimal hamburger header with the signed-in user's identity centered (§7);
+    the workspace, history, account, and sign-out action all live in the
+    drawer. `/account` and the detail pages (`/rides/[rideId]`,
+    `/driver/[poolId]`) stay reachable for deep-linking/history.
+11. **Deviations from the earlier §7 draft (decided in the Phase 2 review).**
+    The drawer omits the GitHub link (it stays on the landing corner), the
+    `UserButton` was removed from the header (Account + Sign out live in the
+    menu; `/account` keeps its own `UserButton` for identity management), and
+    history is rendered on dedicated sub-routes `/rides/history` /
+    `/driver/history` rather than a panel inside the drawer — so the drawer
+    stays minimal and history stays deep-linkable behind the existing
+    middleware/`RoleGate` protection.

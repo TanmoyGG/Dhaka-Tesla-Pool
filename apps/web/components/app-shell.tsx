@@ -1,24 +1,24 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { SignInButton, SignUpButton, UserButton, useAuth } from "@clerk/nextjs";
-import { useMe } from "@/lib/queries";
+import { useUser } from "@clerk/nextjs";
+import { AppMenu } from "./app-menu";
 
-// Product shell: sticky header with role-aware navigation. The link set is
-// purely navigational convenience — the middleware protects every private
-// route and the backend re-verifies roles on each request.
+// Product shell: minimal sticky header — brand left, the signed-in user's
+// identity centered, hamburger right (docs/frontend-design.md §7). Routing and
+// roles are protected by the middleware + RoleGate; this header is navigation
+// convenience only, never a security layer.
 export function AppShell({ children }: { children: React.ReactNode }) {
-  const pathname = usePathname();
-  const { isSignedIn } = useAuth();
-  const me = useMe();
-  // Role links render only when the CURRENT user's role is resolved
-  // (me.isSuccess). While `me` is loading/refetching after an auth change the
-  // header shows a neutral brand — never the previous session's role links.
-  const role = me.isSuccess ? me.data?.role : undefined;
+  const { user } = useUser();
 
-  const isActive = (href: string) =>
-    pathname === href || pathname.startsWith(`${href}/`);
+  // Identity comes from Clerk's own session object (identity-correct by
+  // construction, no cache to go stale). Prefer the username (Nusrat, Jashim),
+  // then the display name, then the primary email as the last resort.
+  const identity =
+    user?.username ??
+    user?.fullName ??
+    user?.primaryEmailAddress?.emailAddress ??
+    null;
 
   return (
     <>
@@ -28,68 +28,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             Dhaka <span className="brand-accent">Tesla</span> Pool
           </Link>
 
-          <nav className="main-nav" aria-label="Primary">
-            {isSignedIn && role === "DRIVER" && (
-              <Link
-                href="/driver"
-                aria-current={isActive("/driver") ? "page" : undefined}
-              >
-                Driver hub
-              </Link>
-            )}
-            {isSignedIn && role === "PASSENGER" && (
-              <Link
-                href="/rides"
-                aria-current={isActive("/rides") ? "page" : undefined}
-              >
-                Book a ride
-              </Link>
-            )}
-            {isSignedIn && role === "ADMIN" && (
-              <>
-                <Link
-                  href="/rides"
-                  aria-current={isActive("/rides") ? "page" : undefined}
-                >
-                  Book a ride
-                </Link>
-                <Link
-                  href="/driver"
-                  aria-current={isActive("/driver") ? "page" : undefined}
-                >
-                  Driver hub
-                </Link>
-              </>
-            )}
-            {isSignedIn && (
-              <Link
-                href="/account"
-                aria-current={isActive("/account") ? "page" : undefined}
-              >
-                Account
-              </Link>
-            )}
-            {!isSignedIn && pathname !== "/" && (
-              <span className="nav-auth">
-                <SignInButton>
-                  <button type="button" className="btn btn-ghost btn-sm">
-                    Sign in
-                  </button>
-                </SignInButton>
-                <SignUpButton>
-                  <button type="button" className="btn btn-primary btn-sm">
-                    Sign up
-                  </button>
-                </SignUpButton>
-              </span>
-            )}
-          </nav>
+          <div className="site-header-current" aria-hidden={!identity}>
+            {identity}
+          </div>
 
-          {isSignedIn && (
-            <div className="header-user">
-              <UserButton />
-            </div>
-          )}
+          <AppMenu />
         </div>
       </header>
 

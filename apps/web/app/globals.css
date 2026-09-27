@@ -130,17 +130,20 @@ p {
 }
 
 .site-header-inner {
-  max-width: 62rem;
-  margin: 0 auto;
-  padding: 0.65rem 1rem;
-  display: flex;
+  /* Full-width header: brand far left, username centered in the viewport,
+     hamburger far right. Grid 1fr auto 1fr holds the middle track at the
+     viewport center regardless of how wide the sides are. */
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  gap: 1rem;
+  column-gap: 1rem;
+  padding: 0.65rem clamp(1rem, 3vw, 1.75rem);
 }
 
 .brand {
+  justify-self: start;
   font-weight: 800;
-  font-size: 1.05rem;
+  font-size: 1.15rem;
   color: var(--text);
   white-space: nowrap;
 }
@@ -154,45 +157,163 @@ p {
   color: var(--accent);
 }
 
-.main-nav {
-  display: flex;
-  align-items: center;
-  gap: 0.15rem;
-  flex-wrap: wrap;
-  margin-left: 0.25rem;
-  flex: 1;
-}
-
-.main-nav a {
+.site-header-current {
+  justify-self: center;
+  min-width: 0;
+  max-width: 100%;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 1rem;
+  font-weight: 800;
+  font-style: italic;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
   color: var(--muted);
-  font-weight: 600;
-  font-size: 0.92rem;
-  padding: 0.45rem 0.7rem;
-  border-radius: var(--radius-sm);
 }
 
-.main-nav a:hover {
-  color: var(--text);
-  text-decoration: none;
-  background: var(--bg-raised);
-}
-
-.main-nav a[aria-current="page"] {
-  color: var(--text);
-  background: var(--bg-raised);
-  box-shadow: inset 0 0 0 1px var(--border);
-}
-
-.main-nav .nav-auth {
-  display: flex;
-  gap: 0.25rem;
-  margin-left: auto;
-}
-
-.header-user {
-  display: flex;
+/* Hamburger trigger (docs/frontend-design.md §7) */
+.menu-button {
+  justify-self: end;
+  display: inline-flex;
+  flex-direction: column;
   align-items: center;
-  margin-left: auto;
+  justify-content: center;
+  gap: 0.26rem;
+  width: 2.6rem;
+  height: 2.6rem;
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  cursor: pointer;
+  padding: 0;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.menu-button:hover {
+  background: var(--bg-raised);
+  border-color: var(--border-strong);
+}
+
+.menu-button-bar {
+  display: block;
+  width: 1.3rem;
+  height: 2.5px;
+  border-radius: 999px;
+  background: var(--text);
+}
+
+/* Right-side drawer — viewport-level UI (portaled to <body> so the sticky
+   header's `backdrop-filter` cannot trap it as a containing block).
+   Z-index hierarchy: page content < backdrop + panel (19) < sticky header (20),
+   so the panel opens BELOW the header and the hamburger stays usable as the
+   close control. */
+.app-menu {
+  position: fixed;
+  inset: 0;
+  z-index: 19;
+}
+
+.app-menu-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: rgba(6, 7, 9, 0.6);
+  backdrop-filter: blur(2px);
+  animation: menu-fade 150ms ease;
+}
+
+.app-menu-panel {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: min(90vw, 25.5rem);
+  z-index: 1;
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border-strong);
+  border-radius: var(--radius) 0 0 0;
+  box-shadow: -1rem 0 2.5rem rgba(0, 0, 0, 0.5);
+  padding: 1.5rem 1rem 1.25rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  animation: menu-slide 160ms ease;
+}
+
+.app-menu-nav {
+  display: flex;
+  flex-direction: column;
+}
+
+.app-menu-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.app-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  font-size: 0.98rem;
+  font-weight: 600;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: 0.85rem 0.9rem;
+  min-height: 3rem;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.app-menu-item:hover {
+  background: var(--bg-elevated);
+  text-decoration: none;
+}
+
+.app-menu-item[aria-current="page"],
+.app-menu-item:focus-visible {
+  background: var(--bg-elevated);
+  border-color: var(--border-strong);
+}
+
+.app-menu-item.sign-out {
+  color: var(--danger-text);
+}
+
+.app-menu-item.sign-out:hover {
+  background: var(--danger-soft);
+}
+
+@keyframes menu-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes menu-slide {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-menu-overlay,
+  .app-menu-panel {
+    animation: none;
+  }
 }
 
 /* ----- Shared layout helpers ----- */

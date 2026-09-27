@@ -8,18 +8,18 @@ import { EmptyState, ErrorCard, LoadingState } from "@/components/state-componen
 import {
   useAvailablePools,
   useDriverAvailability,
-  useDriverHistory,
   useDriverPools,
 } from "@/lib/queries";
 
-// Driver dashboard: availability switch, waiting ride requests in the lobby
-// (ADR-022 — claim one first-wins), owned open pools (polled while any is
-// non-terminal), and completed-trip history. A PASSENGER reaching this page is
-// redirected to /rides by RoleGate; the backend still enforces the role.
+// Driver workspace: availability switch and waiting ride requests in the lobby
+// (ADR-022 — claim one first-wins) plus owned open pools (polled while any is
+// non-terminal). Completed-trip history lives behind the header menu on
+// /driver/history (docs/frontend-design.md §6.6 / §7). A PASSENGER reaching
+// this page is redirected to /rides by RoleGate; the backend still enforces
+// the role.
 export default function DriverDashboardPage() {
   const pools = useDriverPools();
   const lobby = useAvailablePools();
-  const history = useDriverHistory();
   const availability = useDriverAvailability();
   const isOffline =
     !availability.isLoading &&
@@ -85,24 +85,6 @@ export default function DriverDashboardPage() {
               {pools.data.map((pool) => (
                 <li key={pool.id}>
                   <DriverPoolCard pool={pool} />
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-
-        <section aria-labelledby="history-heading">
-          <h2 id="history-heading">Completed trips</h2>
-          {history.isLoading && <LoadingState label="Loading history…" />}
-          {history.isError && <ErrorCard error={history.error} />}
-          {history.data && history.data.length === 0 && (
-            <EmptyState message="No completed trips yet." />
-          )}
-          {history.data && history.data.length > 0 && (
-            <ul className="ridelist">
-              {history.data.map((pool) => (
-                <li key={pool.id}>
-                  <DriverPoolCard pool={pool} isHistory />
                 </li>
               ))}
             </ul>
