@@ -3,10 +3,12 @@
 // fakes (no Clerk). Canonical cast: Jashim drives Bullet (3 seats);
 // Nusrat/Rafiq/Shirin are the passengers. Pools are now born UNASSIGNED wait
 // pools (driver_id NULL) in the driver lobby and "accept" is the first-wins
-// assignment of a driver + Tesla (ADR-022). KARIM is a DRIVER user with NO
-// Tesla — he can never win an accept (VEHICLE_OFFLINE) and is the interloper
-// on owned (accepted) pools (404). RAHIM is a seeded DRIVER with Tesla 3, the
-// honest competitor in the cross-driver accept race.
+// assignment of a driver + Tesla (ADR-022). KARIM is the SEEDED DRIVER with
+// Tesla 2 (online) — an equally eligible competitor who is the interloper on
+// owned (accepted) pools (404). The no-Tesla `VEHICLE_OFFLINE` path (a DRIVER
+// with no vehicles at all) is covered by a dedicated non-cast fixture, NOCAR.
+// RAHIM is a seeded DRIVER with Tesla 3 (online), the honest competitor in
+// the cross-driver accept race.
 //
 // Concurrency tests use two independent postgres connections so the racing
 // transactions genuinely run in parallel at the database (same convention as
@@ -44,9 +46,9 @@ const describeDb = REACHABLE ? describe : describe.skip;
 
 const Z = SEED_ZONE_IDS;
 
-// A second driver who owns NO Tesla: he can never win an accept (VEHICLE_OFFLINE)
-// and is the interloper for owned-pool (404) tests.
-const KARIM_ID = "a1000000-0000-4000-8000-000000000009";
+// A non-cast DRIVER who owns NO Tesla at all: preserves the VEHICLE_OFFLINE
+// assertion now that every seeded driver owns an online Tesla (ADR-022).
+const NOCAR_ID = "a1000000-0000-4000-8000-000000000009";
 
 function user(
   id: string,
@@ -67,7 +69,10 @@ function user(
 }
 
 const JASHIM = user(SEED_IDS.jashim, "Jashim Ahmed", "jashim@example.com", "DRIVER");
-const KARIM = user(KARIM_ID, "Karim Mondol", "karim@example.com", "DRIVER");
+// Seeded DRIVER with Tesla 2 (online): an equally eligible competitor (ADR-022).
+const KARIM = user(SEED_IDS.karim, "Karim Hossain", "karim@example.com", "DRIVER");
+// A non-cast DRIVER owning no Tesla: the dedicated VEHICLE_OFFLINE fixture.
+const NOCAR = user(NOCAR_ID, "Naim Chowdhury", "nocar@example.com", "DRIVER");
 // Seeded DRIVER with Tesla 3 (online): the legitimate competitor in the
 // cross-driver accept race — Jashim is not entitled to every pool.
 const RAHIM = user(SEED_IDS.rahim, "Rahim Mia", "rahim@example.com", "DRIVER");
@@ -97,16 +102,19 @@ const TOKENS = {
   jashim: "tok-jashim-driver",
   karim: "tok-karim-driver",
   nusrat: "tok-nusrat-driver",
+  nocar: "tok-nocar-driver",
 } as const;
 const TOKEN_TO_CLERK: Record<string, string> = {
   [TOKENS.jashim]: `clerk::${SEED_IDS.jashim}`,
-  [TOKENS.karim]: `clerk::${KARIM_ID}`,
+  [TOKENS.karim]: `clerk::${SEED_IDS.karim}`,
   [TOKENS.nusrat]: `clerk::${SEED_IDS.nusrat}`,
+  [TOKENS.nocar]: `clerk::${NOCAR_ID}`,
 };
 const CLERK_TO_USER = new Map<string, AuthUser>([
   [TOKEN_TO_CLERK[TOKENS.jashim], JASHIM],
   [TOKEN_TO_CLERK[TOKENS.karim], KARIM],
   [TOKEN_TO_CLERK[TOKENS.nusrat], NUSRAT],
+  [TOKEN_TO_CLERK[TOKENS.nocar], NOCAR],
 ]);
 
 let testUrl: string;
@@ -164,15 +172,16 @@ describeDb("driver workflow (Phase 6)", () => {
     client = postgres(testUrl, { max: 1 });
     db = drizzle(client);
     await runSeed(db);
-    // Karim exists only as a DRIVER user (no vehicles): he is how the
-    // interloper 404 is exercised, never an owner.
+    // Karim is seeded (SEED_IDS.karim, driving Tesla 2 online). NOCAR is the
+    // only DRIVER with no vehicles at all: the dedicated VEHICLE_OFFLINE
+    // fixture that exercises the no-Tesla reject (and not an owner anywhere).
     await db
       .insert(users)
       .values({
-        id: KARIM_ID,
-        clerkUserId: KARIM.clerkUserId,
-        name: KARIM.name,
-        email: KARIM.email,
+        id: NOCAR_ID,
+        clerkUserId: NOCAR.clerkUserId,
+        name: NOCAR.name,
+        email: NOCAR.email,
         role: "DRIVER",
         active: true,
       })
@@ -312,10 +321,10 @@ describeDb("driver workflow (Phase 6)", () => {
   it("a driver with no Tesla cannot accept a wait pool (VEHICLE_OFFLINE)", async () => {
     const n = await rides.createRequest(NUSRAT, booking());
     const poolId = n.ride.pool!.id;
-    // KARIM owns no Tesla at all — the lobby is open, but he has no car to
-    // bring, so he can never win an accept (previous interloper-404 role is
-    // superseded by open competition, ADR-022).
-    await expect(driver.acceptPool(KARIM.id, poolId)).rejects.toMatchObject({
+    // NOCAR is a non-cast DRIVER owning no Tesla at all — the lobby is open,
+    // but he has no car to bring, so he can never win an accept (open
+    // competition, ADR-022). Karim now owns Tesla 2 online (seeded cast).
+    await expect(driver.acceptPool(NOCAR.id, poolId)).rejects.toMatchObject({
       code: "VEHICLE_OFFLINE",
       statusCode: 409,
     });
@@ -940,17 +949,19 @@ describeDb("driver workflow (Phase 6)", () => {
       const poolId = n.ride.pool!.id;
       const jashim = { authorization: `Bearer ${TOKENS.jashim}` };
       const karim = { authorization: `Bearer ${TOKENS.karim}` };
+      const nocar = { authorization: `Bearer ${TOKENS.nocar}` };
 
-      // The wait pool is unclaimed. KARIM has no Tesla, so he cannot compete
-      // (VEHICLE_OFFLINE), and he cannot arrive/start/complete a pool he has
-      // not accepted (ownership-hiding 404).
-      const karimAcceptUnassigned = await app.inject({
+      // The wait pool is unclaimed. NOCAR (no Tesla at all) cannot compete
+      // (VEHICLE_OFFLINE). KARIM (Tesla 2, online) is an eligible competitor,
+      // but he has not been assigned the pool, so owned actions and detail
+      // hide it from him (ownership-hiding 404).
+      const nocarAcceptUnassigned = await app.inject({
         method: "POST",
         url: `/api/driver/pools/${poolId}/accept`,
-        headers: karim,
+        headers: nocar,
       });
-      expect(karimAcceptUnassigned.statusCode).toBe(409);
-      expect(karimAcceptUnassigned.json().error.code).toBe("VEHICLE_OFFLINE");
+      expect(nocarAcceptUnassigned.statusCode).toBe(409);
+      expect(nocarAcceptUnassigned.json().error.code).toBe("VEHICLE_OFFLINE");
       for (const action of ["arrive", "start", "complete"]) {
         const intruder = await app.inject({
           method: "POST",
@@ -996,7 +1007,7 @@ describeDb("driver workflow (Phase 6)", () => {
       });
       expect(detail.statusCode).toBe(200);
       expect(detail.json().pool.members).toHaveLength(2);
-      // The interloper now loses the accept race outright.
+      // The eligible competitor who did not win now loses the accept race.
       const karimAcceptAgain = await app.inject({
         method: "POST",
         url: `/api/driver/pools/${poolId}/accept`,
