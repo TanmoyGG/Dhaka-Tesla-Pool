@@ -131,14 +131,14 @@ export const SEED_ZONES: Array<{
   {
     id: SEED_ZONE_IDS.banani,
     name: "Banani",
-    latitude: 23.7936,
-    longitude: 90.4062,
+    latitude: 23.7901,
+    longitude: 90.40747,
   },
   {
     id: SEED_ZONE_IDS.gulshan,
     name: "Gulshan 1",
-    latitude: 23.7926,
-    longitude: 90.4133,
+    latitude: 23.77978,
+    longitude: 90.4166,
   },
   {
     id: SEED_ZONE_IDS.mohakhali,

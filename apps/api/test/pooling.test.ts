@@ -210,7 +210,7 @@ describeDb("pooling (Phase 5)", () => {
       vehicleName: null,
       driverName: null,
     });
-    expect(ride.fare.finalFarePaisa).toBe(5932);
+    expect(ride.fare.finalFarePaisa).toBe(5332);
   });
 
   it("automatches the first ride into a new UNASSIGNED wait pool", async () => {
@@ -234,8 +234,8 @@ describeDb("pooling (Phase 5)", () => {
     expect(r.ride.pool?.id).toBe(n.ride.pool?.id);
     expect(r.ride.pool?.occupiedSeats).toBe(2);
 
-    // Nusrat Banani → Mohakhali: 3000 + 2932 - 1483 = 4449 paisa.
-    // Rafiq  Banani → Gulshan 1: 3000 + 1140 - 1035 = 3105 paisa.
+    // Nusrat Banani → Mohakhali: 3000 + 2332 - 1333 = 3999 paisa.
+    // Rafiq  Banani → Gulshan 1: 3000 + 2303 - 1326 = 3977 paisa.
     // (deterministic pinned values, see test/fare.test.ts).
     const [nusratFare] = await db
       .select()
@@ -245,12 +245,12 @@ describeDb("pooling (Phase 5)", () => {
       .select()
       .from(fares)
       .where(eq(fares.rideRequestId, r.ride.id));
-    expect(nusratFare?.poolDiscountPaisa).toBe(1483);
-    expect(nusratFare?.finalFarePaisa).toBe(4449);
+    expect(nusratFare?.poolDiscountPaisa).toBe(1333);
+    expect(nusratFare?.finalFarePaisa).toBe(3999);
     expect(nusratFare?.baseFarePaisa).toBe(3000);
-    expect(nusratFare?.distanceChargePaisa).toBe(2932);
-    expect(rafiqFare?.poolDiscountPaisa).toBe(1035);
-    expect(rafiqFare?.finalFarePaisa).toBe(3105);
+    expect(nusratFare?.distanceChargePaisa).toBe(2332);
+    expect(rafiqFare?.poolDiscountPaisa).toBe(1326);
+    expect(rafiqFare?.finalFarePaisa).toBe(3977);
   });
 
   it("never exceeds Bullet's capacity (sequential claims)", async () => {
@@ -309,22 +309,22 @@ describeDb("pooling (Phase 5)", () => {
   it("a 2-seat ride claims two seats; a later 1-seat ride only fits with 3 free", async () => {
     const big = await rides.createRequest(NUSRAT, booking({ requestedSeats: 2 }));
     expect(big.ride.pool?.occupiedSeats).toBe(2);
-    // Single member → no discount; total = 2 × 5932.
-    expect(big.ride.fare.finalFarePaisa).toBe(5932);
-    expect(big.ride.fare.estimatedTotalPaisa).toBe(11864);
+    // Single member → no discount; total = 2 × 5332.
+    expect(big.ride.fare.finalFarePaisa).toBe(5332);
+    expect(big.ride.fare.estimatedTotalPaisa).toBe(10664);
 
     const rafiq = await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
     expect(rafiq.ride.status).toBe("MATCHED");
     expect(rafiq.ride.pool?.occupiedSeats).toBe(3);
 
     // The two members now both get the 25 % pooled discount.
-    expect(big.ride.fare.estimatedTotalPaisa).toBe(11864);
+    expect(big.ride.fare.estimatedTotalPaisa).toBe(10664);
     const [bigFare] = await db
       .select()
       .from(fares)
       .where(eq(fares.rideRequestId, big.ride.id));
-    expect(bigFare?.poolDiscountPaisa).toBe(1483);
-    expect(bigFare?.finalFarePaisa).toBe(4449);
+    expect(bigFare?.poolDiscountPaisa).toBe(1333);
+    expect(bigFare?.finalFarePaisa).toBe(3999);
 
     // No seat left for a third in THIS pool — Shirin gets her own wait pool
     // (ADR-022: a claim that no longer fits never stalls REQUESTED).
@@ -337,7 +337,7 @@ describeDb("pooling (Phase 5)", () => {
   it("a 3-seat request fills its wait pool; the next request gets its own", async () => {
     const full = await rides.createRequest(NUSRAT, booking({ requestedSeats: 3 }));
     expect(full.ride.pool?.occupiedSeats).toBe(3);
-    expect(full.ride.fare.estimatedTotalPaisa).toBe(3 * 5932);
+    expect(full.ride.fare.estimatedTotalPaisa).toBe(3 * 5332);
 
     const late = await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
     expect(late.ride.status).toBe("MATCHED");
@@ -405,7 +405,7 @@ describeDb("pooling (Phase 5)", () => {
       .from(fares)
       .where(eq(fares.rideRequestId, n.ride.id));
     expect(nusratFare?.poolDiscountPaisa).toBe(0);
-    expect(nusratFare?.finalFarePaisa).toBe(5932);
+    expect(nusratFare?.finalFarePaisa).toBe(5332);
   });
 
   it("cancelling the last member terminates the pool", async () => {
@@ -452,7 +452,7 @@ describeDb("pooling (Phase 5)", () => {
       .where(eq(fares.rideRequestId, r.ride.id));
     // Full refund: base + distance fully reversed via the discount term,
     // final = 0 (all fares CHECKs stay satisfied).
-    expect(rafiqFare?.poolDiscountPaisa).toBe(3000 + 1140);
+    expect(rafiqFare?.poolDiscountPaisa).toBe(3000 + 2303);
     expect(rafiqFare?.finalFarePaisa).toBe(0);
 
     // Nusrat is alone again: no pooled discount.
@@ -460,7 +460,7 @@ describeDb("pooling (Phase 5)", () => {
       .select()
       .from(fares)
       .where(eq(fares.rideRequestId, n.ride.id));
-    expect(nusratFare?.finalFarePaisa).toBe(5932);
+    expect(nusratFare?.finalFarePaisa).toBe(5332);
     expect(nusratFare?.poolDiscountPaisa).toBe(0);
   });
 

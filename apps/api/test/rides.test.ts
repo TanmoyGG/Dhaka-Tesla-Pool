@@ -230,15 +230,15 @@ describeDb("ride requests (Phase 4)", () => {
     expect(ride.requestedSeats).toBe(1);
 
     // Single-member pool: no pooled discount (ADR-017), Nusrat keeps the
-    // hand-computed Phase 4 estimate (BDT 59.32). See test/fare.test.ts.
+    // hand-computed Phase 4 estimate (BDT 53.32). See test/fare.test.ts.
     expect(ride.fare).toEqual({
       currency: "BDT",
       baseFarePaisa: 3000,
-      distanceChargePaisa: 2932,
+      distanceChargePaisa: 2332,
       poolDiscountPaisa: 0,
-      finalFarePaisa: 5932,
-      perSeatFarePaisa: 5932,
-      estimatedTotalPaisa: 5932,
+      finalFarePaisa: 5332,
+      perSeatFarePaisa: 5332,
+      estimatedTotalPaisa: 5332,
     });
 
     // No driver has accepted the wait pool yet: vehicle/driver are NULL until
@@ -266,7 +266,7 @@ describeDb("ride requests (Phase 4)", () => {
       .select()
       .from(fares)
       .where(eq(fares.rideRequestId, ride.id));
-    expect(fareRow?.finalFarePaisa).toBe(5932);
+    expect(fareRow?.finalFarePaisa).toBe(5332);
     const historyRows = await db
       .select()
       .from(rideStatusHistory)
@@ -287,8 +287,8 @@ describeDb("ride requests (Phase 4)", () => {
 
   it("scales the estimated total by the requested seats (stored components per seat)", async () => {
     // Rafiq's 2-seat ride joins Nusrat's 1-seat pool: both members get the
-    // 25 % pooled discount — 3000 + 2932 - round(1482.97…) = 5932 - 1483 =
-    // 4449/seat. Bullet's 3 seats are now occupied.
+    // 25 % pooled discount — 3000 + 2332 - round(1332.97…) = 5332 - 1333 =
+    // 3999/seat. Bullet's 3 seats are now occupied.
     const nusrat = await app.inject({
       method: "POST",
       url: "/api/rides",
@@ -308,10 +308,10 @@ describeDb("ride requests (Phase 4)", () => {
     expect(ride.requestedSeats).toBe(2);
 
     expect(ride.fare.baseFarePaisa).toBe(3000);
-    expect(ride.fare.distanceChargePaisa).toBe(2932);
-    expect(ride.fare.poolDiscountPaisa).toBe(1483);
-    expect(ride.fare.finalFarePaisa).toBe(4449);
-    expect(ride.fare.estimatedTotalPaisa).toBe(8898);
+    expect(ride.fare.distanceChargePaisa).toBe(2332);
+    expect(ride.fare.poolDiscountPaisa).toBe(1333);
+    expect(ride.fare.finalFarePaisa).toBe(3999);
+    expect(ride.fare.estimatedTotalPaisa).toBe(7998);
 
     expect(ride.status).toBe("MATCHED");
     expect(ride.pool?.capacitySnapshot).toBe(3);
@@ -337,7 +337,7 @@ describeDb("ride requests (Phase 4)", () => {
     });
     expect(retry.statusCode).toBe(200);
     expect(retry.json().ride.id).toBe(firstRide.id);
-    expect(retry.json().ride.fare.finalFarePaisa).toBe(5932);
+    expect(retry.json().ride.fare.finalFarePaisa).toBe(5332);
 
     // Exactly one ride + one fare + one journal row for the key.
     const rows = await db
@@ -618,11 +618,11 @@ describeDb("ride requests (Phase 4)", () => {
     expect(res.json().fare).toEqual({
       currency: "BDT",
       baseFarePaisa: 3000,
-      distanceChargePaisa: 2932,
+      distanceChargePaisa: 2332,
       poolDiscountPaisa: 0,
-      finalFarePaisa: 5932,
-      perSeatFarePaisa: 5932,
-      estimatedTotalPaisa: 5932,
+      finalFarePaisa: 5332,
+      perSeatFarePaisa: 5332,
+      estimatedTotalPaisa: 5332,
     });
 
     const seats = await app.inject({
@@ -635,7 +635,7 @@ describeDb("ride requests (Phase 4)", () => {
         requestedSeats: "2",
       },
     });
-    expect(seats.json().fare.estimatedTotalPaisa).toBe(11864);
+    expect(seats.json().fare.estimatedTotalPaisa).toBe(10664);
 
     // Estimating never creates a ride.
     const list = await app.inject({

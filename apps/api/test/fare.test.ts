@@ -23,8 +23,8 @@ const ZONES: Record<string, ZonePoint> = Object.fromEntries(
 describe("fare estimate (Phase 4)", () => {
   it("computes a plausible great-circle distance Banani -> Mohakhali", () => {
     const km = haversineKm(ZONES["Banani"], ZONES["Mohakhali"]);
-    expect(km).toBeGreaterThan(1.8);
-    expect(km).toBeLessThan(2.0);
+    expect(km).toBeGreaterThan(1.4);
+    expect(km).toBeLessThan(1.6);
   });
 
   it("rounds half-up at the paisa", () => {
@@ -34,10 +34,10 @@ describe("fare estimate (Phase 4)", () => {
   });
 
   // Nusrat: Banani -> Mohakhali (1 seat). Hand-computed expected estimate:
-  // distance ~1.879 km, road 2.443 km, charge round(2.443 * 1200) = 2932 paisa,
-  // final 3000 + 2932 = 5932 paisa (BDT 59.32). The DECIMAL_BASE-PAISA story
+  // distance ~1.495 km, road 1.943 km, charge round(1.943 * 1200) = 2332 paisa,
+  // final 3000 + 2332 = 5332 paisa (BDT 53.32). The DECIMAL_BASE-PAISA story
   // value — pinned here and in the integration test.
-  it("estimates Nusrat's Banani -> Mohakhali fare at 5932 paisa", () => {
+  it("estimates Nusrat's Banani -> Mohakhali fare at 5332 paisa", () => {
     const fare = computeInitialFare({
       pickup: ZONES["Banani"],
       destination: ZONES["Mohakhali"],
@@ -46,24 +46,24 @@ describe("fare estimate (Phase 4)", () => {
     expect(fare).toEqual({
       currency: "BDT",
       baseFarePaisa: 3000,
-      distanceChargePaisa: 2932,
+      distanceChargePaisa: 2332,
       poolDiscountPaisa: 0,
-      finalFarePaisa: 5932,
-      perSeatFarePaisa: 5932,
-      estimatedTotalPaisa: 5932,
+      finalFarePaisa: 5332,
+      perSeatFarePaisa: 5332,
+      estimatedTotalPaisa: 5332,
     });
   });
 
-  // Rafiq: Banani -> Gulshan 1 (1 seat). distance ~0.731 km, road 0.950 km,
-  // charge round(0.950 * 1200) = 1140 paisa, final 3000 + 1140 = 4140 paisa.
-  it("estimates Rafiq's Banani -> Gulshan 1 fare at 4140 paisa", () => {
+  // Rafiq: Banani -> Gulshan 1 (1 seat). distance ~1.476 km, road 1.919 km,
+  // charge round(1.919 * 1200) = 2303 paisa, final 3000 + 2303 = 5303 paisa.
+  it("estimates Rafiq's Banani -> Gulshan 1 fare at 5303 paisa", () => {
     const fare = computeInitialFare({
       pickup: ZONES["Banani"],
       destination: ZONES["Gulshan 1"],
       requestedSeats: 1,
     });
-    expect(fare.finalFarePaisa).toBe(4140);
-    expect(fare.distanceChargePaisa).toBe(1140);
+    expect(fare.finalFarePaisa).toBe(5303);
+    expect(fare.distanceChargePaisa).toBe(2303);
   });
 
   it("scales the total by requested seats but keeps stored components per seat", () => {
@@ -81,7 +81,7 @@ describe("fare estimate (Phase 4)", () => {
     expect(double.finalFarePaisa).toBe(single.finalFarePaisa);
     expect(double.distanceChargePaisa).toBe(single.distanceChargePaisa);
     expect(double.estimatedTotalPaisa).toBe(single.estimatedTotalPaisa * 2);
-    expect(double.estimatedTotalPaisa).toBe(2 * 5932);
+    expect(double.estimatedTotalPaisa).toBe(2 * 5332);
   });
 
   it("always satisfies final = base + distance - discount (DB invariant)", () => {
@@ -126,14 +126,14 @@ describe("pooled discount (Phase 5, ADR-017)", () => {
     expect(POOLED_DISCOUNT_MIN_MEMBERS).toBe(2);
   });
 
-  it("computes Nusrat's pooled fare: 5932 - 1483 = 4449 paisa", () => {
-    expect(pooledDiscountPaisa(3000, 2932)).toBe(1483);
-    expect(3000 + 2932 - pooledDiscountPaisa(3000, 2932)).toBe(4449);
+  it("computes Nusrat's pooled fare: 5332 - 1333 = 3999 paisa", () => {
+    expect(pooledDiscountPaisa(3000, 2332)).toBe(1333);
+    expect(3000 + 2332 - pooledDiscountPaisa(3000, 2332)).toBe(3999);
   });
 
-  it("computes Rafiq's pooled fare: 4140 - 1035 = 3105 paisa", () => {
-    expect(pooledDiscountPaisa(3000, 1140)).toBe(1035);
-    expect(3000 + 1140 - pooledDiscountPaisa(3000, 1140)).toBe(3105);
+  it("computes Rafiq's pooled fare: 5303 - 1326 = 3977 paisa", () => {
+    expect(pooledDiscountPaisa(3000, 2303)).toBe(1326);
+    expect(3000 + 2303 - pooledDiscountPaisa(3000, 2303)).toBe(3977);
   });
 
 it("rounds half-up to whole paisa deterministically", () => {

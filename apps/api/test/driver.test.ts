@@ -621,7 +621,7 @@ describeDb("driver workflow (Phase 6)", () => {
       .from(fares)
       .where(eq(fares.rideRequestId, n.ride.id));
     expect(nusratFare?.poolDiscountPaisa).toBe(0);
-    expect(nusratFare?.finalFarePaisa).toBe(5932);
+    expect(nusratFare?.finalFarePaisa).toBe(5332);
   });
 
   it("cancelling the last member at DRIVER_ARRIVED empties and terminates the pool", async () => {
