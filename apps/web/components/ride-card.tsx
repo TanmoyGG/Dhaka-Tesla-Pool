@@ -19,7 +19,9 @@ export function RideCard({ ride }: { ride: RideView }) {
       <p className="card-seats text-muted">
         {ride.requestedSeats} seat{ride.requestedSeats === 1 ? "" : "s"} ·{" "}
         {ride.pool
-          ? `${ride.pool.occupiedSeats}/${ride.pool.capacitySnapshot} seats filled · ${ride.pool.vehicleName} (${ride.pool.driverName})`
+          ? ride.pool.driverName && ride.pool.vehicleName
+            ? `${ride.pool.occupiedSeats}/${ride.pool.capacitySnapshot} seats filled · ${ride.pool.vehicleName} (${ride.pool.driverName})`
+            : `${ride.pool.occupiedSeats}/${ride.pool.capacitySnapshot} seats filled · waiting for a driver`
           : "not matched yet"}
       </p>
 

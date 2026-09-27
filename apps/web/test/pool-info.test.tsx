@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { PoolInfo } from "@/components/pool-info";
-import { makeRidePool } from "./fixtures";
+import { makeRidePool, makeWaitRidePool } from "./fixtures";
 
 describe("PoolInfo", () => {
   it("explains the request is still unmatched", () => {
@@ -18,6 +18,14 @@ describe("PoolInfo", () => {
 
     expect(screen.getByText("Jashim Ahmed")).toBeInTheDocument();
     expect(screen.getByText("Bullet")).toBeInTheDocument();
+    expect(screen.getByText("1 of 3 filled (33%)")).toBeInTheDocument();
+  });
+
+  it("shows a waiting-for-a-driver state for an unassigned wait pool", () => {
+    render(<PoolInfo pool={makeWaitRidePool()} />);
+
+    expect(screen.getByText("Waiting for a driver…")).toBeInTheDocument();
+    expect(screen.getByText("—")).toBeInTheDocument();
     expect(screen.getByText("1 of 3 filled (33%)")).toBeInTheDocument();
   });
 

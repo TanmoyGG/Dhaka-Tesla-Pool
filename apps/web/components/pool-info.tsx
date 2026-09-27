@@ -12,6 +12,12 @@ export function PoolInfo({ pool }: { pool: RidePoolView | null }) {
     );
   }
 
+  // A MATCHED pool with no driver/Tesla is an UNASSIGNED wait pool (ADR-022):
+  // your request is queued in the driver lobby for any eligible driver to
+  // claim first-wins. No driver is assigned yet, so there is no driver or
+  // Tesla to show.
+  const waitingForDriver = !pool.driverName || !pool.vehicleName;
+
   const isShared = pool.occupiedSeats > 1;
   const fill = Math.round((pool.occupiedSeats / pool.capacitySnapshot) * 100);
 
@@ -19,11 +25,11 @@ export function PoolInfo({ pool }: { pool: RidePoolView | null }) {
     <dl className="dl">
       <div>
         <dt>Driver</dt>
-        <dd>{pool.driverName}</dd>
+        <dd>{waitingForDriver ? "Waiting for a driver…" : pool.driverName}</dd>
       </div>
       <div>
         <dt>Tesla</dt>
-        <dd>{pool.vehicleName}</dd>
+        <dd>{waitingForDriver ? "—" : pool.vehicleName}</dd>
       </div>
       <div>
         <dt>Seats</dt>

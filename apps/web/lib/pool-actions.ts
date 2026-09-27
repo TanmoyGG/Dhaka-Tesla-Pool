@@ -14,8 +14,10 @@ export interface NextPoolAction {
 export function nextPoolAction(pool: DriverPoolView): NextPoolAction | null {
   switch (pool.status) {
     case "MATCHED":
-      // accept is a CONFIRMATION (ADR-016); once accepted the pool stays
-      // MATCHED and the next move is to arrive.
+      // Accept is the FIRST-WINS claim of an UNASSIGNED wait pool (ADR-022);
+      // once accepted the pool stays MATCHED and the next move is to arrive.
+      // The discriminator is accepted_at: a pool the driver owns always has it
+      // set (backend CHECK constraint), an unclaimed lobby pool never does.
       return pool.acceptedAt
         ? { action: "arrive", label: "I have arrived" }
         : { action: "accept", label: "Accept ride" };

@@ -38,9 +38,21 @@ describe("describeApiError", () => {
     );
   });
 
-  it("falls back to the server message for domain codes", () => {
+  it("maps VEHICLE_OFFLINE to a go-online instruction", () => {
     expect(describeApiError(new ApiError("VEHICLE_OFFLINE", "Bullet is offline"))).toBe(
-      "This Tesla is offline. Go online in your dashboard before accepting the ride.",
+      "No Tesla of yours can carry this ride right now. Go online in your dashboard and try again.",
+    );
+  });
+
+  it("maps POOL_ALREADY_ACCEPTED (a lost accept race) to a refresh hint", () => {
+    expect(describeApiError(new ApiError("POOL_ALREADY_ACCEPTED", "no"))).toContain(
+      "Another driver just claimed",
+    );
+  });
+
+  it("maps POOL_NOT_ACCEPTABLE to a refresh hint", () => {
+    expect(describeApiError(new ApiError("POOL_NOT_ACCEPTABLE", "no"))).toContain(
+      "no longer waiting to be accepted",
     );
   });
 
@@ -82,18 +94,15 @@ describe("display formatters", () => {
 });
 
 describe("driver lifecycle mapping (next legal action)", () => {
-  it("a fresh MATCHED pool offers accept", () => {
-    expect(nextPoolAction(makeDriverPool())).toEqual({
+  it("an UNASSIGNED MATCHED wait pool offers accept (first-wins claim)", () => {
+    expect(nextPoolAction(makeDriverPool({ vehicle: null, acceptedAt: null }))).toEqual({
       action: "accept",
       label: "Accept ride",
     });
   });
 
-  it("an accepted-but-unstarted pool offers arrive", () => {
-    const pool = makeDriverPool({
-      acceptedAt: "2026-09-27T10:05:00.000Z",
-    });
-    expect(nextPoolAction(pool)).toEqual({
+  it("a pool the driver accepted already moves on to arrive", () => {
+    expect(nextPoolAction(makeDriverPool())).toEqual({
       action: "arrive",
       label: "I have arrived",
     });

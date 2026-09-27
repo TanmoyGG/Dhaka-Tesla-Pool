@@ -55,6 +55,21 @@ export function makeRidePool(overrides: Partial<RidePoolView> = {}): RidePoolVie
   };
 }
 
+// An UNASSIGNED wait pool (ADR-022): MATCHED but with no driver or Tesla,
+// waiting in the lobby for a driver to claim it first-wins.
+export function makeWaitRidePool(
+  overrides: Partial<RidePoolView> = {},
+): RidePoolView {
+  return makeRidePool({
+    id: "d1f9d4a0-0000-0000-0000-000000000007",
+    vehicleId: null,
+    vehicleName: null,
+    driverId: null,
+    driverName: null,
+    ...overrides,
+  });
+}
+
 export function makeRide(overrides: Partial<RideView> = {}): RideView {
   const pickupZone = makeZone();
   const destinationZone = makeZone({ id: "b1a60c28-92e6-4f87-b2a4-6f5e8f3d11bb", name: "Mohakhali" });
@@ -88,6 +103,9 @@ export function makeDriverMember(
   };
 }
 
+// A pool on the DRIVER surface. Defaults to an ACCEPTED pool (owned by
+// Jashim, Bullet assigned) which is what the "Your open pools" list actually
+// contains; use makeWaitPool() for lobby/unassigned cases.
 export function makeDriverPool(
   overrides: Partial<DriverPoolView> = {},
 ): DriverPoolView {
@@ -98,7 +116,7 @@ export function makeDriverPool(
     capacitySnapshot: 3,
     occupiedSeats: 1,
     vehicle: { id: BULLET_ID, name: "Bullet", capacity: 3, isOnline: true },
-    acceptedAt: null,
+    acceptedAt: "2026-09-27T10:05:00.000Z",
     startedAt: null,
     completedAt: null,
     createdAt: "2026-09-27T10:00:00.000Z",
@@ -106,4 +124,17 @@ export function makeDriverPool(
     members: [member],
     ...overrides,
   };
+}
+
+// An UNASSIGNED pool in the driver lobby (ADR-022): MATCHED, no vehicle, and
+// acceptedAt null — the CHECK-invariant combination the backend allows.
+export function makeWaitPool(
+  overrides: Partial<DriverPoolView> = {},
+): DriverPoolView {
+  return makeDriverPool({
+    id: "d1f9d4a0-0000-0000-0000-000000000007",
+    vehicle: null,
+    acceptedAt: null,
+    ...overrides,
+  });
 }

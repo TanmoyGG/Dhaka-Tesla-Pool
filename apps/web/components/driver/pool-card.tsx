@@ -18,7 +18,7 @@ export function DriverPoolCard({
   return (
     <article className="card">
       <div className="row space-between">
-        <h3 className="card-title">{pool.vehicle.name}</h3>
+        <h3 className="card-title">{pool.vehicle?.name ?? "Waiting for a driver"}</h3>
         <StatusBadge status={pool.status} />
       </div>
 

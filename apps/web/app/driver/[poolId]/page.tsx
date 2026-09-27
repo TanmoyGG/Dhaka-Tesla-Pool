@@ -34,7 +34,7 @@ export default function DriverPoolDetailPage() {
           return (
             <article className="card">
               <div className="row space-between">
-                <h2>{current.vehicle.name}</h2>
+                <h2>{current.vehicle?.name ?? "Unassigned pool"}</h2>
                 <StatusBadge status={current.status} />
               </div>
 
@@ -51,7 +51,7 @@ export default function DriverPoolDetailPage() {
                 </div>
                 <div>
                   <dt>Vehicle online</dt>
-                  <dd>{current.vehicle.isOnline ? "yes" : "no"}</dd>
+                  <dd>{current.vehicle ? (current.vehicle.isOnline ? "yes" : "no") : "—"}</dd>
                 </div>
                 <div>
                   <dt>Created</dt>

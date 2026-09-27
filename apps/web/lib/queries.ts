@@ -229,6 +229,24 @@ export function useDriverPools() {
   });
 }
 
+// The driver lobby (ADR-022): every UNASSIGNED MATCHED pool waiting for an
+// eligible driver to claim it first-wins, newest first. Blocking live by
+// construction — the lobby shrinks the moment any driver accepts.
+export function useAvailablePools() {
+  const { getToken } = useAuth();
+  return useQuery({
+    queryKey: ["driver", "pools", "available"],
+    queryFn: async () => {
+      const response = await apiGet<DriverPoolsResponse>(
+        "/api/driver/pools/available",
+        getToken,
+      );
+      return response.pools;
+    },
+    refetchInterval: pollWhileActive(),
+  });
+}
+
 export function useDriverPool(poolId: string | undefined) {
   const { getToken } = useAuth();
   return useQuery({
@@ -278,6 +296,11 @@ function useDriverPoolAction(action: DriverPoolAction) {
       queryClient.invalidateQueries({ queryKey: ["driver", "pools"] });
       queryClient.invalidateQueries({ queryKey: ["driver", "pools", pool.id] });
       queryClient.invalidateQueries({ queryKey: ["driver", "pools", "history"] });
+      // Accepting drains the lobby; the prefix above already covers it, but
+      // the explicit key keeps the intent visible (ADR-022).
+      queryClient.invalidateQueries({
+        queryKey: ["driver", "pools", "available"],
+      });
     },
   });
 }

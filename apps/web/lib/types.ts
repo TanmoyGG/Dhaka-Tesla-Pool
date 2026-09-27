@@ -46,15 +46,17 @@ export interface FareView {
 }
 
 // The pool a PASSENGER rides in (rides/service.ts): driver + Tesla + fill.
+// driver/Tesla are NULL while the pool is an UNASSIGNED wait pool waiting for
+// a driver to accept it (ADR-022); set once a driver claims it first-wins.
 export interface RidePoolView {
   id: string;
   status: RideStatus;
   capacitySnapshot: number;
   occupiedSeats: number;
-  vehicleId: string;
-  vehicleName: string;
-  driverId: string;
-  driverName: string;
+  vehicleId: string | null;
+  vehicleName: string | null;
+  driverId: string | null;
+  driverName: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -90,7 +92,14 @@ export interface DriverPoolView {
   status: RideStatus;
   capacitySnapshot: number;
   occupiedSeats: number;
-  vehicle: { id: string; name: string; capacity: number; isOnline: boolean };
+  // NULL while the pool is an UNASSIGNED wait pool in the driver lobby
+  // (ADR-022); set once a driver accepts it.
+  vehicle: {
+    id: string;
+    name: string;
+    capacity: number;
+    isOnline: boolean;
+  } | null;
   acceptedAt: string | null;
   startedAt: string | null;
   completedAt: string | null;

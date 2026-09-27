@@ -5,7 +5,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { PoolActions } from "@/components/driver/pool-actions";
-import { makeDriverPool } from "./fixtures";
+import { makeDriverPool, makeWaitPool } from "./fixtures";
 
 const queries = vi.hoisted(() => ({
   useAcceptPool: vi.fn(),
@@ -37,10 +37,10 @@ describe("PoolActions", () => {
     mockHook(queries.useCompletePool, completeMutate);
   });
 
-  it("offers accept on a fresh MATCHED pool", () => {
-    render(<PoolActions pool={makeDriverPool()} />);
+  it("offers accept on a fresh unassigned MATCHED wait pool", () => {
+    render(<PoolActions pool={makeWaitPool()} />);
     fireEvent.click(screen.getByRole("button", { name: "Accept ride" }));
-    expect(acceptMutate).toHaveBeenCalledWith("d1f9d4a0-0000-0000-0000-000000000001", expect.any(Object));
+    expect(acceptMutate).toHaveBeenCalledWith("d1f9d4a0-0000-0000-0000-000000000007", expect.any(Object));
   });
 
   it("offers arrive once accepted, start when arrived, complete when started", () => {

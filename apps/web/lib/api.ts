@@ -73,12 +73,17 @@ export async function apiPost<T>(
 
 // Maps an ApiError to a user-facing message. Non-ApiError failures get a
 // generic fallback. The "normal race" codes (INVALID_STATE_TRANSITION,
-// ACTIVE_RIDE_EXISTS, DRIVER_HAS_ACTIVE_POOL) are expected in this domain and
-// get calm, actionable messages instead of raw server text:
+// ACTIVE_RIDE_EXISTS, DRIVER_HAS_ACTIVE_POOL, POOL_ALREADY_ACCEPTED,
+// POOL_NOT_ACCEPTABLE, VEHICLE_OFFLINE) are expected in this domain and get
+// calm, actionable messages instead of raw server text:
 //   - INVALID_STATE_TRANSITION: the pool moved on between render and submit.
 //   - ACTIVE_RIDE_EXISTS: passenger already owns a non-terminal ride; the UI
 //     usually hides the booking form first (defense-in-depth for the race).
-//   - DRIVER_HAS_ACTIVE_POOL: going offline while a trip is open is refused.
+//   - DRIVER_HAS_ACTIVE_POOL: one active trip per driver — going offline or
+//     accepting a second pool while a trip is open is refused (ADR-022).
+//   - POOL_ALREADY_ACCEPTED: the first-wins accept race — another driver won.
+//   - POOL_NOT_ACCEPTABLE: the pool left MATCHED between render and submit.
+//   - VEHICLE_OFFLINE: no online Tesla of the driver's can carry the pool.
 export function describeApiError(error: unknown): string {
   if (error instanceof ApiError) {
     if (error.code === "INVALID_STATE_TRANSITION") {
@@ -88,10 +93,16 @@ export function describeApiError(error: unknown): string {
       return "You already have an active ride. Complete or cancel it before booking another.";
     }
     if (error.code === "DRIVER_HAS_ACTIVE_POOL") {
-      return "You have an active trip. Finish or cancel it before going offline.";
+      return "You already have an active trip. Finish it first — either complete it, wait for it to complete, or cancel it before going offline or accepting another pool.";
+    }
+    if (error.code === "POOL_ALREADY_ACCEPTED") {
+      return "Another driver just claimed this ride. Refresh — the request may still be waiting in a pool that is still open.";
+    }
+    if (error.code === "POOL_NOT_ACCEPTABLE") {
+      return "This ride is no longer waiting to be accepted. Refresh to see its current status.";
     }
     if (error.code === "VEHICLE_OFFLINE") {
-      return "This Tesla is offline. Go online in your dashboard before accepting the ride.";
+      return "No Tesla of yours can carry this ride right now. Go online in your dashboard and try again.";
     }
     if (error.code === "FORBIDDEN") {
       return "You do not have permission to do that.";
