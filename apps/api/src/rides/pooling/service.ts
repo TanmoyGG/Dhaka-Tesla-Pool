@@ -44,6 +44,7 @@ import { alias } from "drizzle-orm/pg-core";
 import { isUniqueViolation } from "../../db/postgres-errors.js";
 import type { AppDatabase } from "../../db/index.js";
 import {
+  fares,
   poolMembers,
   pools,
   rideRequests,
@@ -89,11 +90,70 @@ interface MatchCandidate {
 }
 
 // ---------------------------------------------------------------------------
-// Driver hub views (Phase 6, ADR-019). Deliberately NO fares and NO other
-// drivers' data: the driver sees who is riding with them (name, seats, zones)
-// so they can run the trip — individual per-passenger fares stay off the
-// driver surface (P9).
+// Driver hub views (Phase 6, ADR-019; P9 relaxation, ADR-021/ADR-022). The
+// driver sees who is riding with them (name, seats, zones) AND the money they
+// collect — read from the already-stored `fares` rows (ACTIVE members only),
+// never recomputed here. No other drivers' data is exposed.
 // ---------------------------------------------------------------------------
+
+// The stored fare amount a driver collects from one passenger. Mirrors the
+// passenger surface's derivation (rides/service.ts fareView): `fares` rows are
+// PER SEAT (ADR-015), so totalPaisa = finalFarePaisa × member.seats — an exact
+// integer multiplication, no division, currency snapshot 'BDT'.
+export interface DriverPoolMemberFareView {
+  currency: string;
+  perSeatFarePaisa: number;
+  totalPaisa: number;
+}
+
+// The pool's total driver earnings: sum of the ACTIVE members' collected
+// amounts. Read-only aggregate of stored fare rows.
+export interface DriverPoolEarningsView {
+  currency: string;
+  totalCollectedPaisa: number;
+}
+
+function toDriverPoolMember(member: {
+  rideRequestId: string;
+  passengerId: string;
+  passengerName: string;
+  pickupZoneId: string;
+  pickupZoneName: string;
+  destinationZoneId: string;
+  destinationZoneName: string;
+  seats: number;
+  fareCurrency: string;
+  fareFinalPaisa: number;
+}): DriverPoolMemberView {
+  const perSeatFarePaisa = member.fareFinalPaisa;
+  return {
+    rideRequestId: member.rideRequestId,
+    passengerId: member.passengerId,
+    passengerName: member.passengerName,
+    pickupZoneId: member.pickupZoneId,
+    pickupZoneName: member.pickupZoneName,
+    destinationZoneId: member.destinationZoneId,
+    destinationZoneName: member.destinationZoneName,
+    seats: member.seats,
+    fare: {
+      currency: member.fareCurrency,
+      perSeatFarePaisa,
+      totalPaisa: perSeatFarePaisa * member.seats,
+    },
+  };
+}
+
+function poolEarnings(members: DriverPoolMemberView[]): DriverPoolEarningsView {
+  const totalCollectedPaisa = members.reduce(
+    (sum, member) => sum + member.fare.totalPaisa,
+    0,
+  );
+  // Every fare row carries the same fixed currency snapshot ('BDT'); take it
+  // from the first member. A listed pool always has >= 1 ACTIVE member, so the
+  // fallback is defensive only.
+  const currency = members[0]?.fare.currency ?? "BDT";
+  return { currency, totalCollectedPaisa };
+}
 
 export interface DriverPoolMemberView {
   rideRequestId: string;
@@ -104,6 +164,9 @@ export interface DriverPoolMemberView {
   destinationZoneId: string;
   destinationZoneName: string;
   seats: number;
+  // The money this passenger pays: per seat + their seat total (integer paisa).
+  // ACTIVE members only — a LEFT passenger is never on board and never earns.
+  fare: DriverPoolMemberFareView;
 }
 
 export interface DriverPoolView {
@@ -127,6 +190,9 @@ export interface DriverPoolView {
   updatedAt: Date;
   // ACTIVE members only: a LEFT member is history, not a passenger on board.
   members: DriverPoolMemberView[];
+  // Total collected from the ACTIVE members (Σ member.fare.totalPaisa).
+  // Read-only aggregate of the stored fares rows.
+  earnings: DriverPoolEarningsView;
 }
 
 // A read that can run on either the application handle or a transaction handle
@@ -597,6 +663,8 @@ export function createPoolingService(
         destinationZoneId: destinationZone.id,
         destinationZoneName: destinationZone.name,
         seats: poolMembers.seats,
+        fareCurrency: fares.currency,
+        fareFinalPaisa: fares.finalFarePaisa,
       })
       .from(poolMembers)
       .innerJoin(rideRequests, eq(rideRequests.id, poolMembers.rideRequestId))
@@ -606,14 +674,22 @@ export function createPoolingService(
         destinationZone,
         eq(destinationZone.id, rideRequests.destinationZoneId),
       )
+      // Every ride that reached a pool has its stored fare row (created with
+      // the request, ADR-015); ACTIVE members are MATCHED+ by construction, so
+      // the 1:1 unique join is exact — no LEFT member is ever charged here.
+      .innerJoin(fares, eq(fares.rideRequestId, rideRequests.id))
       .where(and(eq(poolMembers.poolId, poolId), eq(poolMembers.status, "ACTIVE")))
       .orderBy(asc(poolMembers.joinedAt), asc(poolMembers.id));
 
+    const viewMembers = members.map(toDriverPoolMember);
     return {
       id: row.pool.id,
       status: row.pool.status,
       capacitySnapshot: row.pool.capacitySnapshot,
-      occupiedSeats: members.reduce((sum, member) => sum + member.seats, 0),
+      occupiedSeats: viewMembers.reduce(
+        (sum, member) => sum + member.seats,
+        0,
+      ),
       vehicle: row.vehicle
         ? {
             id: row.vehicle.id,
@@ -627,7 +703,8 @@ export function createPoolingService(
       completedAt: row.pool.completedAt,
       createdAt: row.pool.createdAt,
       updatedAt: row.pool.updatedAt,
-      members,
+      members: viewMembers,
+      earnings: poolEarnings(viewMembers),
     };
   }
 
@@ -1018,6 +1095,8 @@ export function createPoolingService(
         destinationZoneId: destinationZone.id,
         destinationZoneName: destinationZone.name,
         seats: poolMembers.seats,
+        fareCurrency: fares.currency,
+        fareFinalPaisa: fares.finalFarePaisa,
       })
       .from(poolMembers)
       .innerJoin(rideRequests, eq(rideRequests.id, poolMembers.rideRequestId))
@@ -1027,6 +1106,7 @@ export function createPoolingService(
         destinationZone,
         eq(destinationZone.id, rideRequests.destinationZoneId),
       )
+      .innerJoin(fares, eq(fares.rideRequestId, rideRequests.id))
       .where(
         and(
           inArray(poolMembers.poolId, poolIds),
@@ -1051,7 +1131,9 @@ export function createPoolingService(
     }
 
     return poolRows.map((row) => {
-      const members = membersByPool.get(row.pool.id) ?? [];
+      const members = (membersByPool.get(row.pool.id) ?? []).map(
+        toDriverPoolMember,
+      );
       return {
         id: row.pool.id,
         status: row.pool.status,
@@ -1071,6 +1153,7 @@ export function createPoolingService(
         createdAt: row.pool.createdAt,
         updatedAt: row.pool.updatedAt,
         members,
+        earnings: poolEarnings(members),
       };
     });
   }

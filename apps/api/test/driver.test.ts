@@ -622,6 +622,16 @@ describeDb("driver workflow (Phase 6)", () => {
       .where(eq(fares.rideRequestId, n.ride.id));
     expect(nusratFare?.poolDiscountPaisa).toBe(0);
     expect(nusratFare?.finalFarePaisa).toBe(5332);
+
+    // Driver earnings reflect ONLY the ACTIVE member (Rafiq LEFT): solo 5332.
+    const [activePool] = await driver.listDriverPools(JASHIM.id);
+    expect(activePool!.members.map((m) => m.passengerName)).toEqual([
+      "Nusrat Haque",
+    ]);
+    expect(activePool!.earnings).toEqual({
+      currency: "BDT",
+      totalCollectedPaisa: 5332,
+    });
   });
 
   it("cancelling the last member at DRIVER_ARRIVED empties and terminates the pool", async () => {
@@ -651,7 +661,7 @@ describeDb("driver workflow (Phase 6)", () => {
   // Driver hub reads (list / detail)
   // -------------------------------------------------------------------------
 
-  it("lists only the driver's own ACCEPTED non-terminal pools, newest first, fare-free", async () => {
+  it("lists only the driver's own ACCEPTED non-terminal pools, newest first, with per-member fares + pool earnings", async () => {
     const n = await rides.createRequest(NUSRAT, booking());
     await rides.createRequest(RAFIQ, booking(BOOK_RAFIQ));
     const poolId = n.ride.pool!.id;
@@ -664,6 +674,11 @@ describeDb("driver workflow (Phase 6)", () => {
     const lobby = await driver.getAvailablePools();
     expect(lobby).toHaveLength(1);
     expect(lobby[0]).toMatchObject({ id: poolId, status: "MATCHED", vehicle: null });
+    // The lobby shows potential earnings too: Nusrat + Rafiq pooled = 3999 + 3977.
+    expect(lobby[0]!.earnings).toEqual({
+      currency: "BDT",
+      totalCollectedPaisa: 3999 + 3977,
+    });
 
     await driver.acceptPool(JASHIM.id, poolId);
 
@@ -675,8 +690,13 @@ describeDb("driver workflow (Phase 6)", () => {
       capacitySnapshot: 3,
       occupiedSeats: 2,
       vehicle: { id: SEED_IDS.bullet, name: "Bullet", capacity: 3, isOnline: true },
+      // Pool-level driver earnings: Σ of the ACTIVE members' stored fares.
+      earnings: { currency: "BDT", totalCollectedPaisa: 3999 + 3977 },
     });
-    // Members: names + zones + seats, NO fare fields (P9).
+    // Members: names + zones + seats + the money collected from each. Fares
+    // are read from the STORED rows (never recomputed here): Nusrat's pooled
+    // Banani → Mohakhali fare is 3999 paisa, Rafiq's pooled Banani →
+    // Gulshan 1 fare is 3977 paisa (1 seat each, so total = perSeat).
     expect(list[0].members).toHaveLength(2);
     expect(list[0].members.map((m) => m.passengerName).sort()).toEqual([
       "Nusrat Haque",
@@ -687,11 +707,47 @@ describeDb("driver workflow (Phase 6)", () => {
       destinationZoneName: "Mohakhali",
       seats: 1,
     });
-    expect(list[0]).not.toHaveProperty("fare");
-    expect(list[0].members[0]).not.toHaveProperty("fare");
+    const nusratFare = list[0].members.find(
+      (m) => m.passengerName === "Nusrat Haque",
+    )!.fare;
+    const rafiqFare = list[0].members.find(
+      (m) => m.passengerName === "Rafiq Rahman",
+    )!.fare;
+    expect(nusratFare).toEqual({
+      currency: "BDT",
+      perSeatFarePaisa: 3999,
+      totalPaisa: 3999,
+    });
+    expect(rafiqFare).toEqual({
+      currency: "BDT",
+      perSeatFarePaisa: 3977,
+      totalPaisa: 3977,
+    });
 
     // Another driver sees nothing.
     expect(await driver.listDriverPools(KARIM.id)).toEqual([]);
+  });
+
+  it("scales member fare and pool earnings by the passenger's requested seats", async () => {
+    // Nusrat's 3-seat booking fills a brand-new pool to capacity, so no pooled
+    // discount applies: each seat pays the solo fare 5332 paisa (1 row, PER
+    // SEAT — the driver collects 3 × 5332 = 15996 paisa).
+    const n = await rides.createRequest(NUSRAT, booking({ requestedSeats: 3 }));
+    const poolId = n.ride.pool!.id;
+    await driver.acceptPool(JASHIM.id, poolId);
+
+    const [view] = await driver.listDriverPools(JASHIM.id);
+    expect(view).toMatchObject({ occupiedSeats: 3 });
+    expect(view!.members).toEqual([
+      expect.objectContaining({
+        seats: 3,
+        fare: { currency: "BDT", perSeatFarePaisa: 5332, totalPaisa: 15996 },
+      }),
+    ]);
+    expect(view!.earnings).toEqual({
+      currency: "BDT",
+      totalCollectedPaisa: 15996,
+    });
   });
 
   it("the hub list excludes COMPLETED pools (and ordering is deterministic)", async () => {
@@ -885,6 +941,17 @@ describeDb("driver workflow (Phase 6)", () => {
     expect(history[0]!.completedAt).not.toBeNull();
     expect(history[0]!.occupiedSeats).toBe(1);
     expect(history[0]!.members[0]!.passengerName).toBe("Rafiq Rahman");
+    // History carries the stored earnings too: pool B was Rafiq solo (no
+    // pooled discount) → 1 seat × 5303 paisa.
+    expect(history[0]!.members[0]!.fare).toEqual({
+      currency: "BDT",
+      perSeatFarePaisa: 5303,
+      totalPaisa: 5303,
+    });
+    expect(history[0]!.earnings).toEqual({
+      currency: "BDT",
+      totalCollectedPaisa: 5303,
+    });
 
     // Active pools are NOT history.
     await rides.createRequest(SHIRIN, booking());
@@ -920,6 +987,16 @@ describeDb("driver workflow (Phase 6)", () => {
       expect(history).toHaveLength(1);
       expect(history[0].id).toBe(poolId);
       expect(history[0].status).toBe("COMPLETED");
+      // Nusrat's solo stored fare (5332) flows through the HTTP history wire.
+      expect(history[0].earnings).toEqual({
+        currency: "BDT",
+        totalCollectedPaisa: 5332,
+      });
+      expect(history[0].members[0].fare).toEqual({
+        currency: "BDT",
+        perSeatFarePaisa: 5332,
+        totalPaisa: 5332,
+      });
 
       const passenger = await app.inject({
         method: "GET",
@@ -998,6 +1075,18 @@ describeDb("driver workflow (Phase 6)", () => {
       expect(accept.json().pool.vehicle).toMatchObject({
         id: SEED_IDS.bullet,
         name: "Bullet",
+      });
+      // Driver fare/earnings ride EVERY lifecycle response (additive fields):
+      // Nusrat 3999 + Rafiq 3977 pooled.
+      expect(accept.json().pool.earnings).toEqual({
+        currency: "BDT",
+        totalCollectedPaisa: 3999 + 3977,
+      });
+      expect(accept.json().pool.members).toHaveLength(2);
+      expect(accept.json().pool.members[0].fare).toEqual({
+        currency: "BDT",
+        perSeatFarePaisa: 3999,
+        totalPaisa: 3999,
       });
       // Detail works for the owner after acceptance.
       const detail = await app.inject({
