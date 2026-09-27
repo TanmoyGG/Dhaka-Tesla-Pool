@@ -14,8 +14,10 @@ The canonical story cast is used **consistently** in seed data, tests, demo,
 and docs: **Jashim** drives his three-seat Tesla **Bullet**; **Nusrat** books
 Banani → Mohakhali; **Rafiq** books Banani → Gulshan 1 (overlapping, not
 identical); **Shirin** tries to grab Bullet's last seat moments later
-(the concurrency case). Do not replace them with generic `user1/driver1`
-placeholders.
+(the concurrency case). **Karim** (no Tesla), **Rahim** (Tesla 3, eligible)
+and **Faruq** (Tesla 4) exist so the driver-accept stories (first-wins race,
+no-Tesla refusal, one-accepted-pool-per-driver) use canonical actors too.
+Do not replace them with generic `user1/driver1` placeholders.
 
 ## SOURCE OF TRUTH
 
@@ -124,13 +126,29 @@ Document and honor cancellation-validity assumptions (see requirements §21.B).
 
 ## CONCURRENCY
 
-The system must handle two passengers simultaneously claiming the final
-available seat (Nusrat vs. Shirin on Bullet's last seat). The MVP does **not**
-require a distributed solution. Preferred design direction: **database-backed
-transactional consistency** — PostgreSQL transactions with appropriate row
-locking (`SELECT … FOR UPDATE` on pool/vehicle seat counts). Document the
-approach and what would change at larger scale before implementing. Expect this
-topic in evaluation (see `docs/requirements.md` §14, §15).
+Two concurrency cases matter:
+
+1. **Final-seat capacity** — two passengers simultaneously claim the final
+   available seat (Nusrat vs. Shirin on Bullet's last seat). `claimSeatIn` in
+   the pooling service is the seat-claim **source of truth**: it locks the pool
+   row `SELECT … FOR UPDATE`, re-checks status, derives occupancy from ACTIVE
+   members under the lock, and exactly one winner is admitted. The loser (or
+   any request with no eligible pool) lands MATCHED in a brand-new **unassigned
+   wait pool** — `REQUESTED` is transient-only, capacity can never be exceeded.
+2. **First-wins driver accept** — two drivers simultaneously claim the same
+   unassigned wait pool (Jashim vs. Rahim). `acceptPool` locks the caller's
+   VEHICLE rows, counts owned active pools (excluding the pool being
+   re-accepted, so re-accept is idempotent), then locks the contested POOL row
+   and writes `driver_id`/`vehicle_id`/`accepted_at`; exactly one winner, losers
+   get `409 POOL_ALREADY_ACCEPTED`.
+
+The MVP does **not** require a distributed solution. Preferred design
+direction: **database-backed transactional consistency** — PostgreSQL
+transactions with appropriate row locking (`SELECT … FOR UPDATE`), in the
+documented ADR-020 lock order (vehicle → rides → pool). Document the approach
+and what would change at larger scale (see `docs/decisions.md` ADR-017/020/022,
+`docs/database.md` §7). Expect these topics in evaluation (`docs/requirements.md`
+§14, §15).
 
 ## GEOGRAPHY
 

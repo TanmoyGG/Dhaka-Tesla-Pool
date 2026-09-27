@@ -328,14 +328,17 @@ the ambiguity is explained, and one reasonable MVP assumption is proposed.
 ### C. Pool creation timing ("Multiple requests may share one Tesla")
 - PRD: Pool is a first-class actor; a ride may contain multiple passengers.
 - Ambiguity: Is a pool created when a passenger requests, or only when the driver accepts / when a second passenger matches?
-- MVP assumption (finalized in Phase 5, ADR-016): A `REQUESTED` ride holds no
-  seats until it is matched. Matching runs **inside the create-ride
-  transaction** (ride + fare + history + membership commit together): the ride
-  is either joined to the best eligible existing pool or placed into a newly
-  created pool, and the ride becomes `MATCHED` with a committed membership —
-  seats are only ever consumed by an ACTIVE membership. **Phase 5 has no driver
-  "accept" step**: allocation happens at match time, so a pool begins life in
-  `MATCHED` (`DRIVER_ARRIVED`/accept flows arrive with the driver phase).
+- MVP assumption (finalized in Phase 5, ADR-016; **extended in Phase 6/8,
+  ADR-022**): A `REQUESTED` ride holds no seats until it is matched. Matching
+  runs **inside the create-ride transaction** (ride + fare + history +
+  membership commit together): the ride either joins the best eligible
+  **existing claimed pool** or is placed into a **newly created pool**, and
+  the ride becomes `MATCHED` with a committed membership — seats are only
+  ever consumed by an ACTIVE membership. A new pool is born `MATCHED` with
+  **no assigned driver/Tesla yet** (an *unassigned wait pool*); the driver
+  assignment is now the driver's first-wins **accept** step (ADR-022), which
+  arrives as the driver phase's selection step, so the pool begins life
+  `MATCHED` across both phases.
 
 ### D. Exact fare parameters
 - PRD: `passengerFare = baseFare + distanceCharge − poolDiscount`; must be hand-verifiable.
@@ -392,15 +395,19 @@ the ambiguity is explained, and one reasonable MVP assumption is proposed.
 ### J. Driver going offline with active rides
 - PRD: driver can go online/offline.
 - Ambiguity: Behavior when a driver with an accepted/active ride goes offline.
-- MVP assumption (**realized in Phase 6, ADR-019/020, strict**): A driver
-  **cannot** go offline while **any** of their pools is non-terminal — the
-  toggle is refused (`409 DRIVER_HAS_ACTIVE_POOL`) for a pool in
-  MATCHED → STARTED. This is deliberately strict: a pool the *system* matched
-  to the driver (ADR-016) is assigned work, and flipping the switch must not
-  be a way to duck it. The transition locks the driver's vehicle rows first
-  (ADR-020) so a racing booking can never strand a pool on an offline Tesla.
-  Going offline is allowed only when every pool is terminal (COMPLETED /
-  CANCELLED). No auto-cancel semantics exist (a non-terminal pool blocks the
+- MVP assumption (**realized in Phase 6, ADR-019/020, strict; narrowed in
+  ADR-022**): A driver **cannot** go offline while **any pool they
+  accepted** is non-terminal — the toggle is refused
+  (`409 DRIVER_HAS_ACTIVE_POOL`) for a pool in MATCHED → STARTED owned via
+  `driver_id`. This is deliberately strict: an accepted pool is assigned
+  work, and flipping the switch must not be a way to duck it. The
+  transition locks the driver's vehicle rows first (ADR-020) so a racing
+  booking can never strand a pool on an offline Tesla. Because assignment
+  is now the driver's own first-wins accept (ADR-022), **unassigned wait
+  pools in the lobby never block the toggle** — claiming them is the
+  driver's choice, so it cannot trap them. Going offline is allowed only
+  when every accepted pool is terminal (COMPLETED / CANCELLED). No
+  auto-cancel semantics exist (an accepted non-terminal pool blocks the
   toggle, so nothing is silently cancelled).
 
 ### K. Seats requested per passenger ("…seats" in request)
@@ -424,6 +431,33 @@ the ambiguity is explained, and one reasonable MVP assumption is proposed.
   previous trip is terminal — the Nusrat flow (book → cancel → rebook) depends
   on this. This is a product assumption for a working demo (one passenger cannot
   meaningfully ride two Teslas at once), not a security boundary.
+
+### M. Driver selection of a waiting request ("driver accepts a pooled ride")
+- PRD: driver "accepts" a pooled ride; the passenger surface says "accepted
+  pool". ADR-016/019 treated accept as a confirmation of a system-assigned
+  driver; review asked for an actual driver-selection step where an online
+  driver picks up a waiting request from a lobby.
+- MVP assumption (**realized in Phase 6/8 follow-up, ADR-022**): a request
+  that cannot join an existing pool always lands in a **new `MATCHED` pool
+  with `driver_id`/`vehicle_id`/`accepted_at` NULL** — an *unassigned wait
+  pool* visible in every driver's lobby (`GET /api/driver/pools/available`,
+  identical for all drivers). **Accept is a first-wins claim**: an online
+  driver whose Tesla's `capacity >= pool.capacitySnapshot` locks their
+  VEHICLE rows (ADR-020 order), verifies they do not already own another
+  active pool (`409 DRIVER_HAS_ACTIVE_POOL`, counted with the pool being
+  re-accepted excluded for idempotence), then locks the contested pool row
+  and writes `driver_id`/`vehicle_id`/`accepted_at`; exactly one concurrent
+  accept wins, losers see `409 POOL_ALREADY_ACCEPTED`. No online eligible
+  Tesla → `409 VEHICLE_OFFLINE`.
+- Consequences (all intended, tested): booking no longer depends on driver
+  availability (an offline fleet still receives the ride into a wait pool);
+  going offline is blocked only by **accepted** pools, never by lobby
+  wait pools; arrive/start/complete on an unclaimed pool → `404 NOT_FOUND`
+  (ownership exists only through acceptance); the DB enforces
+  `(driver_id IS NULL) = (vehicle_id IS NULL)`, `driver_id IS NULL OR
+  accepted_at IS NOT NULL`, and one accepted pool per driver/vehicle
+  (migration 0007). Passenger UX shows "Waiting for a driver…" until a
+  driver claims the pool.
 
 ---
 

@@ -338,11 +338,22 @@ erDiagram
 `ride_status` is a PostgreSQL enum type (not a text/varchar) so invalid states
 are rejected by the database and the lifecycle reads clearly in `psql`.
 
-### 5.2 "MATCHED/ACCEPTED" is stored as `MATCHED`
+### 5.2 "MATCHED/ACCEPTED" is stored as `MATCHED` — and an UNASSIGNED pool is `MATCHED` too
 The PRD writes the single state as "MATCHED/ACCEPTED". It is modeled as one enum
-value, `MATCHED`. A pooled request/pool in `MATCHED` has been accepted by the
-driver; there is no separate "ACCEPTED" column or value. One value = one naming
-scheme, no ambiguity in history rows. See also `docs/decisions.md` ADR-012.
+value, `MATCHED`; a pooled request/pool in `MATCHED` has been joined to a pool.
+Since **ADR-022** the driver assignment is the pool's *first-wins accept* step
+(still recorded in `MATCHED`), so `MATCHED` now covers three lives:
+
+- **Unassigned wait pool** — `driver_id`/`vehicle_id`/`accepted_at` all NULL;
+  created for any request that cannot join an existing eligible pool, sitting in
+  the driver lobby until claimed (the normal newborn state after upgrade).
+- **Accepted pool** — the same row once a driver's accept claim commits
+  (`driver_id`/`vehicle_id`/`accepted_at` set); passenger-visible status does
+  not change.
+- **Assigned by join** — a request that joined an already-claimed pool.
+
+The point of one enum value remains: one naming scheme, no ambiguity in history
+rows (`docs/decisions.md` ADR-012/022).
 
 ### 5.3 `pool_id` on `ride_requests` is a convenience; `pool_members` is truth
 The DB's source of truth for "this request rides in this pool" is `pool_members`
@@ -371,13 +382,13 @@ WHERE pool_id = $1 AND status = 'ACTIVE';
 Comparing that sum to `pools.capacity_snapshot` is the capacity check. This
 avoids the classic cache-divergence bug where a cached counter drifts from the
 truth. The DB still enforces the structural bounds (`seats > 0`, snapshots
-positive, one active pool per vehicle, one active membership per request); the
-**aggregate** occupancy vs. capacity check is transactional application logic
-(§7) because it spans rows. **Implemented in Phase 5** (ADR-017): every claim
-re-derives this sum inside a `SELECT … FOR UPDATE` on the pool row, and pool
-**creation** races are settled with `INSERT … ON CONFLICT DO NOTHING RETURNING`
-against `pools_single_active_per_vehicle`, followed by exactly one re-scan to
-join the concurrent winner (§7).
+positive, one accepted pool per driver/vehicle, one active membership per
+request); the **aggregate** occupancy vs. capacity check is transactional
+application logic (§7) because it spans rows. **Implemented in Phase 5**
+(ADR-017): every claim re-derives this sum inside a `SELECT … FOR UPDATE` on
+the pool row, and a request that loses the final-seat race (or finds no
+eligible pool) always lands in its own **unassigned wait pool** (ADR-022) —
+`REQUESTED` is transient-only.
 
 ### 5.6 `capacity_snapshot` preserves history
 `pools.capacity_snapshot` copies `vehicles.capacity` at pool creation. If Bullet
@@ -440,6 +451,8 @@ ones are explained inline in `src/db/schema.ts` and summarized here.
 | | `ride_requests_pool_requires_matched` | pooled requests have left REQUESTED |
 | pools | `pools_capacity_snapshot_positive` | snapshot always meaningful |
 | | `pools_started_timestamp` / `pools_complete_timestamp` / `pools_complete_requires_started` | started/completed timestamps only ever match the lifecycle; a pool can't complete without starting |
+| | `pools_assignment_consistent` (**0007**) | `(driver_id IS NULL) = (vehicle_id IS NULL)` — driver/Tesla assignment is all-or-nothing (no pool references one without the other) |
+| | `pools_driver_implies_accepted` (**0007**) | `driver_id IS NULL OR accepted_at IS NOT NULL` — a driver can only own a pool they accepted (ADR-022 first-wins claim) |
 | pool_members | `pool_members_seats_positive` | a membership always takes ≥ 1 seat |
 | | `pool_members_left_timestamp` | LEFT ⇔ `left_at` |
 | fares | `fares_monetary_non_negative` | no negative money |
@@ -455,7 +468,8 @@ ones are explained inline in `src/db/schema.ts` and summarized here.
 | zones | `zones_name_unique` | deterministic, named geography |
 | ride_requests | (none beyond PK) | requests are never unique by content |
 | ride_requests | `ride_requests_one_active_per_passenger` (**partial**) | at most **one non-terminal ride per passenger** (`(passenger_id) WHERE status IN ('REQUESTED','MATCHED','DRIVER_ARRIVED','STARTED')`, migration 0006, ADR-021) — the DB is the arbiter when two bookings race; service maps a violation to `409 ACTIVE_RIDE_EXISTS` |
-| pools | `pools_single_active_per_vehicle` (**partial**) | a Tesla runs at most one active pool — capacity + concurrency integrity |
+| pools | `pools_single_accepted_per_driver` (**partial**, 0007) | a driver **owns** at most one active pool via accept — `(driver_id) WHERE driver_id IS NOT NULL AND status NOT IN ('COMPLETED','CANCELLED')`; a second accept is refused `409 DRIVER_HAS_ACTIVE_POOL` (ADR-022; replaces the old `pools_single_active_per_vehicle`) |
+| pools | `pools_single_accepted_per_vehicle` (**partial**, 0007) | a Tesla is assigned to at most one active pool — `(vehicle_id) WHERE vehicle_id IS NOT NULL AND status NOT IN ('COMPLETED','CANCELLED')`; accept capacity + concurrency integrity, and accepting transitively keeps ≤1 pool per vehicle since a driver owns ≤1 (ADR-022) |
 | pool_members | `pool_members_pool_request_unique` | no request twice in the same pool |
 | pool_members | `pool_members_one_active_per_request` (**partial**) | a request in at most one active pool |
 | fares | `fares_one_per_ride_request` | exactly one final fare per request |
@@ -505,41 +519,65 @@ migration 0003).
 6. Commit. The second claimant's `FOR UPDATE` only sees the committed state and
    correctly fails to join.
 
-**Pool creation race** (two requests simultaneously claim a Tesla's first seat
-when no active pool exists yet): the create uses
-`INSERT INTO pools ... ON CONFLICT DO NOTHING RETURNING *`. The losing INSERT
-waits for the winner's transaction to settle, then skips with an **empty**
-result instead of aborting with SQLSTATE 23505 — and since the winner's commit
-is a complete statement-level snapshot (READ COMMITTED), a single bounded
-re-scan deterministically finds the winner's pool to join. Both passengers end
-`MATCHED` in the same pool, occupancy exact.
+**Pool creation race — ADR-022 changed this to "always create a wait pool".**
+A request that can join no existing eligible pool (they are all full, or
+incompatible by the matching rule) — **or that loses the final-seat claim
+above** — is guaranteed a home: it inserts its **own unassigned wait pool**
+(`driver_id`/`vehicle_id` NULL, `status MATCHED`, `capacity_snapshot = 3`) with
+a plain `INSERT … RETURNING` (no conflict target — wait pools reference no
+vehicle), then claims its own seat in it via the same `FOR UPDATE` lock. Two
+concurrent requests that both miss the existing pools therefore end up in two
+separate wait pools — never stalled in `REQUESTED`. Requests on the same route
+that **do** find a compatible wait pool still join it under `claimSeatIn`, so
+passenger grouping (Nusrat + Rafiq sharing a pool) works exactly as before; the
+pool-row lock serializes joins per pool. This is the documented outcome for far
+drop-offs and for the loser of the Bullet final-seat race (Shirin lands alone
+in her own wait pool, capacity intact).
 
-**Lock ordering:** every transaction that writes both a ride row and a pool row
-acquires the RIDE row lock first, then the POOL row lock second (create holds
-the ride lock from its own INSERT; cancel/force-cancel `FOR UPDATE` the ride
-first, then the pool). Consistent ordering ⇒ no deadlock cycle between match,
-cancel, and force-cancel.
+**Driver accept — first-wins claim (ADR-022).** `PATCH …/accept` runs inside
+the caller's transaction with this fixed order — **VEHICLE rows `FOR UPDATE`
+(id-ascending) → active-pool count → contested POOL row `FOR UPDATE`**:
 
-**Driver lifecycle ordering (Phase 6, ADR-020):** every driver transition
-accepts an additional order — **VEHICLE rows `FOR UPDATE` (id-ascending) →
-member RIDE rows `FOR UPDATE` (id-ascending) → POOL row `FOR UPDATE`**. The
-vehicle lock is the shared serialization point between the automatch's Tesla
-pick, the driver's offline toggle, and the lifecycle actions; rides-before-pool
-keeps the global ride → pool order, so no cycle is possible with a passenger's
-cancel/match. The availability toggle locks ONLY vehicle rows and COUNTs
-non-terminal pools under that lock — it never waits on a pool row. This is what
-makes "two concurrent arrivals → exactly one wins" and "offline toggle racing a
-new booking" deterministic (both proven in `test/driver.test.ts`).
-Completing a pool leaves the status terminal, which drops it out of
-`pools_single_active_per_vehicle` — **the Tesla is freed for a new pool by the
-same partial unique index** (no "release" action).
+1. Lock the caller's VEHICLE rows `FOR UPDATE` (id-ascending) — same
+   serialization point as the availability toggle and lifecycle actions
+   (ADR-020).
+2. `SELECT count(*) FROM pools WHERE driver_id = :me AND status NOT IN
+   ('COMPLETED','CANCELLED') AND id <> :poolId` — a non-zero count means the
+   driver already owns another active pool → `409 DRIVER_HAS_ACTIVE_POOL`. The
+   `id <> :poolId` exclusion makes a same-driver **re-accept idempotent**: it
+   returns 200 with the original `accepted_at` instead of false-refusing.
+3. Read the pool row (the contested one) and recheck under its own lock row:
+   `status = 'MATCHED'` else `409 POOL_NOT_ACCEPTABLE`; `driver_id IS NULL` else
+   `409 POOL_ALREADY_ACCEPTED`; and the chosen online Tesla satisfies
+   `vehicle.capacity >= pool.capacitySnapshot` (no online eligible Tesla →
+   `409 VEHICLE_OFFLINE`). No driver → `409 VEHICLE_OFFLINE` ("No online Tesla
+   can carry this pool.").
+4. Write `driver_id`/`vehicle_id`/`accepted_at` and commit. `POOL_ALREADY_ACCEPTED`
+   is the *first-wins* serialization point: two concurrent accepts of the same
+   pool both pass their loop-free read checks, then serialize on the pool row —
+   the loser reads the committed winner and is refused. The pool itself stays
+   `MATCHED` throughout (passenger-visible status never changes).
 
 Why this is safe here:
-- The **partial unique index** `pools_single_active_per_vehicle` already blocks a
-  second active pool on the same Tesla, so all claims funnel through one pool row
-  (the locked row).
+- The **partial unique index** `pools_single_accepted_per_vehicle` /
+  `pools_single_accepted_per_driver` already block a second accepted pool on
+  the same Tesla/driver, so all claims on one pool funnel through the locked
+  pool row (and the acceptance count is taken under the vehicle lock first).
 - Occupancy is **derived** (no cached counter to corrupt).
 - `pool_members` uniqueness prevents double-joining even in a racy window.
+
+**Lock ordering (unchanged by ADR-022):** every transaction that writes both a
+ride row and a pool row acquires the RIDE row lock first, then the POOL row
+lock second (cancel/force-cancel `FOR UPDATE` the ride first, then the pool);
+driver transitions prepend the VEHICLE rows lock (ADR-020). Consistent ordering
+⇒ no deadlock cycle between match, cancel, force-cancel, and accept/arrive/
+start/complete. The availability toggle locks ONLY vehicle rows and COUNTs
+non-terminal **owned** pools under that lock. This is what makes "two
+concurrent arrivals → exactly one wins" and "offline toggle racing a new
+booking" deterministic (both proven in `test/driver.test.ts`). Completing a
+pool leaves the status terminal (or a cancel empties it), which drops it out of
+the accepted-per-driver/vehicle indexes — **a Tesla/driver is freed for a new
+pool by the partial unique indexes themselves** (no "release" action).
 
 What would change at larger scale (documented, not built): when a pool row
 becomes a hotspot, switch to a dedicated per-pool seat ledger (atomic
@@ -562,16 +600,23 @@ notes in `docs/requirements.md` §15. No Redis/mutex/queue is used or planned
   `0002_greedy_ultimatum.sql` (`DROP COLUMN password_hash`). Phase 4 added
   `0003_fluffy_pixie.sql` (`ADD COLUMN client_request_id uuid` + the partial
   unique index `ride_requests_client_request_id_key` — ADR-015 idempotency).
-  Phase 5 added `0004_spotty_harrier.sql` (**additive only**:
-  `ALTER TABLE fares ADD COLUMN updated_at timestamptz NOT NULL DEFAULT now()`
-  — ADR-017 auditability of the in-place pooling recompute). Phase 6 added
-  `0005_powerful_johnny_storm.sql` (**additive only**, ADR-019):
-  `pools.accepted_at` (driver accept confirmation) + CHECK
-  `pools_accepted_progression` (a progressed pool must have been accepted)
-  + partial index `driver_pools_accept_idx` (`WHERE accepted_at IS NOT NULL`).
-  The pool/pool_members
-  tables and their partial unique indexes already existed from 0000 (ADR-012), so
-  no other schema change was needed for pooling.
+Phase 5 added `0004_spotty_harrier.sql` (**additive only**:
+   `ALTER TABLE fares ADD COLUMN updated_at timestamptz NOT NULL DEFAULT now()`
+   — ADR-017 auditability of the in-place pooling recompute). Phase 6 added
+   `0005_powerful_johnny_storm.sql` (**additive only**, ADR-019):
+   `pools.accepted_at` (driver accept confirmation) + CHECK
+   `pools_accepted_progression` (a progressed pool must have been accepted)
+   + partial index `driver_pools_accept_idx` (`WHERE accepted_at IS NOT NULL`).
+   Phase 6/8 follow-up added `0007_outstanding_sugar_man.sql` (**ADR-022**):
+   `pools.driver_id`/`vehicle_id` become **nullable**, `pools_single_active_per_vehicle`
+   is dropped, and the unassigned-wait-pool model is enforced by
+   `pools_assignment_consistent` (`(driver_id IS NULL) = (vehicle_id IS NULL)`),
+   `pools_driver_implies_accepted` (`driver_id IS NULL OR accepted_at IS NOT NULL`),
+   and the partial unique indexes `pools_single_accepted_per_driver` /
+   `pools_single_accepted_per_vehicle` (`WHERE … NOT IN ('COMPLETED','CANCELLED')`).
+   The pool/pool_members
+   tables and their remaining partial unique indexes already existed from 0000
+   (ADR-012), so no other schema change was needed for pooling.
   Generated SQL was reviewed and is committed **unmodified** — no manual edits
   unless a documented reason forces one.
 - Apply with `npm run db:migrate` (uses `apps/api/drizzle/meta/_journal.json`
@@ -588,9 +633,16 @@ deletes). Contents (the canonical PRD cast — see `src/db/seed.ts`):
 
 | kind | rows |
 |---|---|
-| users | Jashim Ahmed (DRIVER), Nusrat Haque, Rafiq Rahman, Shirin Islam |
-| vehicle | **Bullet** — owned by Jashim, capacity 3, online |
+| users | Jashim Ahmed (DRIVER), Nusrat Haque, Rafiq Rahman, Shirin Islam (PASSENGER), **Karim Hassan, Rahim Uddin, Faruq Khan (DRIVER)** |
+| vehicles | **Bullet** — owned by Jashim, capacity 3, online; **Tesla 2** — Karim, capacity 3, offline; **Tesla 3** — Rahim, capacity 3, online; **Tesla 4** — Faruq, capacity 3, offline |
 | zones | Banani, Gulshan 1, Mohakhali, Dhanmondi, Mirpur, Uttara, Farmgate, Bashundhara |
+
+The 0007 seed (ADR-022) adds the extra drivers/Teslas so the accept story is
+covered with canonical actors: **Karim** is a bare DRIVER with no Tesla (every
+accept → `VEHICLE_OFFLINE`); **Rahim** is the legitimate competitor for
+Jashim's first-wins race on Bullet's pool (Tesla 3 online); **Faruq** rides
+along for the one-accepted-pool-per-driver cases. Backend/seed tests reference
+them via `SEED_IDS` (never a generic `driver2`).
 
 IDs are fixed (deterministic) so tests and demos can reference Jashim/Bullet by
 a stable UUID. Seeded `clerk_user_id` values are **documented development-only
@@ -621,8 +673,11 @@ npm run db:seed   -w @dhaka-tesla-pool/api    # idempotent cast seed
 
 1. A ride request belongs to exactly one passenger — `passenger_id` FK. ✔ DB
 2. Requested seats are positive — CHECK. ✔ DB
-3. A pool belongs to exactly one Tesla — `vehicle_id` FK + one active pool per
-   vehicle. ✔ DB
+3. A pool belongs to **at most** one Tesla, and a driver/Tesla assignment is
+   all-or-nothing — `vehicle_id` FK, CHECK `pools_assignment_consistent`
+   (`(driver_id IS NULL) = (vehicle_id IS NULL)`, migration 0007), plus one
+   accepted pool per driver (ADR-022). An unassigned wait pool belongs to no
+   Tesla until a driver claims it. ✔ DB
 4. Membership seats are positive — CHECK. ✔ DB
 5. A request cannot appear twice in the same pool — `UNIQUE(pool_id, ride_request_id)`. ✔ DB
 6. Occupied seats are derived from ACTIVE memberships — no cached counter. ✔ By design
@@ -652,9 +707,22 @@ npm run db:seed   -w @dhaka-tesla-pool/api    # idempotent cast seed
     one. ✔ DB + App
 17. A pool that has progressed (DRIVER_ARRIVED/STARTED/COMPLETED) must have
     been accepted — CHECK `pools_accepted_progression` (migration 0005); accept
-    itself keeps the pool MATCHED and is idempotent (Phase 6, ADR-019). ✔ DB + App
-18. A non-terminal pool keeps its Tesla online — the driver offline toggle is
-    refused (`409 DRIVER_HAS_ACTIVE_POOL`) under the vehicle lock (Phase 6,
-    ADR-019/020, requirements §21.J strict). ✔ App
-19. A completed pool frees its Tesla for a new pool — terminal status drops the
-    pool out of `pools_single_active_per_vehicle` (Phase 6, ADR-019). ✔ DB
+    itself keeps the pool MATCHED and is idempotent (Phase 6, ADR-019/022). ✔ DB + App
+18. A driver can only own a pool they accepted — CHECK
+    `pools_driver_implies_accepted` (migration 0007, ADR-022): no accidental
+    assignment without the first-wins claim step. ✔ DB
+19. A driver/Tesla owns at most one active pool — partial unique indexes
+    `pools_single_accepted_per_driver` / `pools_single_accepted_per_vehicle`
+    (migration 0007); a second accept → `409 DRIVER_HAS_ACTIVE_POOL` (the
+    count excludes the pool being re-accepted, so re-accept is idempotent). ✔ DB
+20. A non-terminal pool the driver **accepted** keeps its Tesla online — the
+    driver offline toggle is refused (`409 DRIVER_HAS_ACTIVE_POOL`) under the
+    vehicle lock for owned non-terminal pools (Phase 6, ADR-019/020,
+    requirements §21.J; **narrowed in ADR-022** — unassigned wait pools in the
+    lobby never block the toggle). ✔ App
+21. A completed/emptied pool frees its Tesla/driver for a new pool — terminal
+    status drops the pool out of `pools_single_accepted_per_*` (ADR-022). ✔ DB
+22. `REQUESTED` is transient-only — every request is matched into a pool inside
+    its create transaction (either joins an eligible pool or creates its own
+    unassigned wait pool, ADR-022); the loser of a concurrent final-seat race
+    lands in its own fresh wait pool, never stuck. ✔ App

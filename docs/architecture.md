@@ -359,16 +359,16 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-016/017/018,
   `DRIVER_ARRIVED → STARTED → COMPLETED` are declared and driver-phase-exercised.
 - **Auto-match** (`src/rides/pooling/service.ts`): `createRideRequest` runs the
   match *inside its own transaction* — ride + fare + history + membership +
-  pool_id commit atomically; a request either joins the best pool or starts a new
-  `MATCHED` pool (no driver accept in Phase 5, ADR-016).
+  pool_id commit atomically; a request either joins the best eligible pool or
+  starts a **new unassigned `MATCHED` wait pool** (no Tesla is picked at match
+  time — ADR-022; **updated in Phase 6/8 follow-up**).
 - **Seat-claim concurrency (ADR-017)**: occupancy is always derived
   (`SUM(seats) WHERE status='ACTIVE'`); a claim `SELECT … FOR UPDATE`s the pool
   row, re-derives under the lock, and only joins when the assertion passes;
-  pool creation uses `INSERT … ON CONFLICT DO NOTHING RETURNING` plus exactly one
-  bounded re-scan, so two concurrent first-seat requests end MATCHED in the
-  **same** pool and two concurrent last-seat claims never exceed Bullet's 3
-  seats. Lock order (ride → pool) is consistent across match/cancel/force-cancel,
-  so no deadlock.
+  a request that loses the final-seat race (or finds no eligible pool) starts
+  its own unassigned wait pool — `REQUESTED` is transient-only, and two
+  concurrent last-seat claims never exceed Bullet's 3 seats. Lock order
+  (ride → pool) is consistent across match/cancel/force-cancel, so no deadlock.
 - **In-place pooled fare** (`src/rides/pooling/fare.ts`): ≥ 2 ACTIVE members ⇒
   every member's fare row recomputed in place (25% off base+distance, rounded
   half-up; `fares.updated_at` from migration 0004); solo pool stays at full fare.
@@ -380,59 +380,82 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-016/017/018,
   through the discount term (`final = 0`), CHECKs still hold. No `cancel_reason`.
 - **Ride view** gained an additive `pool` object (id/status/vehicle/driver/
   capacitySnapshot/occupiedSeats) computed via a correlated ACTIVE-membership
-  subquery — history of exactly the Phase 4 shape stays intact.
+  subquery — history of exactly the Phase 4 shape stays intact. Since ADR-022
+  the `vehicle`/`driver` fields are NULL while the pool is unassigned (waiting
+  for a driver to claim it).
 - **Validation/tests**: full suite **122/122** (8 files), root lint + typecheck +
   build (API + Next.js web) green; migration 0004 applied to the Docker dev DB;
   `db:generate` reports no drift; `docker compose config` valid. Concurrency is
   proven with two independent PostgreSQL connections, including the canonical
   race — Bullet pre-filled to 2 seats, Rafiq vs Shirin both claiming the last
   seat: exactly one MATCHED, one stays REQUESTED, occupancy always 3.
-- Pending (later phases): driver accept/arrived/started/complete, payments,
-  frontend pooling UX.
+- Pending (later phases): payments, map visualization; the Phase 5 "driver
+  accept" gap was closed by ADR-022 (Phase 6/8 follow-up, §13 below).
 
 ## 13. Implementation Status (Phase 6 — driver workflow)
 
-Implemented and verified (see [docs/decisions.md](decisions.md) ADR-019/020,
+Implemented and verified (see [docs/decisions.md](decisions.md) ADR-019/020/022,
 [docs/database.md](database.md) §3.6/§7/§10, [docs/requirements.md](requirements.md)
-§21.B/E/J, [`apps/api/test/driver.test.ts`](../../apps/api/test/driver.test.ts)):
+§21.B/E/J/M, [`apps/api/test/driver.test.ts`](../../apps/api/test/driver.test.ts)):
 
 - **Availability switch** (`POST /api/driver/availability {isOnline}` → 204):
-  per-driver, flips all of the driver's Teslas; going offline while any pool is
-  non-terminal is refused (`409 DRIVER_HAS_ACTIVE_POOL`, strict §21.J). The
-  toggle locks the driver's vehicle rows first (ADR-020) so it serializes with
-  the automatch — a pool can never be created on an offline Tesla, and an
-  offline toggle can never strand a pool on an offline Tesla.
-- **Read hub** (`GET /api/driver/pools`, `GET /api/driver/pools/:poolId`):
-  the driver's non-terminal pools (newest first) and a single pool, each as a
-  fare-free view: passenger name, seats, pickup/destination zone names, vehicle
-  (incl. `isOnline`), pool status + timestamps. Deliberately **no fares** on the
-  driver surface (P9); ACTIVE members only.
-- **Lifecycle actions** (`POST /api/driver/pools/:poolId/{accept,arrive,start,
-  complete}` → `{ pool }`): the driver confirms and operates the pool the
-  automatch assigned. Accept records `accepted_at` while the pool **stays
-  MATCHED** (idempotent; requires the Tesla online = `409 VEHICLE_OFFLINE`, still
-  MATCHED = `409 POOL_NOT_ACCEPTABLE`). Arrive requires a prior accept; the
-  aggregate (pool + every member ride) moves MATCHED → DRIVER_ARRIVED →
-  STARTED → COMPLETED together with per-ride journaling and pool/ride
-  timestamps; illegal moves are `409 INVALID_STATE_TRANSITION`. Completion frees
-  the Tesla (terminal status drops the pool out of the partial unique index).
+  per-driver, flips all of the driver's Teslas; going offline while any pool the
+  driver **accepted** is non-terminal is refused (`409 DRIVER_HAS_ACTIVE_POOL`,
+  §21.J strict, narrowed by ADR-022 — unassigned wait pools in the lobby never
+  block the toggle). The toggle locks the driver's vehicle rows first (ADR-020)
+  so it serializes with the accept claim — a pool can never be stranded on an
+  offline Tesla after acceptance.
+- **Lobby** (`GET /api/driver/pools/available`): every unassigned `MATCHED`
+  pool (no `driver_id`), newest first — **identical for every driver** (the
+  method takes no `driverId`; a driver-agnostic lobby by construction). A
+  driver accepts a request from here; owned-pool reads (`GET /api/driver/pools`,
+  `GET /api/driver/pools/:poolId`) now return only pools the driver **accepted**
+  (ownership = `driver_id`).
+- **Read hub**: the driver's accepted non-terminal pools (newest first) and a
+  single pool, each as a fare-free view: passenger name, seats, pickup/
+  destination zone names, vehicle (incl. `isOnline`; NULL while unassigned),
+  pool status + timestamps. Deliberately **no fares** on the driver surface
+  (P9); ACTIVE members only.
+- **Accept = first-wins claim** (`POST /api/driver/pools/:poolId/accept` →
+  `{ pool }`): atomically assigns `driver_id`/`vehicle_id`/`accepted_at` to an
+  unassigned pool under the ADR-020 vehicle → count → pool-row lock order
+  (`docs/database.md` §7). Capacity gate: `vehicle.capacity >= capacity_snapshot`.
+  Exactly one concurrent accept wins; losers get `409 POOL_ALREADY_ACCEPTED`;
+  the pool **stays MATCHED**; a second accept by the same driver on their own
+  pool is idempotent (count excludes the pool, `id <> :poolId`); a pool already
+  owned by another driver or not MATCHED is `409 POOL_ALREADY_ACCEPTED` /
+  `409 POOL_NOT_ACCEPTABLE`; no online eligible Tesla → `409 VEHICLE_OFFLINE`
+  ("No online Tesla can carry this pool."); already owning another active pool
+  → `409 DRIVER_HAS_ACTIVE_POOL`. Arrive/start/complete require a prior accept;
+  **arrive on an unclaimed pool → `404 NOT_FOUND`** (ownership exists only
+  through acceptance). Illegality is otherwise `409 INVALID_STATE_TRANSITION`;
+  completion frees the Tesla/driver (terminal status drops the pool out of the
+  partial unique indexes).
 - **Auth/isolation**: driver identity from the session only; every route
   `requireRole(["DRIVER"])` (401 unauthenticated, 403 passengers); interloper or
-  unknown pool = plain `404 NOT_FOUND` (existence hidden 1:1).
+  unknown pool = plain `404 NOT_FOUND` (existence hidden 1:1 — superseded on the
+  accept path, which is an open, first-wins competition instead).
 - **Passenger cancel extension (P8)**: cancellation remains legal through
   DRIVER_ARRIVED (seat freed, remaining fares recomputed, emptied pool
   terminated); refused from STARTED onward.
-- **Concurrency (ADR-020)**: three real races proven with two independent
-  PostgreSQL connections — concurrent accepts (both succeed, one `accepted_at`),
-  concurrent arrivals (exactly one wins), concurrent completes (one wins, Tesla
-  freed), and offline-toggle-vs-new-booking (invariant: an offline Bullet holds
-  no non-terminal pool).
-- **Schema (migration 0005, additive):** `pools.accepted_at` + CHECK
-  `pools_accepted_progression` (progressed ⇒ accepted; MATCHED → CANCELLED stays
-  legal) + partial index `driver_pools_accept_idx`.
-- **Validation/tests**: full suite **152/152** (9 files) against the Docker
+- **Concurrency (ADR-020, refitted to ADR-022)**: real races proven with two
+  independent PostgreSQL connections — cross-driver first-wins accept (Jashim vs
+  Rahim: one wins, loser 409, vehicle matches the winner), a no-Tesla driver
+  (KARIM) accepts → `VEHICLE_OFFLINE`, concurrent arrivals (exactly one wins),
+  concurrent completes (one wins, Tesla freed), an offline-toggle-vs-booking
+  race (booking succeeds into a wait pool and the toggle succeeds — no coupling
+  exists any more), and one-accepted-pool-per-driver enforcement.
+- **Schema (migration 0005 + 0007):** 0005 added `pools.accepted_at` + CHECK
+  `pools_accepted_progression`; 0007 made `driver_id`/`vehicle_id` nullable and
+  enforced the wait-pool model (`pools_assignment_consistent`,
+  `pools_driver_implies_accepted`, partial uniques
+  `pools_single_accepted_per_driver` / `pools_single_accepted_per_vehicle`;
+  `pools_single_active_per_vehicle` dropped).
+- **Validation/tests**: full suite **173/173** (9 files) against the Docker
   PostgreSQL `_test` database, root lint + typecheck + build (API + web) green;
-  migration 0005 applied; `db:generate` reports no drift.
+  migration 0007 applied; `db:generate` reports no drift; web suite **36→39**
+  tests with the lobby flow.
 - Routing additions: `POST /api/driver/availability`, `GET /api/driver/pools`,
-  `GET /api/driver/pools/:poolId`, and the four lifecycle POSTs, registered in
-  `src/app.ts` via a thin `DriverService` facade (`src/driver/`).
+  `GET /api/driver/pools/available`, `GET /api/driver/pools/:poolId`, and the
+  four lifecycle POSTs, registered in `src/app.ts` via a thin `DriverService`
+  facade (`src/driver/`).

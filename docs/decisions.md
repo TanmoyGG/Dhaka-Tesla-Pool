@@ -748,3 +748,128 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   contested from multiple hot paths — then per-vehicle advisory locks or a
   reservation table (`FOR UPDATE SKIP LOCKED`) would spread the serialization
   point; the order documented here stays the ordering rule either way.
+
+## ADR-022: Unassigned wait pools + first-wins driver accept (Phase 6/8 follow-up)
+
+- **Status:** implemented on `feature/driver-accept-selection` (backend
+  migration 0007, `pooling`/`driver` services; web app shows the lobby).
+  Reworks ADR-016/019's "system-assigned" driver pickup into an explicit
+  driver **selection** step while keeping every passenger invariant intact.
+
+### 1. Problem
+- ADR-016/019&nbsp;P12 assigned the matched pool to a driver/vehicle
+  *inside the booking transaction* (an "automatch"); containership was
+  implicit (the pool referenced the driver, but the driver never acted on
+  the assignment). "Accept" was only a **confirmation** that mutated no
+  driver state. Requirement gaps surfaced in review: (a) there was no
+  workflow where an online driver *picks up* a waiting request; (b) the
+  driver/vehicle actually assigned was invisible until until a join created
+  the pool; (c) with assignment happening at booking time, "which driver
+  gets it" could not be a decision, and evaluation asked for a believable
+  driver-selection story (the driver opens a lobby and claims a request).
+
+### 2. Decision: pools are born unassigned and are claimed first-wins
+- A `REQUESTED` ride that cannot join an existing eligible pool **always
+  creates a new pool**, but the pool is created **`MATCHED` with
+  `driver_id`/`vehicle_id`/`accepted_at` NULL** — an *unassigned wait
+  pool* sitting in every driver's lobby. It joins an existing pool only
+  when friend-trip constraints match an **already-claimed** pool.
+- Assignment is now **`DRIVER accept = first-wins claim`**: any online
+  driver with an eligible Tesla claims an unassigned pool atomically
+  (`PATCH /api/driver/pools/:poolId/accept`). `accept` records `driver_id`,
+  `vehicle_id`, and `accepted_at` on the pool row; the first committed
+  transaction wins (see §4), every later driver gets
+  `409 POOL_ALREADY_ACCEPTED`. The pool itself stays `MATCHED` (per the
+  passenger view nothing changed — ADR-016's `MATCHED` semantics preserved).
+- **Lobby endpoint:** `GET /api/driver/pools/available` returns all
+  unassigned `MATCHED` pools (newest first) — identical for every driver,
+  driver-agnostic by construction (no `driverId` filter; ESLint rules
+  forbid an unused parameter). The owned pools list (`GET /api/driver/pools`)
+  now contains only pools the driver **accepted**; `driver_id` is a hard
+  ownership key, and the lobby empty state is text, not a graceful-hunt.
+- **Booking no longer depends on driver availability:** an offline fleet
+  never blocks a ride — the request always lands in a wait pool. This is a
+  deliberate change from ADR-019&nbsp;P12 (offline-vs-booking race test now
+  asserts both sides succeed).
+
+### 3. DB invariants (migration 0007) — why they hold
+- CHECK `(driver_id IS NULL) = (vehicle_id IS NULL)`: assignment is always
+  all-or-nothing.
+- CHECK `driver_id IS NULL OR accepted_at IS NOT NULL`: a driver cannot own
+  an unaccepted pool (no accidental assignment without the acceptance step).
+- Partial unique indexes `pools_single_accepted_per_driver` /
+  `pools_single_accepted_per_vehicle` on `(driver_id)` / `(vehicle_id)`
+  `WHERE driver_id IS NOT NULL`: a driver or Tesla can *own* at most one
+  non-terminal pool. Replaces the old `pools_single_active_per_vehicle`
+  (one active pool per vehicle) — the old index still holds transitively
+  because accepted ⇒ active and a vehicle has ≤1 accepted pool.
+- Passenger `REQUESTED` is now transient-only by construction: every
+  request leaves creation inside an accepted-CAPACITY `MATCHED` pool
+  (either a claimed pool or a fresh wait pool).
+
+### 4. Concurrency — still ADR-017, refitted
+- The seat-claim transaction is **unchanged** (`claimSeatIn`: pool row
+  `SELECT … FOR UPDATE`, status recheck, occupancy derived from ACTIVE
+  members under the lock, exactly one winner; the last-seat loser becomes
+  a new unassigned wait pool). AGENTS invariant #6 (concurrent requests
+  never corrupt capacity) still holds; the whole Seat-claim design:
+  `docs/database.md` §7.
+- New accept transaction, fixed lock order **vehicle → pools → contested
+  pool** (ADR-020 extended): lock the caller's VEHICLE rows `FOR UPDATE`
+  (id-ascending); `SELECT count(*) FROM pools WHERE driver_id = :me AND
+  status NOT IN ('COMPLETED','CANCELLED') AND id <> :poolId` — if this
+  driver already owns another active pool, `409 DRIVER_HAS_ACTIVE_POOL`
+  (the count **excludes the pool being re-accepted**, so idempotent
+  re-accept of a pool you own returns 200 with the same `accepted_at`);
+  verify `status = 'MATCHED'` and `driver_id IS NULL` (else
+  `409 POOL_NOT_ACCEPTABLE` / `POOL_ALREADY_ACCEPTED`); then lock the
+  contested POOL row `FOR UPDATE` and write `driver_id`/`vehicle_id`/
+  `accepted_at`. Capacity rule: `vehicle.capacity >= pool.capacitySnapshot`.
+- **First-wins is the serialization point:** the pool row lock makes two
+  concurrent accepts of the same pool serialize — the second sees a
+  committed winner and returns `POOL_ALREADY_ACCEPTED`. No distributed
+  solution needed (fits "no unnecessary Redis"; see `requirements.md` §15
+  and ADR-020's scale-out note).
+- A race with a no-Tesla driver (KARIM) or an offline fleet yields
+  `409 VEHICLE_OFFLINE` ("No online Tesla can carry this pool.").
+
+### 5. Behavior changes vs ADR-016/019 (intended, tested)
+- **arrive before accept:** an unassigned pool has no owner, so
+  `PATCH …/arrive` → `404 NOT_FOUND` (ownership is defined by acceptance
+  only; the `accepted_at` guard is defensive/dead under the CHECK).
+- **offline toggle narrowed:** only **accepted** pools block going offline
+  (`DRIVER_HAS_ACTIVE_POOL`); unassigned wait pools in the lobby never
+  block it.
+- **interloper 404 superseded by open competition:** any driver may
+  attempt an accept; only the first wins. No "this pool is yours" 404 on
+  the claim path.
+- Hotel/indirect consequences: `getAvailablePools()` no longer takes a
+  `driverId`; the seeded cast gains Karim/Rahim/Faruq + Tesla 2/3/4 so the
+  accept story (Jashim vs. Rahim race, KARIM never wins — no Tesla) is
+  covered with canonical actors (tests use `SEED_IDS`).
+
+### 6. Web UI (Phase 8 follow-up)
+- Driver hub gains a **"Waiting requests" lobby**: `useAvailablePools()`
+  polls `GET /api/driver/pools/available` (5 s, while any pool is
+  non-terminal, ADR-021&nbsp;§6) and each lobby card offers an **Accept**
+  button that fires the first-wins claim inline (the detail page 404s for
+  unclaimed pools, so the claim must live on the lobby card). A lost race
+  surfaces `POOL_ALREADY_ACCEPTED` with a refresh hint, and the refetch
+  drops the pool.
+- Passenger surfaces render the wait-pool state: `PoolInfo`/`RideCard`
+  show "Waiting for a driver…" when `driver_id`/`vehicle_id` are NULL
+  (`RidePoolView` assignment fields are `string | null`; driver types
+  `vehicle?: {…} | null`). Owned-open-pools and detail pages use the
+  assigned Tesla once present.
+
+### 7. Alternatives rejected (briefly)
+- **Keep system-assignment; add accept-as-confirmation (ADR-019 as-is):**
+  leaves no driver-facing decision and cannot tell the "who claims it"
+  story; also kept the offline-fleet-blocks-booking behavior that froze
+  the booking path on availability.
+- **Queue/assignment service (e.g., Redis stream or a workers pool):**
+  violates "no unnecessary queues/Redis" for a single-node MVP; the pool
+  row lock is simpler and correct.
+- **Application-level "first-wins" via a `claimed_by` read-then-write:**
+  racy — two accepts could both pass the check before writing; the DB
+  transaction is the arbiter (AGENTS data integrity principle).

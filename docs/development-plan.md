@@ -179,44 +179,58 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 
 ## Phase 6 — Driver flow
 
-> **Status: COMPLETE** (branch `feature/driver-workflow`; merged, validation
-> 152/152). Drivers get an online/offline switch and hands-on control of the
-> pool the automatch assigned: **accept → arrive → start → complete**, plus a
-> fare-free hub (their pools, members, seats, zones). **Scope changes vs. the
-> plan:** (1) accept is a **confirmation** that records `pools.accepted_at`
-> while the pool stays MATCHED (idempotent), not a reservation — automatch per
-> ADR-016 stays the allocation, ADR-019; (2) the offline rule is **strict**
-> (§21.J): refused while ANY pool is non-terminal (`409 DRIVER_HAS_ACTIVE_POOL`);
+> **Status: COMPLETE + PV2 review changes absorbed** (branch
+> `feature/driver-workflow` merged; validation 152/152. **ADR-022 rework** on
+> `feature/driver-accept-selection` — validation **173/173**). Drivers get an
+> online/offline switch and hands-on control of the pool they **claim first-
+> wins from a lobby**: **accept → arrive → start → complete**, plus a fare-free
+> hub (their pools, members, seats, zones). **Scope changes vs. the plan:**
+> (1) pools are born **unassigned** (migration 0007 — `driver_id`/`vehicle_id`
+> NULL); accept is a **first-wins claim** that assigns the driver/Tesla and
+> records `pools.accepted_at` while the pool stays MATCHED (idempotent;
+> losers → `409 POOL_ALREADY_ACCEPTED`), replacing ADR-016's automatch
+> allocation — ADR-019/022; (2) the offline rule is **strict but narrowed**
+> (§21.J): refused while any pool the driver **accepted** is non-terminal
+> (`409 DRIVER_HAS_ACTIVE_POOL`); lobby wait pools never block the toggle;
 > (3) passenger cancellation is extended to stay legal through DRIVER_ARRIVED
-> (P8); (4) migration 0005 (`pools.accepted_at` + CHECK
-> `pools_accepted_progression` + partial index) — additive only.
+> (P8); (4) migrations 0005 + 0007 (`pools.accepted_at` + CHECK
+> `pools_accepted_progression` + the wait-pool CHECKs/partial uniques) —
+> 0007 is not additive (nullable columns, index swap).
 
 - **Objective:** Driver online/offline, accepts a ride/pool, marks
   `ARRIVED → STARTED → COMPLETED`, sees seats/history.
 - **Deliverables:** `apps/api/src/driver/` (routes + thin `DriverService`
   facade); `POST /api/driver/availability` (204); `GET /api/driver/pools`;
-  `GET /api/driver/pools/:poolId`; `POST /api/driver/pools/:poolId/{accept,
-  arrive,start,complete}` → pool view; driver lifecycle lock order **vehicle →
-  rides → pool** (ADR-020); count-based busy-vehicle guard; deterministic
-  vehicle-first serialization with the automatch/offline toggle.
+  `GET /api/driver/pools/available` (**lobby**, ADR-022); `GET /api/driver/
+  pools/:poolId`; `POST /api/driver/pools/:poolId/{accept,arrive,start,
+  complete}` → pool view; driver lifecycle lock order **vehicle → rides →
+  pool** (ADR-020); **first-wins accept claim** with a count-based
+  one-accepted-pool guard (`id <> :poolId` for idempotence) and capacity gate
+  (`vehicle.capacity >= capacity_snapshot`); deterministic vehicle-first
+  serialization with the accept claim/offline toggle.
 - **Dependencies:** Phases 4, 5.
 - **Risks:** state machine enforcement; driver seeing only their own vehicles
   (interloper = 404, existence hidden); deadlock-free lock ordering with the
   passenger cancel path (vehicle lock + ride-before-pool).
-- **Tests:** `test/driver.test.ts` (new, 30 tests): full happy-path lifecycle
-  with timestamps + per-ride journals; accept idempotency/idempotent-concurrent;
-  `VEHICLE_OFFLINE`; `POOL_NOT_ACCEPTABLE` (accept-after-move, arrive-before-
-  accept); illegal transitions (`arrive twice`, `start before arrive`,
-  `complete before start`) → 409; interloper 404 on all four actions + detail;
-  offline guard at MATCHED and STARTED; offline allowed after terminal; offline
-  Tesla → new booking stays REQUESTED; completion frees Bullet for a fresh pool;
-  P8 cancel at DRIVER_ARRIVED (seat freed, fare recomputed, emptied pool
-  terminates) and refused at STARTED; hub list/detail semantics (own pools only,
-  fare-free, ACTIVE members, ordering); HTTP role guards (401/403) and full
-  lifecycle over HTTP; three true concurrency races (double accept → one
-  `accepted_at`; double arrive → one winner; double complete → one winner +
-  Tesla freed; offline-vs-booking invariant) on two independent connections —
-  full suite **152 passing**.
+- **Tests:** `test/driver.test.ts` (reworked for ADR-022, 40 tests): full
+  happy-path lifecycle with timestamps + per-ride journals; **lobby semantics**
+  (`getAvailablePools()` driver-agnostic; held/accepted list split); **first-wins
+  accept** — cross-driver race (Jashim vs Rahim, one winner + 409 loser),
+  idempotent re-accept of an owned pool, `POOL_ALREADY_ACCEPTED` for a claimed
+  pool, `VEHICLE_OFFLINE` for a no-Tesla driver (KARIM) and for an offline fleet;
+  `POOL_NOT_ACCEPTABLE` (accept-after-move); **arrive-before-accept → 404**;
+  illegal transitions (`arrive twice`, `start before arrive`, `complete before
+  start`) → 409; interloper 404 on all non-accept actions + detail; offline guard
+  on **accepted** pools at MATCHED and STARTED, offline **allowed** with only
+  unclaimed wait pools; offline Tesla → booking still succeeds into a wait pool;
+  completion frees Bullet for a fresh pool; P8 cancel at DRIVER_ARRIVED (seat
+  freed, fare recomputed, emptied pool terminates) and refused at STARTED; hub
+  list/detail semantics (own accepted pools only, fare-free, ACTIVE members,
+  ordering); HTTP role guards (401/403) and full lifecycle over HTTP; true
+  concurrency races (cross-driver accept → exactly one winner; double arrive →
+  one winner; double complete → one winner + Tesla freed; offline-vs-booking
+  decoupled — both succeed) on two independent connections — full suite
+  **173 passing**.
 
 ## Phase 7 — Fare calculation
 
@@ -245,28 +259,33 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 
 ## Phase 8 — Concurrency / data integrity
 
-> **Status: pulled forward and completed in Phase 5.** The seat-claim race was a
+> **Status: completed in Phase 5 + Phase 6/8 follow-up.** The seat-claim race was a
 > first-class deliverable of the pooling phase (ADR-017), implemented in
 > `apps/api/src/rides/pooling/service.ts` and proven by `test/pooling.test.ts`
-> on two independent database connections. What remains for Phase 8's scope is
-> driver-phase concurrency (busy-vehicle guards once Phase 6 adds ARRIVED/STARTED
-> endpoints).
+> on two independent database connections. Driver-phase concurrency (first-wins
+> accept, one-accepted-pool-per-driver/Tesla) was completed with ADR-022
+> (`test/driver.test.ts`). Pool creation no longer races on a shared vehicle
+> slot — a request that cannot join an eligible pool **always creates its own
+> unassigned wait pool** (`INSERT … RETURNING`, no conflict target), and the
+> per-pool `FOR UPDATE` row lock still serializes every join.
 
 - **Objective:** Seat-claim race cannot corrupt capacity (Nusrat vs. Shirin).
 - **Deliverables (done in Phase 5):** transactional seat allocation
-  (`SELECT … FOR UPDATE` pool row + derived-occupancy recheck; pool creation via
-  `INSERT … ON CONFLICT DO NOTHING RETURNING` + one bounded re-scan — no retry
-  loop), documented approach and large-scale alternative (requirements §14,
-  database.md §7). Chosen lock order: ride row → pool row (deadlock-free).
-  No Redis/queues/mutexes; the database is the truth.
-- **Dependencies:** Phases 5 (done), 6 (driver-phase residual).
-- **Risks (settled):** deadlocks (consistent ride→pool lock order);
-  choosing the right lock scope (pool row is the single per-Tesla
-  serialization point thanks to `pools_single_active_per_vehicle`).
+  (`SELECT … FOR UPDATE` pool row + derived-occupancy recheck; the loser of a
+  concurrent claim lands in its own wait pool — no retry loop), documented
+  approach and large-scale alternative (requirements §14, database.md §7).
+  Chosen lock order: ride row → pool row (deadlock-free); driver transitions
+  prepend the vehicle row lock (ADR-020) and the accept claim serializes
+  cross-driver via the contested pool row (ADR-022). No Redis/queues/mutexes;
+  the database is the truth.
+- **Dependencies:** Phases 5 (done), 6 (done — ADR-022).
+- **Risks (settled):** deadlocks (consistent ride→pool→vehicle lock order);
+  choosing the right lock scope (the contested pool row is the single
+  first-wins serialization point for accept; derived occupancy for capacity).
 - **Tests (implemented):** required behavioral test #6 — Bullet pre-filled to 2
-  seats, Rafiq and Shirin concurrently claim the last seat: exactly one MATCHED,
-  one stays REQUESTED, occupancy stays 3; plus the first-pool race (both
-  concurrent claims land in one pool).
+  seats, Rafiq and Shirin concurrently claim the last seat: exactly one MATCHED
+  in the pool, occupancy stays 3, the loser is MATCHED in its own unassigned
+  wait pool; plus the equal-route pool join and the cross-driver accept race.
 
 ## Phase 9 — Frontend UX
 
@@ -281,11 +300,14 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 > in the fare breakdown, state timeline, two-step cancel; driver: online/offline
 > toggle with true state, open pools + pool detail (member list, seats, zones,
 > no fares P9), accept/arrive/start/complete actions, completed-trip history.
-> State pages poll at 5 s and **stop at terminal status** (ADR-021 §6). 36
+> State pages poll at 5 s and **stop at terminal status** (ADR-021 §6). The
+> driver hub adds a **"Waiting requests" lobby** (`useAvailablePools()`, ADR-022)
+> with an inline first-wins Accept button; passenger surfaces render
+> "Waiting for a driver…" while a pool is unassigned. 39
 > Vitest + RTL tests; `next build` clean. **Deferred from this phase:** the
 > Zebra-style Leaflet + OSM map stays out of the MVP (visualization-only later,
 > ADR-007) and Playwright E2E is parked in Phase 10 — the six required
-> behaviors are covered by the API suite (162 tests) plus the web unit tests.
+> behaviors are covered by the API suite (173 tests) plus the web unit tests.
 
 - **Objective:** Passenger + driver flows with proper loading/error/empty states.
 - **Deliverables:** auth screens, ride request + fare display, status tracking,
