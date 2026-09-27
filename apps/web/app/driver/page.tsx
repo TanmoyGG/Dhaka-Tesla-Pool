@@ -7,6 +7,7 @@ import { RoleGate } from "@/components/role-gate";
 import { EmptyState, ErrorCard, LoadingState } from "@/components/state-components";
 import {
   useAvailablePools,
+  useDriverAvailability,
   useDriverHistory,
   useDriverPools,
 } from "@/lib/queries";
@@ -19,6 +20,11 @@ export default function DriverDashboardPage() {
   const pools = useDriverPools();
   const lobby = useAvailablePools();
   const history = useDriverHistory();
+  const availability = useDriverAvailability();
+  const isOffline =
+    !availability.isLoading &&
+    !availability.isError &&
+    availability.data?.isOnline === false;
 
   return (
     <RoleGate roles={["DRIVER"]} fallback="/rides">
@@ -36,19 +42,34 @@ export default function DriverDashboardPage() {
             Ride requests matched to a new pool wait here until a driver claims
             them first-wins. Once claimed they move to your open pools.
           </p>
-          {lobby.isLoading && <LoadingState label="Loading waiting requests…" />}
-          {lobby.isError && <ErrorCard error={lobby.error} />}
-          {lobby.data && lobby.data.length === 0 && (
-            <EmptyState message="No waiting requests right now. New requests that cannot join an existing pool appear here." />
+          {availability.isLoading && (
+            <LoadingState label="Loading availability…" />
           )}
-          {lobby.data && lobby.data.length > 0 && (
-            <ul className="ridelist">
-              {lobby.data.map((pool) => (
-                <li key={pool.id}>
-                  <LobbyPoolCard pool={pool} />
-                </li>
-              ))}
-            </ul>
+          {isOffline && (
+            <div className="notice notice-warning" role="status">
+              <p>
+                You&apos;re offline. Go online in your dashboard to accept
+                waiting ride requests.
+              </p>
+            </div>
+          )}
+          {!availability.isLoading && !isOffline && (
+            <>
+              {lobby.isLoading && <LoadingState label="Loading waiting requests…" />}
+              {lobby.isError && <ErrorCard error={lobby.error} />}
+              {lobby.data && lobby.data.length === 0 && (
+                <EmptyState message="No waiting requests right now. New requests that cannot join an existing pool appear here." />
+              )}
+              {lobby.data && lobby.data.length > 0 && (
+                <ul className="ridelist">
+                  {lobby.data.map((pool) => (
+                    <li key={pool.id}>
+                      <LobbyPoolCard pool={pool} />
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
           )}
         </section>
 

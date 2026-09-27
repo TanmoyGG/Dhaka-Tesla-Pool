@@ -53,7 +53,11 @@ async function request<T>(
     throw await parseErrorResponse(res);
   }
 
-  return (await res.json()) as T;
+  const text = await res.text();
+  if (!text) {
+    return undefined as T;
+  }
+  return JSON.parse(text) as T;
 }
 
 export async function apiGet<T>(
