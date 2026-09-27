@@ -386,7 +386,7 @@ UPDATE users SET clerk_user_id = '<clerk-user-id>' WHERE email = 'nusrat@example
 Real Clerk IDs cannot collide with placeholders (`user_...` vs
 `dev-only::seed::...`).
 
-The four Development-cluster cast identities (below) are applied for you by the
+The seven Development-cluster cast identities (below) are applied for you by the
 ready-made development-only script
 [`apps/api/scripts/map-cast-clerk-ids.sql`](apps/api/scripts/map-cast-clerk-ids.sql);
 it only updates `clerk_user_id` on the exact seeded rows and preserves every
@@ -405,22 +405,23 @@ are never derived from email):
    ```bash
    npm run db:migrate -w @dhaka-tesla-pool/api
    ```
-3. **Run seed** (idempotent — adds Jashim, Nusrat, Rafiq, Shirin, Bullet, and
-   the 8 zones):
+3. **Run seed** (idempotent — adds Jashim, Nusrat, Rafiq, Shirin, Karim, Rahim,
+   Faruq, the four-Tesla fleet, and the 8 zones):
    ```bash
    npm run db:seed -w @dhaka-tesla-pool/api
    ```
-4. **Map the four seeded cast users to their real Clerk Development
-   identities.** These four users are **Development-instance test users** (the
+4. **Map the seven seeded cast users to their real Clerk Development
+   identities.** These seven users are **Development-instance test users** (the
    IDs are not secrets, but a matching `CLERK_SECRET_KEY` is required to verify
    their sessions). The script preserves the seeded roles exactly:
    ```bash
    docker compose exec -T db psql -U postgres -d dhaka_tesla_pool -f - `
      < apps/api/scripts/map-cast-clerk-ids.sql
    ```
-   Result — `jashim@example.com` → DRIVER; `nusrat@example.com`, `rafiq@example.com`,
+   Result — `jashim@example.com`, `karim@example.com`, `rahim@example.com`,
+   `faruq@example.com` → DRIVER; `nusrat@example.com`, `rafiq@example.com`,
    `shirin@example.com` → PASSENGER.
-5. **Sign in through Clerk** at `http://localhost:3000` with one of the four
+5. **Sign in through Clerk** at `http://localhost:3000` with one of the seven
    Development accounts (any brand-new identity is provisioned automatically).
 6. **Scripted story:**
    - Nusrat → book **Banani → Mohakhali** and watch the fare estimate before
@@ -435,12 +436,14 @@ are never derived from email):
      requests** lobby, and claim a request first-wins with **Accept ride**
      (ADR-022 — another driver racing you loses with a refresh hint). The pool
      moves to your open pools; on the pool detail run arrive → start → complete.
-     Pool completion frees Bullet/Tesla for a new pool. The toggle is refused
-     while a pool you accepted is non-terminal (§21.J). A no-Tesla sign-in
-     (e.g., Karim) can watch the lobby but cannot accept (`VEHICLE_OFFLINE`).
+Pool completion frees Bullet/Tesla for a new pool. The toggle is refused
+      while a pool you accepted is non-terminal (§21.J). Every seeded driver
+      (Jashim→Bullet, Karim→Tesla 2, Rahim→Tesla 3, Faruq→Tesla 4) is online
+      and eligible; a driver whose Teslas are all offline (toggle off) can
+      watch the lobby but cannot accept (`VEHICLE_OFFLINE`).
 
 No passwords appear in the README, source, seed, script, or git history. The
-four Clerk accounts are **Development-instance** test users in the project's
+seven Clerk accounts are **Development-instance** test users in the project's
 dev Clerk application; any production instance uses separate real identities.
 
 ## API
@@ -593,8 +596,9 @@ and `0007` (nullable assignment + wait-pool CHECKs + one-accepted-pool-per-
 driver/vehicle) drive the driver flow; `test/driver.test.ts` (40 tests) is
 pinned against the seed cast — Jashim drives Bullet, Nusrat/Rafiq book the
 pool, Shirin's concurrent grab is the canonical capacity race, and Karim/Rahim/
-Faruq (Tesla 2/3/4) cover the no-Tesla, cross-driver race, and multi-pool
-accept cases.
+Faruq (Tesla 2/3/4, all online) cover the cross-driver race and multi-pool
+accept cases (the no-Tesla `VEHICLE_OFFLINE` case uses a dedicated non-cast
+driver fixture).
 
 ## Docker (full stack, reproducible)
 

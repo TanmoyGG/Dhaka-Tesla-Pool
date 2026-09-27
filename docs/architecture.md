@@ -440,8 +440,9 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-019/020/022,
   terminated); refused from STARTED onward.
 - **Concurrency (ADR-020, refitted to ADR-022)**: real races proven with two
   independent PostgreSQL connections — cross-driver first-wins accept (Jashim vs
-  Rahim: one wins, loser 409, vehicle matches the winner), a no-Tesla driver
-  (KARIM) accepts → `VEHICLE_OFFLINE`, concurrent arrivals (exactly one wins),
+  Rahim: one wins, loser 409, vehicle matches the winner), a driver with no
+  Tesla (a dedicated non-cast fixture) accepts → `VEHICLE_OFFLINE`, concurrent
+  arrivals (exactly one wins),
   concurrent completes (one wins, Tesla freed), an offline-toggle-vs-booking
   race (booking succeeds into a wait pool and the toggle succeeds — no coupling
   exists any more), and one-accepted-pool-per-driver enforcement.

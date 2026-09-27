@@ -14,9 +14,10 @@ The canonical story cast is used **consistently** in seed data, tests, demo,
 and docs: **Jashim** drives his three-seat Tesla **Bullet**; **Nusrat** books
 Banani → Mohakhali; **Rafiq** books Banani → Gulshan 1 (overlapping, not
 identical); **Shirin** tries to grab Bullet's last seat moments later
-(the concurrency case). **Karim** (no Tesla), **Rahim** (Tesla 3, eligible)
-and **Faruq** (Tesla 4) exist so the driver-accept stories (first-wins race,
-no-Tesla refusal, one-accepted-pool-per-driver) use canonical actors too.
+(the concurrency case). **Karim** (Tesla 2), **Rahim** (Tesla 3) and
+**Faruq** (Tesla 4) — eligible, online drivers — exist so the driver-accept
+stories (first-wins race, offline-fleet/`VEHICLE_OFFLINE` refusal,
+one-accepted-pool-per-driver) use canonical actors too.
 Do not replace them with generic `user1/driver1` placeholders.
 
 ## SOURCE OF TRUTH

@@ -830,7 +830,8 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   committed winner and returns `POOL_ALREADY_ACCEPTED`. No distributed
   solution needed (fits "no unnecessary Redis"; see `requirements.md` §15
   and ADR-020's scale-out note).
-- A race with a no-Tesla driver (KARIM) or an offline fleet yields
+- A race with a no-Tesla driver (a dedicated non-cast fixture; every seeded
+  driver now owns an online Tesla) or an offline fleet yields
   `409 VEHICLE_OFFLINE` ("No online Tesla can carry this pool.").
 
 ### 5. Behavior changes vs ADR-016/019 (intended, tested)
@@ -844,8 +845,9 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   attempt an accept; only the first wins. No "this pool is yours" 404 on
   the claim path.
 - Hotel/indirect consequences: `getAvailablePools()` no longer takes a
-  `driverId`; the seeded cast gains Karim/Rahim/Faruq + Tesla 2/3/4 so the
-  accept story (Jashim vs. Rahim race, KARIM never wins — no Tesla) is
+  `driverId`; the seeded cast gains Karim/Rahim/Faruq + Tesla 2/3/4 (all
+  online) so the accept story (Jashim vs. Rahim race, Karim the eligible
+  Tesla-2 competitor; the no-Tesla case is a dedicated fixture) is
   covered with canonical actors (tests use `SEED_IDS`).
 
 ### 6. Web UI (Phase 8 follow-up)

@@ -633,16 +633,18 @@ deletes). Contents (the canonical PRD cast — see `src/db/seed.ts`):
 
 | kind | rows |
 |---|---|
-| users | Jashim Ahmed (DRIVER), Nusrat Haque, Rafiq Rahman, Shirin Islam (PASSENGER), **Karim Hassan, Rahim Uddin, Faruq Khan (DRIVER)** |
-| vehicles | **Bullet** — owned by Jashim, capacity 3, online; **Tesla 2** — Karim, capacity 3, offline; **Tesla 3** — Rahim, capacity 3, online; **Tesla 4** — Faruq, capacity 3, offline |
+| users | Jashim Ahmed (DRIVER), Nusrat Haque, Rafiq Rahman, Shirin Islam (PASSENGER), **Karim Hossain, Rahim Mia, Faruq Hasan (DRIVER)** |
+| vehicles | **Bullet** — owned by Jashim, capacity 3, online; **Tesla 2** — Karim, capacity 3, online; **Tesla 3** — Rahim, capacity 3, online; **Tesla 4** — Faruq, capacity 3, online |
 | zones | Banani, Gulshan 1, Mohakhali, Dhanmondi, Mirpur, Uttara, Farmgate, Bashundhara |
 
 The 0007 seed (ADR-022) adds the extra drivers/Teslas so the accept story is
-covered with canonical actors: **Karim** is a bare DRIVER with no Tesla (every
-accept → `VEHICLE_OFFLINE`); **Rahim** is the legitimate competitor for
-Jashim's first-wins race on Bullet's pool (Tesla 3 online); **Faruq** rides
-along for the one-accepted-pool-per-driver cases. Backend/seed tests reference
-them via `SEED_IDS` (never a generic `driver2`).
+covered with canonical actors: **Karim**, **Rahim** and **Faruq** each own an
+online three-seat Tesla (Tesla 2/3/4) and are equally eligible competitors for
+Jashim's first-wins race — Rahim on Tesla 3 is the cross-driver race opponent,
+Faruq covers the one-accepted-pool-per-driver cases. Backend/seed tests
+reference them via `SEED_IDS` (never a generic `driver2`); the no-Tesla accept
+rejection (`VEHICLE_OFFLINE`) is exercised with a dedicated non-cast fixture in
+`test/driver.test.ts`.
 
 IDs are fixed (deterministic) so tests and demos can reference Jashim/Bullet by
 a stable UUID. Seeded `clerk_user_id` values are **documented development-only

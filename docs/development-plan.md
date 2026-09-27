@@ -217,7 +217,8 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
   (`getAvailablePools()` driver-agnostic; held/accepted list split); **first-wins
   accept** — cross-driver race (Jashim vs Rahim, one winner + 409 loser),
   idempotent re-accept of an owned pool, `POOL_ALREADY_ACCEPTED` for a claimed
-  pool, `VEHICLE_OFFLINE` for a no-Tesla driver (KARIM) and for an offline fleet;
+  pool, `VEHICLE_OFFLINE` for a driver with no Tesla (dedicated non-cast
+  fixture) and for an offline fleet;
   `POOL_NOT_ACCEPTABLE` (accept-after-move); **arrive-before-accept → 404**;
   illegal transitions (`arrive twice`, `start before arrive`, `complete before
   start`) → 409; interloper 404 on all non-accept actions + detail; offline guard
