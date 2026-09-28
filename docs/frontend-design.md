@@ -394,6 +394,23 @@ panel / sheet shows, per status:
 - **Not in scope (ever, for MVP):** live GPS, real-time Tesla tracking,
   turn-by-turn, traffic-aware routing, live ETA (§9).
 
+**Implemented (Phase 3, shared workspace skeleton):** `MapPane`
+(`components/workspace/map-pane.tsx`) is the only module importing Leaflet and
+is mounted via `next/dynamic(…, { ssr: false })` in the `/rides` page, so
+Leaflet never executes during prerender. `leaflet/dist/leaflet.css` is a global
+import in `app/layout.tsx` (safe App-Router spot for a node_modules stylesheet);
+the dark restyles for popup/tooltip/zoom/attribution live in `app/globals.css`.
+Zone pins use `L.divIcon` lime dots (no marker-image assets); coordinates come
+only from `GET /api/zones`. `ResizeObserver` → 
+`map.invalidateSize()` keeps the viewport correct across the desktop/mobile
+grid switch. The initial view center ≈ 23.79, 90.40, zoom ≈ 12 and tiles from
+OpenStreetMap. The workspace grid (`WorkspaceShell`) anchors to the exact
+signed-in header height via `--app-header-height` +
+`.site-header:has(.menu-button)` (globals.css); mobile stacks map-top
+(@~40vh) over a scrolling panel, desktop puts the panel left
+(`minmax(20rem, 26rem)`) and the map right (majority). Driver workspace
+adoption is a later phase; the shell is role-agnostic. Rides use it now.
+
 ---
 
 ## 9. MVP scope / non-goals (explicit)
@@ -453,6 +470,9 @@ The MVP is deliberately **not** building:
    2. Hamburger/drawer navigation; move history out of the workspace.
       **— done (Phase 2).**
    3. Workspace skeleton (map + panel/sheet) with map non-blocking.
+      **— done (Phase 3, map-only skeleton: `WorkspaceShell` + `MapPane`
+      behind `/rides`; desktop panel-split + mobile map-top stacking. The
+      mobile bottom-sheet behavior stays deferred — no gesture work yet.)**
    4. Passenger book/live/pay flow.
    5. Driver workspace (availability + lobby + open pools + cash flow) with
       earnings line once the API field exists.

@@ -3,6 +3,10 @@ import { ClerkProvider } from "@clerk/nextjs";
 import { dark } from "@clerk/themes";
 import { Providers } from "./providers";
 import "./globals.css";
+// Leaflet's stylesheet is a global import (the only safe App-Router spot for a
+// CSS file from node_modules). Its rules are scoped to .leaflet-* classes and
+// the dark restyles live in globals.css (frontend-design.md §8).
+import "leaflet/dist/leaflet.css";
 
 export const metadata: Metadata = {
   title: "Dhaka Tesla Pool",

@@ -40,6 +40,12 @@
   --radius-sm: 0.5rem;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, "Cascadia Code", "Segoe UI Mono", Menlo, monospace;
+
+  /* Exact signed-in header height (button 2.6rem + padding + border) so the
+     ride workspace can fill the rest of the viewport deterministically:
+     calc(100dvh - var(--app-header-height)). Normalized below only for
+     headers that contain the hamburger — landing/auth headers stay auto. */
+  --app-header-height: 3.9rem;
 }
 
 * {
@@ -138,6 +144,13 @@ p {
   align-items: center;
   column-gap: 1rem;
   padding: 0.65rem clamp(1rem, 3vw, 1.75rem);
+}
+
+/* Signed-in headers get an exact height (--app-header-height) so the workspace
+   below can subtract it reliably. box-sizing: border-box keeps the value exact
+   including borders/padding. */
+.site-header:has(.menu-button) {
+  height: var(--app-header-height);
 }
 
 .brand {
@@ -313,6 +326,157 @@ p {
   .app-menu-overlay,
   .app-menu-panel {
     animation: none;
+  }
+}
+
+/* ----- Shared ride workspace (map + controls) ----- */
+
+/* The workspace replaces the centered .container inside the signed-in app:
+   a full-height grid under the exact header height, never a page that scrolls
+   with its own background scrollbar. Mobile stacks map on top (prominent,
+   ~40vh) over a panel that scrolls internally; desktop puts the panel on the
+   left and gives the map the majority width. */
+.workspace {
+  display: grid;
+  grid-template-columns: 1fr;
+  grid-template-rows: minmax(15rem, 42vh) minmax(0, 1fr);
+  grid-template-areas:
+    "map"
+    "panel";
+  gap: 1rem;
+  height: calc(100vh - var(--app-header-height));
+  height: calc(100dvh - var(--app-header-height));
+  min-height: 0;
+  padding: 1rem clamp(1rem, 3vw, 1.5rem) 1.5rem;
+}
+
+.workspace-panel {
+  grid-area: panel;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 1.1rem 1.2rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.workspace-map {
+  grid-area: map;
+  min-height: 0;
+}
+
+@media (min-width: 56rem) {
+  .workspace {
+    grid-template-columns: minmax(20rem, 26rem) 1fr;
+    grid-template-rows: 1fr;
+    grid-template-areas: "panel map";
+  }
+}
+
+/* ----- Leaflet map pane (visualization only, frontend-design.md §8) ----- */
+
+.map-pane {
+  position: relative;
+  height: 100%;
+  width: 100%;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--bg);
+  /* Contain Leaflet's internal z-indexes (panes, controls) so they can never
+     compete with the sticky header (20) or the nav drawer (19). */
+  isolation: isolate;
+}
+
+.map-pane .leaflet-container {
+  height: 100%;
+  width: 100%;
+  font: inherit;
+  background: var(--bg);
+}
+
+.map-pane-placeholder,
+.map-pane-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.9rem;
+  padding: 1rem;
+}
+
+.map-pane .leaflet-bar {
+  border: 1px solid var(--border-strong);
+}
+
+.map-pane .leaflet-control-zoom a {
+  color: var(--text);
+  background: var(--bg-raised);
+  border-color: var(--border);
+}
+
+.map-pane .leaflet-control-zoom a:hover {
+  background: var(--bg-elevated);
+}
+
+.map-pane .leaflet-control-attribution {
+  background: rgba(10, 11, 13, 0.75);
+  color: var(--muted);
+  font-size: 0.64rem;
+}
+
+.map-pane .leaflet-control-attribution a {
+  color: var(--muted);
+}
+
+.map-pane .leaflet-control-attribution a:hover {
+  color: var(--accent);
+}
+
+.map-pane .leaflet-popup-content-wrapper,
+.map-pane .leaflet-popup-tip {
+  background: var(--bg-raised);
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+}
+
+.map-pane .leaflet-popup-content {
+  margin: 0.75rem 0.9rem;
+  font: inherit;
+}
+
+.map-pane .leaflet-tooltip {
+  background: var(--bg-raised);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  font: inherit;
+  font-size: 0.8rem;
+}
+
+.map-pane .leaflet-tooltip-top::before {
+  border-top-color: var(--border-strong);
+}
+
+.zone-marker-dot {
+  display: block;
+  width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 999px;
+  background: var(--accent);
+  border: 2px solid var(--accent-text);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .map-pane .leaflet-fade-anim .leaflet-tile,
+  .map-pane .leaflet-zoom-anim .leaflet-zoom-animated {
+    transition: none;
   }
 }
 

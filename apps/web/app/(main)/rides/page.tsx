@@ -1,15 +1,29 @@
 "use client";
 
 import { useState } from "react";
+import dynamic from "next/dynamic";
 import Link from "next/link";
 import { BookingArea } from "@/components/booking-area";
 import { FareBreakdown } from "@/components/fare-breakdown";
 import { PoolInfo } from "@/components/pool-info";
 import { RoleGate } from "@/components/role-gate";
 import { StatusBadge } from "@/components/status-badge";
+import { WorkspaceShell } from "@/components/workspace/workspace-shell";
 import { formatPaisa } from "@/lib/format";
 import { useRides } from "@/lib/queries";
 import { isTerminal, type RideView } from "@/lib/types";
+
+// Leaflet is client-only and must never execute during prerender, so the map
+// is always `dynamic(…, { ssr: false })`. The placeholder keeps the map slot's
+// size while it loads so the layout doesn't jump (frontend-design.md §8).
+const MapPane = dynamic(() => import("@/components/workspace/map-pane"), {
+  ssr: false,
+  loading: () => (
+    <div className="map-pane map-pane-placeholder" role="status">
+      Loading map…
+    </div>
+  ),
+});
 
 // Passenger workspace: book while no ride is active (BookingArea enforces the
 // one-active-ride rule in the UI) and see the confirmed booking with its live
@@ -23,7 +37,7 @@ export default function RidesPage() {
 
   return (
     <RoleGate roles={["PASSENGER"]} fallback="/driver">
-      <main className="container">
+      <WorkspaceShell map={<MapPane />}>
         <h1 className="page-header">Book a ride</h1>
 
         <section aria-labelledby="book-heading">
@@ -48,7 +62,7 @@ export default function RidesPage() {
             </p>
           </section>
         )}
-      </main>
+      </WorkspaceShell>
     </RoleGate>
   );
 }
