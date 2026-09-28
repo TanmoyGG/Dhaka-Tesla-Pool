@@ -179,11 +179,26 @@ p {
   overflow: hidden;
   text-overflow: ellipsis;
   font-size: 1rem;
-  font-weight: 800;
-  font-style: italic;
+  /* Light tracked-out caps — cleaner and thinner than the old bold-italic,
+     still legible against the muted header grey. */
+  font-weight: 300;
+  font-style: normal;
   text-transform: uppercase;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.08em;
   color: var(--muted);
+}
+
+/* Mobile: pin the identity just left of the hamburger so the header reads
+   brand ···· USER → ☰ instead of three spread-out islands. Desktop keeps the
+   centered `1fr auto 1fr` alignment above (unchanged). */
+@media (max-width: 47.99rem) {
+  .site-header-inner {
+    grid-template-columns: 1fr auto auto;
+  }
+
+  .site-header-current {
+    justify-self: end;
+  }
 }
 
 /* Hamburger trigger (docs/frontend-design.md §7) */
@@ -690,6 +705,13 @@ p {
 @media (min-width: 40rem) {
   .form-grid {
     grid-template-columns: 1fr 1fr 1fr;
+  }
+
+  /* Multi-column fields sit above narrow select columns where a longer label
+     ("Destination zone") can wrap while shorter ones don't — reserving equal
+     two-line label space keeps every select on the same row. */
+  .form-grid .field label {
+    min-height: 2.85em;
   }
 }
 
