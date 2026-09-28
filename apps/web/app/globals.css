@@ -80,6 +80,24 @@ body {
   margin: 0 0 1.25rem;
 }
 
+/* Page title row (e.g. Ride details) with a compact action on the right —
+   collapses into a single responsive row on mobile. */
+.page-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.page-head .page-header {
+  margin: 0;
+}
+
+.page-head .btn {
+  white-space: nowrap;
+}
+
 .page-link {
   display: inline-block;
   margin-bottom: 1rem;
@@ -344,6 +362,95 @@ p {
   }
 }
 
+/* ----- Completion modal (cash-payment acknowledgement) ----- */
+
+/* Portaled to <body> (see ride-completion-modal.tsx) so it is true viewport
+   UI above the header. Centered by flex; the card's min() width keeps it
+   comfortably inset on phones and compact on desktop. */
+.completion-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+
+.completion-modal-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(6, 7, 9, 0.6);
+  backdrop-filter: blur(2px);
+  animation: completion-fade 150ms ease;
+}
+
+.completion-modal-card {
+  position: relative;
+  width: min(100%, 22rem);
+  max-height: calc(100dvh - 2rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 1.25rem 3.5rem rgba(0, 0, 0, 0.55);
+  padding: 1.75rem 1.5rem;
+  text-align: center;
+  animation: completion-pop 160ms ease;
+}
+
+.completion-modal-card h2 {
+  margin: 0 0 0.35rem;
+}
+
+.completion-route {
+  margin: 0 0 1rem;
+}
+
+.completion-fare {
+  font-size: 1.05rem;
+  margin: 0 0 1.35rem;
+}
+
+.completion-fare strong {
+  font-size: 1.4rem;
+  color: var(--accent);
+}
+
+.completion-thanks {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+@keyframes completion-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes completion-pop {
+  from {
+    opacity: 0;
+    transform: translateY(0.5rem) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .completion-modal-overlay,
+  .completion-modal-card {
+    animation: none;
+  }
+}
+
 /* ----- Shared ride workspace (map + controls) ----- */
 
 /* The workspace replaces the centered .container inside the signed-in app:
@@ -486,6 +593,21 @@ p {
   background: var(--accent);
   border: 2px solid var(--accent-text);
   box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* Selected-zone marker variants (Phase 4): pickup = filled lime with a pulse
+   halo ring, destination = lime outline with an open centre — visually
+   distinct from the plain muted zone dots. */
+.zone-marker--pickup .zone-marker-dot {
+  box-shadow:
+    0 0 0 4px var(--accent-soft),
+    0 0 0 6px rgba(182, 243, 107, 0.22);
+}
+
+.zone-marker--destination .zone-marker-dot {
+  background: var(--bg);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-soft);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -696,23 +818,32 @@ p {
 
 /* ----- Forms ----- */
 
-.form-grid {
+/* Route group: two fields, side-by-side on anything wide enough that the
+   labels fit without wrapping, stacked otherwise. Replaces the cramped
+   3-across grid of the pre-Phase-4 form. */
+.route-heading {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin: 0 0 0.85rem;
+}
+
+.route-grid {
   display: grid;
   grid-template-columns: 1fr;
   gap: 0.85rem;
 }
 
-@media (min-width: 40rem) {
-  .form-grid {
-    grid-template-columns: 1fr 1fr 1fr;
+@media (min-width: 28rem) {
+  .route-grid {
+    grid-template-columns: 1fr 1fr;
   }
+}
 
-  /* Multi-column fields sit above narrow select columns where a longer label
-     ("Destination zone") can wrap while shorter ones don't — reserving equal
-     two-line label space keeps every select on the same row. */
-  .form-grid .field label {
-    min-height: 2.85em;
-  }
+.route-swap {
+  margin: 0.7rem 0 0;
+  display: flex;
+  justify-content: flex-start;
 }
 
 .field {
@@ -721,9 +852,48 @@ p {
   gap: 0.3rem;
 }
 
-.field label {
+.field label,
+.field-label {
   font-weight: 600;
   font-size: 0.88rem;
+}
+
+.field-hint {
+  margin: 0.1rem 0 0;
+}
+
+.seats-field {
+  margin-top: 1.15rem;
+}
+
+/* Segmented 1|2|3 seat control (spec §5.2: stepper, default 1). */
+.segment {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.5rem;
+}
+
+.segment-option {
+  min-height: 2.85rem;
+  font: inherit;
+  font-weight: 700;
+  font-size: 1rem;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.segment-option:hover {
+  border-color: var(--muted);
+}
+
+.segment-option[aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
 }
 
 .field select,
@@ -747,6 +917,37 @@ p {
   color: var(--danger-text);
   font-size: 0.85rem;
   margin: 0.25rem 0;
+}
+
+/* ----- Fare estimate (backend-provided, FareBreakdown) ----- */
+
+.estimate-block {
+  margin-top: 1.25rem;
+  padding-top: 1.15rem;
+  border-top: 1px solid var(--border);
+}
+
+.estimate-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.estimate-title {
+  margin: 0;
+  font-size: 1.02rem;
+  font-weight: 600;
+}
+
+.estimate-total {
+  font-weight: 800;
+  font-size: 1.12rem;
+  color: var(--accent);
+}
+
+.estimate-note {
+  margin-top: 1.25rem;
 }
 
 /* ----- Ride list ----- */

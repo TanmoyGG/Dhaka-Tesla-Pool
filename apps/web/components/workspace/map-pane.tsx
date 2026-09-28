@@ -7,13 +7,17 @@
 //
 // Non-blocking rule (hard): if the map fails, booking is unaffected — the
 // pane falls back to a quiet message and the controls carry on.
+//
+// Phase 4 (passenger book mode): the workspace lifts the form's zone selection
+// here as pickupZoneId/destinationZoneId. Selected pins get distinct markers
+// with an open tooltip, and once BOTH ends are chosen the view fits the route.
+// Zone coordinates still come ONLY from GET /api/zones — never hardcoded here.
 
 import L from "leaflet";
 import { useEffect, useRef, useState } from "react";
 import { useZones } from "@/lib/queries";
 
-// Dhaka city center — the map's initial view only. Zone coordinates are NEVER
-// hardcoded: they always come from GET /api/zones via useZones().
+// Dhaka city center — the map's initial view only.
 const DHAKA_CENTER: L.LatLngTuple = [23.79, 90.4];
 const DHAKA_ZOOM = 12;
 
@@ -21,21 +25,31 @@ const OSM_TILE_URL = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
 const OSM_ATTRIBUTION =
   '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 
-// Decorative lime pin for a zone. divIcon → no marker-image assets to bundle,
-// matches the always-dark accent token set.
-function zoneIcon(): L.DivIcon {
+// Set an icon class so the selected pickup/destination pins stand out from
+// the muted zone dots (CSS in globals.css drives the look — divIcon, no image
+// assets). Any extra class becomes part of the marker's wrapper class.
+function zoneIcon(extra?: string): L.DivIcon {
+  const wrapper = extra ? `zone-marker ${extra}` : "zone-marker";
   return L.divIcon({
-    className: "zone-marker",
+    className: wrapper,
     html: `<span class="zone-marker-dot" aria-hidden="true"></span>`,
-    iconSize: [14, 14],
-    iconAnchor: [7, 7],
+    iconSize: [16, 16],
+    iconAnchor: [8, 8],
     tooltipAnchor: [0, -11],
   });
 }
 
-export default function MapPane() {
+export default function MapPane({
+  pickupZoneId,
+  destinationZoneId,
+}: {
+  pickupZoneId?: string;
+  destinationZoneId?: string;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
+  // zoneId → marker, rebuilt whenever the zone list refetches.
+  const markersRef = useRef<Map<string, L.Marker>>(new Map());
   const [map, setMap] = useState<L.Map | null>(null);
   const [failed, setFailed] = useState(false);
   const zones = useZones();
@@ -78,16 +92,55 @@ export default function MapPane() {
     };
   }, []);
 
-  // Zone pins load independently of map init — applied whenever both exist.
+  // Rebuild the zone-pin layer from /api/zones whenever the list refreshes.
   // The map never gates the panel, and a zones error just leaves pins off.
   useEffect(() => {
     if (!map || !zones.data) return;
+    const markers = markersRef.current;
+    markers.forEach((marker) => marker.remove());
+    markers.clear();
     for (const zone of zones.data) {
-      L.marker([zone.latitude, zone.longitude], { icon: zoneIcon() })
-        .addTo(map)
-        .bindTooltip(zone.name, { direction: "top" });
+      const marker = L.marker([zone.latitude, zone.longitude], {
+        icon: zoneIcon(),
+      }).addTo(map);
+      marker.bindTooltip(zone.name, { direction: "top" });
+      markers.set(zone.id, marker);
     }
   }, [map, zones.data]);
+
+  // Selection feedback: restyle the chosen pins, open their tooltips, and fit
+  // the route once both ends are known. Idempotent per selection change.
+  useEffect(() => {
+    if (!map || !zones.data) return;
+    const markers = markersRef.current;
+    for (const [id, marker] of markers) {
+      const selected =
+        id === pickupZoneId || id === destinationZoneId;
+      const extra =
+        id === pickupZoneId
+          ? "zone-marker--pickup"
+          : id === destinationZoneId
+            ? "zone-marker--destination"
+            : undefined;
+      marker.setIcon(zoneIcon(extra));
+      if (selected) marker.openTooltip();
+      else marker.closeTooltip();
+    }
+
+    if (pickupZoneId && destinationZoneId && pickupZoneId !== destinationZoneId) {
+      const pickup = zones.data.find((zone) => zone.id === pickupZoneId);
+      const destination = zones.data.find((zone) => zone.id === destinationZoneId);
+      if (pickup && destination) {
+        map.fitBounds(
+          L.latLngBounds(
+            [pickup.latitude, pickup.longitude],
+            [destination.latitude, destination.longitude],
+          ),
+          { padding: [48, 48], maxZoom: 15 },
+        );
+      }
+    }
+  }, [map, zones.data, pickupZoneId, destinationZoneId]);
 
   if (failed) {
     return (

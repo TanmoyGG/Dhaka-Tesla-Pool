@@ -6,7 +6,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { BookingArea } from "@/components/booking-area";
-import { makeRide, makeZone } from "./fixtures";
+import { makeRide, makeRidePool, makeWaitRidePool, makeZone } from "./fixtures";
 
 const queries = vi.hoisted(() => ({
   useZones: vi.fn(),
@@ -60,6 +60,26 @@ describe("BookingArea", () => {
     const link = screen.getByRole("link", { name: "View active ride" });
     expect(link).toHaveAttribute("href", `/rides/${ride.id}`);
     expect(screen.getByText("Driver arrived")).toBeInTheDocument();
+  });
+
+  it("shows quick-glance driver, seats, and total fare on the active ride", () => {
+    const ride = makeRide({
+      status: "MATCHED",
+      pool: makeRidePool({ occupiedSeats: 2 }),
+    });
+    render(<BookingArea activeRide={ride} onBooked={vi.fn()} />);
+
+    expect(screen.getByText("Jashim Ahmed")).toBeInTheDocument();
+    expect(screen.getByText("2 of 3 filled")).toBeInTheDocument();
+    expect(screen.getByText("৳59.32")).toBeInTheDocument();
+  });
+
+  it("shows the waiting-for-driver state on an unassigned wait pool", () => {
+    const ride = makeRide({ status: "MATCHED", pool: makeWaitRidePool() });
+    render(<BookingArea activeRide={ride} onBooked={vi.fn()} />);
+
+    expect(screen.getByText("Waiting for a driver…")).toBeInTheDocument();
+    expect(screen.getByText("1 of 3 filled")).toBeInTheDocument();
   });
 
   it("shows the booking form once no ride is active", () => {

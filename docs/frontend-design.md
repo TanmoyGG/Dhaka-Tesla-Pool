@@ -474,6 +474,11 @@ The MVP is deliberately **not** building:
       behind `/rides`; desktop panel-split + mobile map-top stacking. The
       mobile bottom-sheet behavior stays deferred — no gesture work yet.)**
    4. Passenger book/live/pay flow.
+      **— Phase 4 (book-mode UX): segmented 1|2|3 seat stepper, route swap,
+      live estimate card (FareView verbatim), zone-selection map feedback
+      (pickup/destination pins + route fit), responsive form hierarchy. The
+      live-ride workspace (§5.3) and completion/payment modal (§5.4) stay
+      deferred.**
    5. Driver workspace (availability + lobby + open pools + cash flow) with
       earnings line once the API field exists.
 8. **Document driver-facing map behavior** (markers/polyline pulls zone

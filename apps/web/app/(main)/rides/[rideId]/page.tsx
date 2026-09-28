@@ -5,6 +5,7 @@ import Link from "next/link";
 import { CancelRideButton } from "@/components/cancel-ride-button";
 import { FareBreakdown } from "@/components/fare-breakdown";
 import { PoolInfo } from "@/components/pool-info";
+import { RideCompletionModal } from "@/components/ride-completion-modal";
 import { RoleGate } from "@/components/role-gate";
 import { StatusBadge } from "@/components/status-badge";
 import { ErrorCard, LoadingState } from "@/components/state-components";
@@ -22,7 +23,12 @@ export default function RideDetailPage() {
   return (
     <RoleGate roles={["PASSENGER"]} fallback="/driver">
       <main className="container">
-        <h1 className="page-header">Ride details</h1>
+        <div className="page-head">
+          <h1 className="page-header">Ride details</h1>
+          <Link className="btn btn-ghost btn-sm" href="/rides">
+            ← Back to your rides
+          </Link>
+        </div>
 
         {ride.isLoading && <LoadingState label="Loading ride…" />}
         {ride.isError && <ErrorCard error={ride.error} />}
@@ -79,11 +85,9 @@ export default function RideDetailPage() {
           );
         })()}
 
-        {ride.data && (
-          <p>
-            <Link href="/rides">Back to your rides</Link>
-          </p>
-        )}
+        <RideCompletionModal
+          ride={ride.data?.status === "COMPLETED" ? ride.data : null}
+        />
       </main>
     </RoleGate>
   );

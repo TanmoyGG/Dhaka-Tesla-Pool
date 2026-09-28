@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { describeApiError } from "@/lib/api";
+import { formatPaisa } from "@/lib/format";
 import { FareBreakdown } from "@/components/fare-breakdown";
 import { FormField } from "@/components/form-field";
 import { useCreateRide, useEstimateRide, useZones } from "@/lib/queries";
@@ -44,7 +45,20 @@ const EMPTY_VALUES: RideFormValues = {
   requestedSeats: 1,
 };
 
-export function RideForm({ onBooked }: { onBooked: (ride: RideView) => void }) {
+// Which zones the form currently holds, lifted to the workspace page so the
+// map can give visual feedback (Phase 4, docs/frontend-design.md §5.2/§8).
+export interface ZoneSelection {
+  pickupZoneId?: string;
+  destinationZoneId?: string;
+}
+
+export function RideForm({
+  onBooked,
+  onSelectionChange,
+}: {
+  onBooked: (ride: RideView) => void;
+  onSelectionChange?: (selection: ZoneSelection) => void;
+}) {
   const zones = useZones();
   const createRide = useCreateRide();
   const [serverError, setServerError] = useState<string | null>(null);
@@ -52,7 +66,6 @@ export function RideForm({ onBooked }: { onBooked: (ride: RideView) => void }) {
   const {
     register,
     handleSubmit,
-    reset,
     setValue,
     getValues,
     watch,
@@ -73,6 +86,15 @@ export function RideForm({ onBooked }: { onBooked: (ride: RideView) => void }) {
       setValue("destinationZoneId", "", { shouldValidate: true });
     }
   }, [watched.pickupZoneId, getValues, setValue]);
+
+  // Lift the current zone selection to the workspace so the map can highlight
+  // the pickup/destination pins (and fit the route once both are chosen).
+  useEffect(() => {
+    onSelectionChange?.({
+      pickupZoneId: watched.pickupZoneId,
+      destinationZoneId: watched.destinationZoneId,
+    });
+  }, [watched.pickupZoneId, watched.destinationZoneId, onSelectionChange]);
 
   // The estimate input is only "active" once the form is complete enough:
   // both zones chosen, seats in range, distinct route.
@@ -96,6 +118,14 @@ export function RideForm({ onBooked }: { onBooked: (ride: RideView) => void }) {
 
   const estimate = useEstimateRide(estimateInput);
 
+  function swapRoute() {
+    const pickup = getValues("pickupZoneId");
+    const destination = getValues("destinationZoneId");
+    if (!pickup || !destination) return;
+    setValue("pickupZoneId", destination, { shouldValidate: true });
+    setValue("destinationZoneId", pickup, { shouldValidate: true });
+  }
+
   function onSubmit(values: RideFormValues) {
     setServerError(null);
     createRide.mutateAsync(
@@ -106,8 +136,12 @@ export function RideForm({ onBooked }: { onBooked: (ride: RideView) => void }) {
       },
       {
         onSuccess: (ride) => {
+          // Deliberately NOT reset: resetting would lift an empty selection to
+          // the workspace and wipe the booked route off the map the moment it
+          // becomes active. BookingArea swaps this form for the active-ride
+          // notice as soon as the query refetch lands, and the form remounts
+          // fresh (EMPTY_VALUES) for the next ride.
           onBooked(ride);
-          reset(EMPTY_VALUES);
         },
       },
     ).catch((err: unknown) => {
@@ -129,44 +163,88 @@ export function RideForm({ onBooked }: { onBooked: (ride: RideView) => void }) {
 
   return (
     <form className="card" onSubmit={handleSubmit(onSubmit)} noValidate>
-      <div className="form-grid">
-        <FormField id="pickupZoneId" label="Pickup zone" error={errors.pickupZoneId?.message}>
-          <select id="pickupZoneId" {...register("pickupZoneId")} defaultValue="">
-            <option value="" disabled>
-              Select pickup…
-            </option>
-            {zones.data?.map((zone) => (
-              <option key={zone.id} value={zone.id}>
-                {zone.name}
+      {/* Route: pickup → destination. Two columns on wider panels so the
+          Destination label no longer wraps and knocks its select out of line. */}
+      <section aria-labelledby="route-heading">
+        <h2 id="route-heading" className="route-heading">
+          Where to?
+        </h2>
+        <div className="route-grid">
+          <FormField id="pickupZoneId" label="Pickup zone" error={errors.pickupZoneId?.message}>
+            <select id="pickupZoneId" {...register("pickupZoneId")} defaultValue="">
+              <option value="" disabled>
+                Select pickup…
               </option>
-            ))}
-          </select>
-        </FormField>
+              {zones.data?.map((zone) => (
+                <option key={zone.id} value={zone.id}>
+                  {zone.name}
+                </option>
+              ))}
+            </select>
+          </FormField>
 
-        <FormField id="destinationZoneId" label="Destination zone" error={errors.destinationZoneId?.message}>
-          <select id="destinationZoneId" {...register("destinationZoneId")} defaultValue="">
-            <option value="" disabled>
-              Select destination…
-            </option>
-            {zones.data?.map((zone) => (
-              <option key={zone.id} value={zone.id}>
-                {zone.name}
+          <FormField
+            id="destinationZoneId"
+            label="Destination zone"
+            error={errors.destinationZoneId?.message}
+          >
+            <select id="destinationZoneId" {...register("destinationZoneId")} defaultValue="">
+              <option value="" disabled>
+                Select destination…
               </option>
-            ))}
-          </select>
-        </FormField>
+              {zones.data?.map((zone) => (
+                <option key={zone.id} value={zone.id}>
+                  {zone.name}
+                </option>
+              ))}
+            </select>
+          </FormField>
+        </div>
 
-        <FormField id="requestedSeats" label="Seats" error={errors.requestedSeats?.message}>
-          <select id="requestedSeats" {...register("requestedSeats", { valueAsNumber: true })} defaultValue={1}>
-            <option value={1}>1</option>
-            <option value={2}>2</option>
-            <option value={3}>3</option>
-          </select>
-        </FormField>
+        {watched.pickupZoneId && watched.destinationZoneId && (
+          <p className="route-swap">
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              onClick={swapRoute}
+            >
+              ⇄ Swap pickup and destination
+            </button>
+          </p>
+        )}
+      </section>
+
+      <div className="field seats-field">
+        <span className="field-label" id="seats-label">
+          Seats
+        </span>
+        <div role="group" aria-labelledby="seats-label" className="segment">
+          {[1, 2, 3].map((seats) => (
+            <button
+              key={seats}
+              type="button"
+              className="segment-option"
+              aria-pressed={watched.requestedSeats === seats}
+              onClick={() => setValue("requestedSeats", seats, { shouldValidate: true })}
+            >
+              {seats}
+            </button>
+          ))}
+        </div>
+        <p className="text-small text-muted field-hint">
+          A Tesla has {MAX_SEATS} seats — book for you and your group.
+        </p>
+        {errors.requestedSeats?.message && (
+          <p className="error-text" role="alert">
+            {errors.requestedSeats.message}
+          </p>
+        )}
       </div>
 
       {estimateInput && estimate.isPending && (
-        <p className="text-muted">Estimating your fare…</p>
+        <p className="text-muted estimate-note" role="status">
+          Estimating your fare…
+        </p>
       )}
       {estimateInput && estimate.isError && (
         <p className="error-text">
@@ -174,12 +252,17 @@ export function RideForm({ onBooked }: { onBooked: (ride: RideView) => void }) {
         </p>
       )}
       {estimateInput && estimate.data && (
-        <section aria-label="Fare estimate">
-          <h3>Estimated fare</h3>
+        <section aria-label="Estimated fare" className="estimate-block">
+          <div className="estimate-head">
+            <h3 className="estimate-title">Estimated fare</h3>
+            <span className="estimate-total">
+              {formatPaisa(estimate.data.estimatedTotalPaisa)}
+            </span>
+          </div>
           <FareBreakdown fare={estimate.data} />
           <p className="text-small text-muted">
-            This assumes you ride alone. When a second passenger joins your
-            pool, a 25% pool discount applies to everyone on board.
+            Seat fares assume a solo ride — every seat pays 25% less once your
+            ride shares a Tesla with another passenger.
           </p>
         </section>
       )}
@@ -190,6 +273,7 @@ export function RideForm({ onBooked }: { onBooked: (ride: RideView) => void }) {
         type="submit"
         className="btn btn-primary"
         disabled={createRide.isPending}
+        aria-busy={createRide.isPending}
       >
         {createRide.isPending ? "Booking…" : "Book ride"}
       </button>
