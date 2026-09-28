@@ -4,6 +4,7 @@
 // once ONLINE the normal lobby with Accept buttons returns.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useEffect, useState } from "react";
 import { render, screen } from "@testing-library/react";
 import DriverDashboardPage from "@/app/(main)/driver/page";
 import { makeWaitPool } from "./fixtures";
@@ -25,6 +26,35 @@ vi.mock("next/link", () => ({
   default: ({ children, ...props }: { children: React.ReactNode }) => (
     <a {...props}>{children}</a>
   ),
+}));
+// The workspace mounts Leaflet only through next/dynamic (ssr: false); a test
+// never boots a real map, so both the dynamic wrapper and the pane are stubbed.
+vi.mock("next/dynamic", () => ({
+  __esModule: true,
+  default: (
+    loader: () => Promise<{ default: React.ComponentType<Record<string, unknown>> }>,
+  ) => {
+    function DynamicMock(props: Record<string, unknown>) {
+      const [Component, setComponent] = useState<React.ComponentType<
+        Record<string, unknown>
+      > | null>(null);
+      useEffect(() => {
+        let alive = true;
+        loader().then((module) => {
+          if (alive) setComponent(() => module.default);
+        });
+        return () => {
+          alive = false;
+        };
+      }, []);
+      if (!Component) return null;
+      return <Component {...props} />;
+    }
+    return DynamicMock;
+  },
+}));
+vi.mock("@/components/workspace/map-pane", () => ({
+  default: () => <div data-testid="map-pane" />,
 }));
 vi.mock("@/lib/queries", () => queries);
 

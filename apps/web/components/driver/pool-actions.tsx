@@ -10,7 +10,15 @@ import type { DriverPoolView } from "@/lib/types";
 // is rendered (accept → arrive → start → complete); a terminal or empty pool
 // shows nothing. All four mutations are created unconditionally (hooks rules);
 // no request fires until one is actually used.
-export function PoolActions({ pool }: { pool: DriverPoolView }) {
+export function PoolActions({
+  pool,
+  onCompleted,
+}: {
+  pool: DriverPoolView;
+  // Notified with the completed pool view when THIS button finishes a trip —
+  // the workspace feeds its cash-received modal straight from this result.
+  onCompleted?: (pool: DriverPoolView) => void;
+}) {
   const accept = useAcceptPool();
   const arrive = useArrivePool();
   const start = useStartPool();
@@ -30,11 +38,17 @@ export function PoolActions({ pool }: { pool: DriverPoolView }) {
   }
 
   const hook = hooks[next.action];
+  // Captured before the closure: completion is the only transition that hands
+  // the finished pool to the workspace's completion flow.
+  const completesTrip = next.action === "complete";
 
   function onAction() {
     setError(null);
     hook.mutate(pool.id, {
       onError: (err) => setError(describeApiError(err)),
+      onSuccess: (updatedPool) => {
+        if (completesTrip) onCompleted?.(updatedPool);
+      },
     });
   }
 

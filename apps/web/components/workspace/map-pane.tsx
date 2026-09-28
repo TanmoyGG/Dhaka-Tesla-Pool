@@ -42,9 +42,15 @@ function zoneIcon(extra?: string): L.DivIcon {
 export default function MapPane({
   pickupZoneId,
   destinationZoneId,
+  destinationZoneIds,
 }: {
   pickupZoneId?: string;
   destinationZoneId?: string;
+  // Driver workspace (frontend-design.md §6.4/§8): a pool can carry members
+  // to DIFFERENT destinations (Banani → Mohakhali + Banani → Gulshan 1), so
+  // the map highlights the shared pickup and EVERY distinct drop-off. Additive
+  // and optional: the passenger surface keeps using destinationZoneId.
+  destinationZoneIds?: string[];
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
@@ -113,34 +119,38 @@ export default function MapPane({
   useEffect(() => {
     if (!map || !zones.data) return;
     const markers = markersRef.current;
+    const destinationIds = new Set(
+      destinationZoneIds ?? (destinationZoneId ? [destinationZoneId] : []),
+    );
+
     for (const [id, marker] of markers) {
-      const selected =
-        id === pickupZoneId || id === destinationZoneId;
-      const extra =
-        id === pickupZoneId
-          ? "zone-marker--pickup"
-          : id === destinationZoneId
-            ? "zone-marker--destination"
-            : undefined;
+      let extra: string | undefined;
+      if (id === pickupZoneId) extra = "zone-marker--pickup";
+      else if (destinationIds.has(id)) extra = "zone-marker--destination";
       marker.setIcon(zoneIcon(extra));
-      if (selected) marker.openTooltip();
+      if (extra) marker.openTooltip();
       else marker.closeTooltip();
     }
 
-    if (pickupZoneId && destinationZoneId && pickupZoneId !== destinationZoneId) {
-      const pickup = zones.data.find((zone) => zone.id === pickupZoneId);
-      const destination = zones.data.find((zone) => zone.id === destinationZoneId);
-      if (pickup && destination) {
-        map.fitBounds(
-          L.latLngBounds(
-            [pickup.latitude, pickup.longitude],
-            [destination.latitude, destination.longitude],
+    // Fit the view once the pickup and at least one destination are known.
+    const pickup = zones.data.find((zone) => zone.id === pickupZoneId);
+    const destinations = Array.from(destinationIds).flatMap((id) => {
+      const zone = zones.data.find((zone) => zone.id === id);
+      return zone ? [zone] : [];
+    });
+    if (pickup && destinations.length > 0) {
+      map.fitBounds(
+        L.latLngBounds([
+          [pickup.latitude, pickup.longitude],
+          ...destinations.map(
+            (zone) =>
+              [zone.latitude, zone.longitude] as L.LatLngTuple,
           ),
-          { padding: [48, 48], maxZoom: 15 },
-        );
-      }
+        ]),
+        { padding: [48, 48], maxZoom: 15 },
+      );
     }
-  }, [map, zones.data, pickupZoneId, destinationZoneId]);
+  }, [map, zones.data, pickupZoneId, destinationZoneId, destinationZoneIds]);
 
   if (failed) {
     return (

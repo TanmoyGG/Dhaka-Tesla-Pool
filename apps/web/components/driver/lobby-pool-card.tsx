@@ -7,10 +7,11 @@ import { useAcceptPool } from "@/lib/queries";
 import type { DriverPoolView } from "@/lib/types";
 
 // One UNASSIGNED pool in the driver lobby (ADR-022). Nobody owns it yet, so
-// there is no Tesla to show; the card lists who is riding and offers the
-// first-wins Accept claim right here (the detail page 404s for unclaimed
-// pools). A lost race surfaces as POOL_ALREADY_ACCEPTED and the lobby refetch
-// drops the pool.
+// there is no Tesla to show; the card lists the booking party (names, seats,
+// run) and offers the first-wins Accept claim right here (the detail page 404s
+// for unclaimed pools). Fares stay OFF this surface by design — the decision
+// is route + fill first (frontend-design.md §6.3). A lost race surfaces as
+// POOL_ALREADY_ACCEPTED and the lobby refetch drops the pool.
 export function LobbyPoolCard({ pool }: { pool: DriverPoolView }) {
   const accept = useAcceptPool();
   const [error, setError] = useState<string | null>(null);
@@ -33,11 +34,16 @@ export function LobbyPoolCard({ pool }: { pool: DriverPoolView }) {
 
       <p className="card-seats text-muted">
         {pool.occupiedSeats} of {pool.capacitySnapshot} seats ·{" "}
-        {pool.occupiedSeats} rider seat{pool.occupiedSeats === 1 ? "" : "s"}
         {firstRider
-          ? ` · ${firstRider.pickupZoneName} → ${firstRider.destinationZoneName}`
+          ? `${firstRider.pickupZoneName} → ${firstRider.destinationZoneName}`
           : ""}
       </p>
+
+      {pool.members.length > 0 && (
+        <p className="card-seats text-muted">
+          {pool.members.map((member) => member.passengerName).join(", ")}
+        </p>
+      )}
 
       <div className="row space-between mt">
         <button

@@ -310,21 +310,31 @@ panel / sheet shows, per status:
   pools — the claim lives on the lobby card.
 
 ### 6.4 Open / active pools (owned)
-- Owned non-terminal pools from `useDriverPools` (`GET /api/driver/pools`).
-- Each pool shows: Tesla (name/capacity/online), status, route,
-  passengers + seats (`MemberList` — names, pickup/destination, seats),
-  and — **once available** — per-passenger fare and total earnings
-  (**§11; backend gap**). Update `pool-card.tsx` to surface the earnings
-  line from the API field; never sum seats/estimates client-side.
-- Active trip lifecycle: the single legal next action in the workspace via
-  `nextPoolAction` / `PoolActions` — **accept → arrive → start → complete**
-  (`accepted_at` discriminator for lobby vs owned, ADR-022 §6). Driver
-  detail on `/driver/[poolId]` stays for deep-linking.
+- **Implemented (driver workspace UX phase).** The workspace panel shows the
+  ONE owned non-terminal pool as `ActivePoolCard` (driver's analog of §5.3's
+  active-ride notice): Tesla, seats filled, **total to collect**
+  (`earnings.totalCollectedPaisa`), the single legal next action inline via
+  `PoolActions`, and a `View pool details` link. The waiting-request lobby
+  hides while a trip is active.
+- The map lights up the active pool's **shared pickup zone** and **every
+  distinct member destination** (a pool drops Nusrat at Mohakhali and Rafiq
+  at Gulshan 1 — both pins show; §8, `MapPane` `destinationZoneIds`).
+- Fares come only from the backend pool view (`member.fare`,
+  `earnings.totalCollectedPaisa`), rendered verbatim — never sum
+  seats/estimates client-side. The per-passenger breakdown and the total
+  live on `/driver/[poolId]`.
+- Active trip lifecycle: the single legal next action via `nextPoolAction` /
+  `PoolActions` — **accept → arrive → start → complete** (`accepted_at`
+  discriminator for lobby vs owned, ADR-022 §6). Worker detail on
+  `/driver/[poolId]` stays for deep-linking/history.
 
 ### 6.5 Completion / cash-received flow
-- On `COMPLETED`, a **cash-received modal**: for each passenger the amount
-  collected (from the API earnings field) and the total; a single "Cash
-  received" acknowledgment completes the flow and returns the driver to the
+- **Implemented (driver workspace UX phase).** On `COMPLETED`, a
+  **cash-received modal** (`DriverCompletionModal`): per-passenger rows with
+  the amount collected (`member.fare.totalPaisa`) and the total
+  (`earnings.totalCollectedPaisa`), all verbatim from the API; a single
+  "Cash received" acknowledgment completes the flow (persisted in
+  localStorage so it shows exactly once) and the driver returns to the
   workspace. Same MVP assumption as §5.4: acknowledgment only, no payment
   write.
 
@@ -408,8 +418,12 @@ OpenStreetMap. The workspace grid (`WorkspaceShell`) anchors to the exact
 signed-in header height via `--app-header-height` +
 `.site-header:has(.menu-button)` (globals.css); mobile stacks map-top
 (@~40vh) over a scrolling panel, desktop puts the panel left
-(`minmax(20rem, 26rem)`) and the map right (majority). Driver workspace
-adoption is a later phase; the shell is role-agnostic. Rides use it now.
+(`minmax(20rem, 26rem)`) and the map right (majority). Rides and the driver
+workspace both use it.
+Drivers highlight the active pool: `pickupZoneId` plus **`destinationZoneIds`**
+(every distinct member destination — a pool can carry Nusrat to Mohakhali and
+Rafiq to Gulshan 1 at once), fit across all pins. The single-end
+`destinationZoneId` stays the passenger behavior.
 
 ---
 
@@ -479,8 +493,12 @@ The MVP is deliberately **not** building:
       (pickup/destination pins + route fit), responsive form hierarchy. The
       live-ride workspace (§5.3) and completion/payment modal (§5.4) stay
       deferred.**
-   5. Driver workspace (availability + lobby + open pools + cash flow) with
-      earnings line once the API field exists.
+   5. Driver workspace (availability + lobby + active-trip card + cash flow)
+      with earnings rendered from the API field.
+      **— done (driver workspace UX phase): map+panel workspace, active-pool
+      pickup + all-destination map pins, inline lifecycle actions, per-rider
+      fares + total collection on the detail page, fare-free first-wins lobby,
+      and a cash-received completion modal (once-per-pool localStorage ack).**
 8. **Document driver-facing map behavior** (markers/polyline pulls zone
    coords via `GET /api/zones`) in code comments referencing this spec.
 
@@ -497,17 +515,12 @@ changed — each needs a conscious decision:
    direction decision, not a token renaming). ADR-021 §4's "switch later if
    the design surface grows" applies. **Assumption:** lime replaces blue
    everywhere in the app (not a secondary flavor).
-2. **Driver fares/earnings is a backend gap (P9).** The spec (§6.4, §6.5)
-   requires per-passenger fare and total earnings on the driver workspace,
-   but `DriverPoolView`/`DriverPoolMemberView` deliberately carry **zero**
-   fare fields ("individual per-passenger fares stay off the driver surface",
-   `pooling/service.ts`). Fares exist only on the passenger surface. The UI
-   will **not** compute them. Needs an **additive read-only backend field**
-   (e.g., per-member fare + a `totalCollectedPaisa` on `DriverPoolView`,
-   sourced from the already-stored `fares` rows) before those screens can
-   show money. **Assumption:** this is accepted follow-up work; the passenger
-   flow and §13 UI land without it, driver earnings render when the field
-   ships.
+2. **Driver fares/earnings backend gap (P9) — RESOLVED.** §6.4/§6.5 once
+   required fare fields the driver API lacked. That gap closed in commit
+   `74e1d8f` (per-passenger `fare` + `earnings.totalCollectedPaisa` on
+   `DriverPoolView`, read from the stored `fares` rows), and the driver
+   workspace now renders them verbatim. The web mirror (`lib/types.ts`) was
+   updated in the same phase; the UI never recomputes money.
 3. **Landing is the single auth control set.** Signed-out visitors reach
    auth only from the landing CTAs; the reworked `AppShell` header (Phase 2)
    no longer renders a sign-in/up pair at all.

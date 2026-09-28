@@ -73,9 +73,21 @@ export interface RideView {
   updatedAt: string;
 }
 
-// The pool view the DRIVER sees (pooling/service.ts): the passenger members,
-// NO per-passenger fares (P9). Deliberately a different surface from
-// RidePoolView.
+// The pool view the DRIVER sees (pooling/service.ts): the passenger members
+// with their per-person fares plus the pool's total collection. Deliberately a
+// different surface from RidePoolView. Fares are read-only from the stored
+// `fares` rows (per-seat, ADR-015); the UI renders them verbatim.
+export interface DriverPoolMemberFareView {
+  currency: string;
+  perSeatFarePaisa: number;
+  totalPaisa: number;
+}
+
+export interface DriverPoolEarningsView {
+  currency: string;
+  totalCollectedPaisa: number;
+}
+
 export interface DriverPoolMemberView {
   rideRequestId: string;
   passengerId: string;
@@ -85,6 +97,8 @@ export interface DriverPoolMemberView {
   destinationZoneId: string;
   destinationZoneName: string;
   seats: number;
+  // What this passenger pays: per seat + their seat total (integer paisa).
+  fare: DriverPoolMemberFareView;
 }
 
 export interface DriverPoolView {
@@ -106,6 +120,8 @@ export interface DriverPoolView {
   createdAt: string;
   updatedAt: string;
   members: DriverPoolMemberView[];
+  // Total collected from the ACTIVE members (Σ member.fare.totalPaisa).
+  earnings: DriverPoolEarningsView;
 }
 
 export interface MeResponse {

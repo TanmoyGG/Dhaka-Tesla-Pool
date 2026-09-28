@@ -1,10 +1,14 @@
 import Link from "next/link";
 import { StatusBadge } from "@/components/status-badge";
+import { formatPaisa } from "@/lib/format";
 import { nextPoolAction } from "@/lib/pool-actions";
 import type { DriverPoolView } from "@/lib/types";
 
-// One pool on the driver dashboard: Tesla, occupancy, how many passengers
-// are on board, and the legal next action. Fares stay off this surface (P9).
+// One completed trip on the driver's history (frontend-design.md §6.6):
+// route, occupancy, passenger count, and the total collected. Fares come
+// verbatim from the backend pool view (`earnings.totalCollectedPaisa`) —
+// never recomputed. The active-pool variant lives on the workspace as
+// ActivePoolCard; this compact card serves the history route.
 export function DriverPoolCard({
   pool,
   isHistory = false,
@@ -13,7 +17,12 @@ export function DriverPoolCard({
   isHistory?: boolean;
 }) {
   const next = nextPoolAction(pool);
-  const passengers = pool.members.length;
+  const members = pool.members;
+  const firstRider = members[0];
+  const route = firstRider
+    ? `${firstRider.pickupZoneName} → ${firstRider.destinationZoneName}`
+    : "No confirmed route";
+  const destinationZoneIds = [...new Set(members.map((m) => m.destinationZoneId))];
 
   return (
     <article className="card">
@@ -23,8 +32,15 @@ export function DriverPoolCard({
       </div>
 
       <p className="card-seats text-muted">
-        {pool.occupiedSeats} of {pool.capacitySnapshot} seats ·{" "}
-        {passengers} passenger{passengers === 1 ? "" : "s"}
+        {route}
+        {destinationZoneIds.length > 1
+          ? ` (+${destinationZoneIds.length - 1} more drop-off${destinationZoneIds.length === 2 ? "" : "s"})`
+          : ""}
+      </p>
+      <p className="card-seats text-muted">
+        {pool.occupiedSeats} of {pool.capacitySnapshot} seats · {members.length}{" "}
+        passenger{members.length === 1 ? "" : "s"} · total collected{" "}
+        <strong>{formatPaisa(pool.earnings.totalCollectedPaisa)}</strong>
       </p>
 
       {!isHistory && next && (

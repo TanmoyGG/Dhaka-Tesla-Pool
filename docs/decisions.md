@@ -659,8 +659,11 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
 - **Decision:** two read-only `DRIVER` routes feed the driver hub UI without
   widening the write surface: the current availability switch state (so the
   toggle renders true state), and terminal pools (so "previous trips" is
-  renderable). Both keep the fare-free rule (P9) — no fares anywhere in the
-  driver graph.
+  renderable). The fare-free rule (P9) stated at the time was later relaxed
+  for the driver hub by commit `74e1d8f`, which added per-passenger `fare`
+  and pool `earnings` to the driver pool view (read from the stored `fares`
+  rows, ACTIVE members only) — the driver surface shows the money it
+  collects, still never recomputing it.
 - **Alternative rejected:** reusing `GET /api/driver/pools` for both open and
   completed trips — the route's non-terminal semantics are part of the
   Phase 6 contract; a second read is cheaper than a semantics change.

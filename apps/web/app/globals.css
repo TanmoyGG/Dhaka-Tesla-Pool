@@ -408,6 +408,33 @@ p {
   margin: 0 0 1rem;
 }
 
+/* Per-passenger collection rows in the driver modal (§6.5): name + seats on
+   the left, the passenger's backend fare on the right. */
+.completion-passengers {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding: 0.65rem 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+}
+
+.completion-passengers li {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+}
+
+.completion-passengers strong {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
 .completion-fare {
   font-size: 1.05rem;
   margin: 0 0 1.35rem;
@@ -1245,6 +1272,15 @@ p {
 
 .member-name {
   font-weight: 700;
+}
+
+/* Per-passenger fare on the driver surface (§6.4): backend figure rendered
+   verbatim, accent-tinted so the money reads at a glance. */
+.member-fare {
+  color: var(--accent);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 /* ----- Loading skeleton ----- */

@@ -5,6 +5,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { PoolActions } from "@/components/driver/pool-actions";
+import type { DriverPoolView } from "@/lib/types";
 import { makeDriverPool, makeWaitPool } from "./fixtures";
 
 const queries = vi.hoisted(() => ({
@@ -63,5 +64,28 @@ describe("PoolActions", () => {
       <PoolActions pool={makeDriverPool({ status: "COMPLETED" })} />,
     );
     expect(container.querySelector("button")).toBeNull();
+  });
+
+  it("notifies onCompleted with the returned pool when the trip is finished", () => {
+    const completed = makeDriverPool({ status: "COMPLETED" });
+    const onCompleted = vi.fn();
+
+    render(
+      <PoolActions
+        pool={makeDriverPool({ status: "STARTED" })}
+        onCompleted={onCompleted}
+      />,
+    );
+
+    let onSuccess: (pool: DriverPoolView) => void = () => undefined;
+    completeMutate.mockImplementation((_poolId, options) => {
+      onSuccess = options.onSuccess;
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Complete trip" }));
+    expect(completeMutate).toHaveBeenCalled();
+    expect(onCompleted).not.toHaveBeenCalled();
+
+    onSuccess(completed);
+    expect(onCompleted).toHaveBeenCalledWith(completed);
   });
 });

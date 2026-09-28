@@ -87,6 +87,15 @@ export function makeRide(overrides: Partial<RideView> = {}): RideView {
   };
 }
 
+// Per-passenger fare on the driver surface (backend DriverPoolMemberFareView,
+// ADR-015): per seat + seat total, integer paisa. Nusrat books one seat at
+// ৳59.32.
+const NUSRAT_FARE = {
+  currency: "BDT",
+  perSeatFarePaisa: 5932,
+  totalPaisa: 5932,
+};
+
 export function makeDriverMember(
   overrides: Partial<DriverPoolMemberView> = {},
 ): DriverPoolMemberView {
@@ -99,6 +108,7 @@ export function makeDriverMember(
     destinationZoneId: "b1a60c28-92e6-4f87-b2a4-6f5e8f3d11bb",
     destinationZoneName: "Mohakhali",
     seats: 1,
+    fare: NUSRAT_FARE,
     ...overrides,
   };
 }
@@ -109,20 +119,27 @@ export function makeDriverMember(
 export function makeDriverPool(
   overrides: Partial<DriverPoolView> = {},
 ): DriverPoolView {
-  const member = makeDriverMember();
+  const { members, earnings, ...rest } = overrides;
+  const resolvedMembers = members ?? [makeDriverMember()];
+  const earningsTotal = resolvedMembers.reduce(
+    (sum, member) => sum + member.fare.totalPaisa,
+    0,
+  );
   return {
     id: "d1f9d4a0-0000-0000-0000-000000000001",
     status: "MATCHED",
     capacitySnapshot: 3,
-    occupiedSeats: 1,
+    occupiedSeats: resolvedMembers.reduce((sum, member) => sum + member.seats, 0),
     vehicle: { id: BULLET_ID, name: "Bullet", capacity: 3, isOnline: true },
     acceptedAt: "2026-09-27T10:05:00.000Z",
     startedAt: null,
     completedAt: null,
     createdAt: "2026-09-27T10:00:00.000Z",
     updatedAt: "2026-09-27T10:00:00.000Z",
-    members: [member],
-    ...overrides,
+    members: resolvedMembers,
+    earnings:
+      earnings ?? { currency: "BDT", totalCollectedPaisa: earningsTotal },
+    ...rest,
   };
 }
 
