@@ -43,7 +43,7 @@ flowchart LR
 
     subgraph Web[apps/web - Next.js/React, always-dark plain-CSS]
         UI[React UI]
-        CLRP[<@clerk/nextjs><br/>ClerkProvider + middleware]
+        CLRP["<@clerk/nextjs><br/>ClerkProvider + middleware"]
         RF[React Hook Form + Zod validation]
         TQ[TanStack Query client state / caching]
         MAP[Leaflet + OpenStreetMap - visualization only]
@@ -52,7 +52,7 @@ flowchart LR
 
     subgraph Api[apps/api - Fastify]
         ROUTES[REST routes]
-        VERIFY[Auth plugin<br/>@clerk/backend authenticateRequest<br/>+ resolve local user]
+        VERIFY["Auth plugin<br/>@clerk/backend authenticateRequest<br/>+ resolve local user"]
         AUTHZ[requireAuth / requireRole<br/>roles from PostgreSQL]
         VAL[Zod request validation]
         BC[Business logic / services<br/>ride state machine, pooling, fares]
