@@ -71,13 +71,20 @@ REQUESTED
   journal entry `NULL → REQUESTED` into `ride_status_history`; a REQUESTED ride
   holds no pool and no seats (`REQUESTED` is a seat-hold-free state, so Phase 4
   needs no concurrency locking — the pooling phase adds it, requirements §14).
+  (Since ADR-022, `REQUESTED` is **transient-only**: a request transitions to
+  MATCHED inside the create-ride transaction, and no ride persists in REQUESTED.)
 - **Phase 5 notes** (ADR-016/017): the full lifecycle is declared as an explicit
   state machine (`apps/api/src/rides/state.ts`) with a single transition map;
   every service state change goes through it and invalid moves raise
   `409 INVALID_STATE_TRANSITION`. Phase 5 exercises the automatically-matched
   `REQUESTED → MATCHED` and cancellation `{REQUESTED, MATCHED} → CANCELLED`
-  arms. `DRIVER_ARRIVED → STARTED → COMPLETED` are declared in the map now and
-  implemented with the driver flow (later phase).
+  arms.
+- **Driver-flow notes** (realized in Phase 6, ADR-019/020/022): the
+  `DRIVER_ARRIVED → STARTED → COMPLETED` arms are implemented by the driver
+  lifecycle routes (`POST /api/driver/pools/:poolId/{accept,arrive,start,
+  complete}`). Since ADR-022 `REQUESTED` is **transient-only** — a matched
+  (or unmatched-but-eligible) request lands `MATCHED` either in an eligible
+  pool or in its own unassigned wait pool (§21.C).
 
 ## 5. Geography
 
@@ -99,15 +106,15 @@ REQUESTED
 
 - **Implemented in Phase 4** (`apps/api/src/fare/`, ADR-015): the deterministic
   estimate is computed for a new ride request and stored per seat in `fares`
-  integer paisa. Nusrat `Banani → Mohakhali` = **5932 paisa (BDT 59.32)**;
-  Rafiq `Banani → Gulshan 1` = **4140 paisa (BDT 41.40)** — both pinned in
+  integer paisa. Nusrat `Banani → Mohakhali` = **5332 paisa (BDT 53.32)**;
+  Rafiq `Banani → Gulshan 1` = **5303 paisa (BDT 53.03)** — both pinned in
   `test/fare.test.ts` and `test/rides.test.ts`. Formula/rounding:
   `roundHalfUp(haversine × 1.3 × 1200)`; `final = base + distance − discount`
   derived, never independently rounded; a pool discount stays 0 for a
   single-member pool and is applied **in place** once a pool holds ≥ 2 ACTIVE
   members (Phase 5, ADR-017): `poolDiscount = roundHalfUp(25% of (base +
-  distance))`, `final = base + distance − discount` — Nusrat lands at **4449
-  paisa**, Rafiq at **3105 paisa** (both pinned).
+  distance))`, `final = base + distance − discount` — Nusrat lands at **3999
+  paisa**, Rafiq at **3977 paisa** (both pinned).
 - The evaluator must be able to **verify the calculation by hand** using Nusrat's
   and Rafiq's trip.
 - Document **how money is stored** (integer paisa/poysha vs. decimal) and why.
@@ -201,6 +208,15 @@ build(docker): add compose setup for api and postgres
 ```
 
 ## 13. README Requirements (minimum)
+
+> **Delivery status (docs pass):** met in `README.md` except the two items
+> still marked OPEN below. Screenshots/GIFs ✅ (18 PNGs in
+> `docs/Screenshots/`), architecture + ERD ✅, stack/structure/prerequisites ✅,
+> env + local setup + Docker + migration/seed ✅, run/tests + demo credentials
+> ✅, API overview + decisions + known limitations + next improvements ✅,
+> **AI Usage** ✅. **OPEN:** deployment URL (no public deploy yet —
+> `docs/development-plan.md` Phase 11) and the **demo video link**
+> (Phase 12).
 
 - Summary, problem statement, features implemented, screenshots/GIFs.
 - Architecture diagram and ERD/database diagram.
@@ -300,11 +316,14 @@ the ambiguity is explained, and one reasonable MVP assumption is proposed.
   every ACTIVE pool member's destination points. An existing eligible pool is
   always preferred over creating a new one; the pool choice is fully
   deterministic (**fullest first** — `occupiedSeats DESC, created_at ASC, id
-  ASC`) so concurrent requests converge on the same Tesla. Applied to the story:
+  ASC`) so the *choice among existing pools* is stable. Applied to the story:
   Nusrat (Banani → Mohakhali) and Rafiq (Banani → Gulshan 1) share a pool
-  (spread ≈ 1.906 km); Banani → Dhanmondi does **not** (≈ 4.6 km from the pool).
+  (spread ≈ 1.103 km); Banani → Dhanmondi does **not** (≈ 4.6 km from the pool).
   The rule is pure and unit-tested (`test/matching.test.ts`), with no routing
-  engine — only predefined zone points (§5).
+  engine — only predefined zone points (§5). Since ADR-022 the candidate set is
+  every `MATCHED` pool, claimed or not, and no Tesla is chosen at booking time;
+  two truly simultaneous first-claims therefore land in two wait pools
+  (accepted tradeoff — capacity is always correct, no seat is double-booked).
 
 ### B. Cancellation rules ("cancel while valid")
 - PRD: "cancel while valid" (passenger).
@@ -377,7 +396,7 @@ the ambiguity is explained, and one reasonable MVP assumption is proposed.
 ### G. Map visualization behavior
 - PRD: predefined list of Dhaka areas / lat-long points / lightweight free map; do not fight map APIs.
 - Ambiguity: What exactly the map shows and how interactive it must be.
-- MVP assumption: Map is **visualization only** (display of predefined zones + matched route markers). Static zone selection via dropdown/buttons rather than map picking; Leaflet + OSM renders zones and route polylines. No routing, geocoding, or dragging of pins.
+- MVP assumption: Map is **visualization only** (display of predefined zones + matched route markers). Static zone selection via dropdown/buttons rather than map picking. **Realized in the web workspace (Phase 9 + redesign, ADR-021):** Leaflet + OSM renders zones and route polylines on `/rides` and `/driver`. No routing, geocoding, or dragging of pins.
 
 ### H. Route-distance approximation
 - PRD: fare needs distanceCharge; no routing.

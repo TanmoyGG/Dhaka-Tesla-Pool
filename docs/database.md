@@ -137,8 +137,8 @@ A set of matched ride requests being served by **one Tesla**.
 | column | type | notes |
 |---|---|---|
 | `id` | uuid PK | |
-| `vehicle_id` | uuid → `vehicles.id` | RESTRICT |
-| `driver_id` | uuid → `users.id` | RESTRICT; must equal the vehicle's driver (app-enforced) |
+| `vehicle_id` | uuid → `vehicles.id` | RESTRICT; **NULL until a driver accepts** (ADR-022, migration 0007) |
+| `driver_id` | uuid → `users.id` | RESTRICT; **NULL until a driver accepts**; must equal the vehicle's driver (app-enforced) (ADR-022, migration 0007) |
 | `status` | `ride_status` NOT NULL DEFAULT `REQUESTED` | pool carries the same lifecycle |
 | `capacity_snapshot` | integer NOT NULL | CHECK `> 0`; vehicle capacity copied at pool creation |
 | `accepted_at` | timestamptz NULL | **added in migration 0005** (Phase 6); driver accept records the confirmation (ADR-019) |
@@ -146,9 +146,13 @@ A set of matched ride requests being served by **one Tesla**.
 | `started_at` | timestamptz NULL | CHECK: set only for `STARTED`/`COMPLETED` |
 | `completed_at` | timestamptz NULL | CHECK: set exactly when `COMPLETED`; requires `started_at` |
 
-**Partial unique index:** `pools_single_active_per_vehicle` — a vehicle can
-have at most one pool in a non-terminal state (`NOT IN ('COMPLETED','CANCELLED')`).
-This is a first-class capacity/concurrency invariant at the DB layer.
+**Partial unique indexes (migration 0007, ADR-022):** `pools_single_accepted_per_vehicle`
+and `pools_single_accepted_per_driver` — a Tesla/driver can have at most **one
+accepted** pool in a non-terminal state (`NOT IN ('COMPLETED','CANCELLED')`).
+These are first-class capacity/concurrency invariants at the DB layer. (The
+earlier `pools_single_active_per_vehicle` index was **dropped by migration
+0007** — it assumed pools were bound to a vehicle at creation; under ADR-022 a
+wait pool is unassigned until a driver accepts it.)
 
 **Check `pools_accepted_progression`** (migration 0005, Phase 6): a pool that
 has progressed (DRIVER_ARRIVED/STARTED/COMPLETED) must carry an
@@ -214,6 +218,21 @@ cancellation produces a full refund **through the discount term**
 (`discount = base + distance`, `final = 0`), so the CHECK keeps holding. Values
 follow §21.D: `base = 3000 paisa`,
 `charge = roundHalfUp(haversine × 1.3 × 1200) paisa/km`.
+
+**Read consumers:** since commit `74e1d8f` (ADR-021 §3) the driver pool views
+(list, detail, history, lifecycle responses) also project each member's `fare`
+and the pool's `earnings` from these rows, so `fares` is no longer
+passenger-write-only.
+
+**Hand-verifiable worked example** (seed coordinates, pinned in
+`apps/api/test/fare.test.ts` and `apps/api/test/driver.test.ts`):
+
+| Trip | haversine × 1.3 × 1200 (paisa) | base | charge | discount (25% of base+charge, half-up) | final |
+|---|---|---|---|---|---|
+| Nusrat Banani → Mohakhali (solo) | 2332 | 3000 | 2332 | 0 | **5332** |
+| Rafiq Banani → Gulshan 1 (solo) | 2303 | 3000 | 2303 | 0 | **5303** |
+| Nusrat pooled (Nusrat + Rafiq) | 2332 | 3000 | 2332 | roundHalfUp(0.25 × 5332) = 1333 | **3999** |
+| Rafiq pooled (Nusrat + Rafiq) | 2303 | 3000 | 2303 | roundHalfUp(0.25 × 5303) = 1326 | **3977** |
 
 ### 3.9 `ride_status_history`
 
@@ -409,7 +428,8 @@ user-owned infrastructure and use `ON DELETE CASCADE`.
 ### 5.8 Email uniqueness is case-insensitive by construction
 Emails are stored lowercase (CHECK `email = lower(email)`) under a plain unique
 index, so `Nusrat@Example.com` and `nusrat@example.com` cannot both exist
-without a functional index. The app normalizes on write (later phases).
+without a functional index. The app normalizes on write (`user-resolver.ts`
+`upsertLocalUser` lowers the email before insert; Phase 3.5).
 
 ### 5.9 No generic "audit" table
 The PRD marks audit **optional**. `ride_status_history` + fare snapshots already
@@ -419,7 +439,7 @@ per the "no complexity without a reason" rule.
 
 ### 5.10 What the DB does NOT enforce (application boundary — documented)
 These require cross-table or cross-row knowledge a simple SQL constraint cannot
-express. The application enforces them in later phases; this list is the record:
+express. The application enforces them (Phases 4–6); this list is the record:
 
 - **Only a `DRIVER` owns a vehicle** — needs a users lookup; CHECK cannot
   reference another table. Enforced by the app when creating vehicles.
@@ -537,9 +557,11 @@ pool-row lock serializes joins per pool. This is the documented outcome for far
 drop-offs and for the loser of the Bullet final-seat race (Shirin lands alone
 in her own wait pool, capacity intact).
 
-**Driver accept — first-wins claim (ADR-022).** `PATCH …/accept` runs inside
-the caller's transaction with this fixed order — **VEHICLE rows `FOR UPDATE`
-(id-ascending) → active-pool count → contested POOL row `FOR UPDATE`**:
+**Driver accept — first-wins claim (ADR-022).** `POST /api/driver/pools/:poolId/accept`
+(`POST`, via the driver service facade — ADR-020 lists it as `PATCH`/accept in
+places, but the shipped route is `POST`) runs inside the caller's transaction
+with this fixed order — **VEHICLE rows `FOR UPDATE` (id-ascending) → active-pool
+count → contested POOL row `FOR UPDATE`**:
 
 1. Lock the caller's VEHICLE rows `FOR UPDATE` (id-ascending) — same
    serialization point as the availability toggle and lifecycle actions
@@ -692,7 +714,8 @@ npm run db:seed   -w @dhaka-tesla-pool/api    # idempotent cast seed
 8. A completed/cancelled ride cannot move back to an earlier state — state
    machine (`src/rides/state.ts`) + `ride_status_history`; invalid moves raise
    `409 INVALID_STATE_TRANSITION` (**Phase 5 implemented the map for all
-   transitions; driver-flow arms exercised in later phases**). ✔ App
+   transitions; the driver-flow arms — `DRIVER_ARRIVED → STARTED → COMPLETED`
+   — have been exercised since Phase 6**, `apps/api/test/driver.test.ts`). ✔ App
 9. Fare amounts cannot be negative — CHECK. ✔ DB
 10. Foreign keys always valid — FKs + restrictive delete policy. ✔ DB
 11. One app user per Clerk identity — `users.clerk_user_id` UNIQUE (ADR-013). ✔ DB

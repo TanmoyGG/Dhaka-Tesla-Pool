@@ -124,6 +124,10 @@
 
 ## ADR-009: Deployment strategy (free-tier only)
 
+> **Status: decided, not yet executed.** `docker compose up` runs the full stack
+> locally, but none of the three hosts has been deployed to; "public deployment
+> preferred" remains an open README/checklist item.
+
 - **Decision:** Vercel (Next.js) → Render (Fastify API) → Neon (PostgreSQL),
   all free tiers; fallback to a reproducible Docker deployment if a free
   backend host is unavailable.
@@ -209,17 +213,21 @@ explainable; `docs/database.md` mirrors this in prose.
   + the derived sum inside one transaction (`docs/database.md` §7).
 - **`pools.capacity_snapshot`** denormalizes vehicle capacity at creation so
   history survives vehicle reconfiguration. `docs/requirements.md` §21.I.
-- **Two partial unique indexes** — `pools_single_active_per_vehicle` (one
-  active pool per Tesla) and `pool_members_one_active_per_request` (one active
-  membership per request): these are capacity/concurrency invariants the DB can
-  express cheaply and must own.
+- **Partial unique index** — `pool_members_one_active_per_request` (one active
+  membership per request): a capacity/concurrency invariant the DB can express
+  cheaply and must own. (The companion `pools_single_active_per_vehicle` index
+  was **dropped by migration 0007** — ADR-022 wait pools are unassigned until a
+  driver accepts; the current per-accepted-pool invariants are
+  `pools_single_accepted_per_driver` / `pools_single_accepted_per_vehicle`.)
 - **Delete policy: RESTRICT for the ride domain, CASCADE for user
-  infrastructure** (`sessions`, `vehicles`). Ride history is not deletable
-  (`docs/requirements.md` §21.I); sessions/vehicles are disposable with their
-  user. See `docs/database.md` §5.7.
+  infrastructure** (`vehicles`). Ride history is not deletable
+  (`docs/requirements.md` §21.I); vehicles are disposable with their
+  user. (`sessions` was deliberately dropped in migration 0001 — ADR-013.)
+  See `docs/database.md` §5.7.
 - **Enforced fare formula as a CHECK** (`final = base + distance − discount`,
   all non-negative): stored history can never contradict the documented model.
-  The *computation* is still a later phase — this only guards stored values.
+  The computation is implemented (ADR-015/017) — this CHECK guards *stored*
+  values against drift.
 - **One final fare per request (`UNIQUE ride_request_id`)**: matches the
   PRD's "each passenger gets an individual fare" snapshot model.
 - **Lowercase-only email CHECK + unique index** instead of `citext`/functional
@@ -374,7 +382,7 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   roadKm              = distanceKm × 1.3                            // 2.4/twist factor, §21.H
   distanceChargePaisa = roundHalfUp(roadKm × 1200)                  // 12 BDT/km
   baseFarePaisa       = 3000                                        // 30 BDT flat
-  poolDiscountPaisa   = 0 for a new (REQUESTED) ride                // pooling, later phase
+  poolDiscountPaisa   = 0 for the initial (unpooled) estimate       // set on pool join (ADR-017)
   finalFarePaisa      = baseFare + distanceCharge − poolDiscount    // never rounded independently
   estimatedTotal      = finalFarePaisa × requestedSeats             // the API total
   ```
@@ -393,8 +401,9 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   not a reaction to parameter drift, so history-immutability (requirements
   §21.I) is preserved. No schema change was needed for this.
 - **Worked examples (pinned in tests, from seed coordinates):**
-  `Banani → Mohakhali` = **5932 paisa** (BDT 59.32, Nusrat);
-  `Banani → Gulshan 1` = **4140 paisa** (BDT 41.40, Rafiq).
+  `Banani → Mohakhali` = **5332 paisa** (BDT 53.32, Nusrat);
+  `Banani → Gulshan 1` = **5303 paisa** (BDT 53.03, Rafiq).
+  (Pooled with the 25% discount: Nusrat **3999**, Rafiq **3977** — ADR-017.)
 - **Atomicity:** ride request + fare + the initial status-history journal entry
   (`NULL → REQUESTED`, requirements §4) commit in **one PostgreSQL
   transaction** (`createRideRequest` in `src/rides/service.ts`). A ride can
@@ -423,9 +432,10 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   `GET /api/zones` list. A ride id that does not exist — or belongs to someone
   else — is a single 404 `NOT_FOUND` so observers cannot distinguish.
 - **Authorization (K7):** Phase 4 ride-request and ride-read endpoints are
-  **PASSENGER-only** (`requireRole(["PASSENGER"])`); DRIVER/ADMIN management of
-  rides/pools is later-phase work. `GET /api/zones` requires a session (any
-  role). CORS now permits `POST` for the future web form.
+  **PASSENGER-only** (`requireRole(["PASSENGER"])`); driver management of
+  rides/pools arrived with the Phase 6 driver flow (ADR-019/020/022).
+  `GET /api/zones` requires a session (any role). CORS now permits `POST` for
+  the web form.
 - **Alternatives rejected:** persisting the estimate only at pooling time
   (breaks "ride and fare are atomic" and the always-explainable fare);
   a separate estimate/final fare table or `is_final` flag (schema churn with no
@@ -444,23 +454,30 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
 - **Matching rule (realizes requirements.md §5, §21.A):**
   1. Same `pickup_zone_id`.
   2. All-pairs drop-off spread ≤ **`POOL_DEST_SPREAD_KM` = 2.0 km** (max
-     pairwise haversine distance among the candidate's and every ACTIVE
-     member's destination point). Nusrat + Rafiq match (≈1.906 km); a Dhanmondi
-     drop-off does not (≈4.6 km from the pool).
+pairwise haversine distance among the candidate's and every ACTIVE
+      member's destination point). Nusrat + Rafiq match (≈1.103 km); a Dhanmondi
+      drop-off does not (≈4.6 km from the pool).
   3. `occupiedSeats + requestedSeats ≤ capacity_snapshot` (occupancy is derived
      from ACTIVE memberships — no cached counter).
   Pool choice among eligible candidates: **fullest first** (`occupiedSeats
   DESC`, then `created_at ASC`, then `id ASC`). An existing eligible pool always
   beats creating a new one; the new-pool Tesla pick is also deterministic
   (`name ASC, id ASC`, online + active driver + no non-terminal pool). Two
-  concurrent first-seat requests therefore converge on the **same** pool.
+  concurrent first-seat requests therefore converge on the **same** pool
+  (*historically true in Phase 5: the `pools_single_active_per_vehicle` unique
+  index serialized the two inserts onto one vehicle/pool. Migration 0007
+  dropped that index, so under ADR-022 two simultaneous first-claims instead
+  each open their own unassigned wait pool — see `pooling.test.ts` "creates
+  SEPARATE wait pools for two concurrent first-claims (accepted tradeoff)"*).
 - **Why no driver "accept" in Phase 5:** the PRD lets us improve if explainable
   (requirements.md §4). Making matching part of create-ride keeps the very
   first transaction atomic (ride + fare + history + membership), avoids a
   separate accept endpoint with unhandled pending state, and makes the required
   concurrency scenario testable without a driver UI. `DRIVER_ARRIVED`/accept
   semantics arrive with the driver phase and are already declared in the state
-  map (ADR-017/state.ts).
+  map (ADR-017/state.ts). **Superseded by ADR-022:** the driver phase reworked
+  system-assigned automatch into an explicit first-wins accept; see the
+  "Behavior changes" list there.
 - **State machine:** `RIDE_STATE_TRANSITIONS` is the single source of truth;
   `canTransition` rejects every invalid move and the service raises
   `409 INVALID_STATE_TRANSITION` instead of writing a bad row. A REQUESTED→
@@ -477,9 +494,10 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   consumer in Phase 5); closest-first or random Tesla selection (non-determinism
   makes the required one-pool race flaky and the story unexplainable).
 - **Switch later if:** real routing/geo becomes available (then the spread rule
-  becomes a detour/time rule), or a driver-accept step becomes product-required
-  (then automatch becomes "reserve while pending" — a separate hold state gains
-  concurrency requirements that the current design deliberately avoids).
+  becomes a detour/time rule). The "driver-accept step becomes product-required"
+  trigger has **already fired** and was resolved by ADR-022 (first-wins claim —
+  not a hold state; automatch became the unassigned-wait-pool design it
+  describes there).
 
 ## ADR-017: Seat-claim transaction: `FOR UPDATE` + derived occupancy (Phase 5)
 
@@ -496,16 +514,17 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   - A claim **`SELECT … FOR UPDATE` the pool row**, then re-derives occupancy
     under that lock and only joins when `occupied + seats ≤ capacity_snapshot`.
     The pool row is the single serialization point for a Tesla, which is correct
-    because `pools_single_active_per_vehicle` guarantees at most one active pool
-    per vehicle.
-  - Pool **creation** uses `INSERT … ON CONFLICT DO NOTHING RETURNING` against
-    that partial unique index. This is the subtle bit: a plain second INSERT on
-    the same Tesla would abort the whole transaction with SQLSTATE 23505. With
-    DO NOTHING the racing INSERT **waits** for the winner (committed or aborted)
-    and then skips with an EMPTY result while our transaction stays alive — and
-    because the winner's commit is a full statement-level snapshot (READ
-    COMMITTED), a single re-scan deterministically finds the winner's pool to
-    join. Bounded re-evaluation exactly once, then stop.
+    because the accepted-pool indexes (`pools_single_accepted_per_driver` /
+    `pools_single_accepted_per_vehicle`, migration 0007) bound accept; before
+    accept a wait pool is unassigned (ADR-022), so every join still funnels
+    through the locked pool row.
+  - Pool **creation** since ADR-022 uses a plain `INSERT … RETURNING` with **no
+    conflict target** — an unmatched request always creates its **own
+    unassigned wait pool** (wait pools reference no vehicle), so a second seat
+    never races the same Tesla at creation. (The pre-ADR-022 bullet below
+    described `INSERT … ON CONFLICT DO NOTHING RETURNING` against the old
+    `pools_single_active_per_vehicle` index — that creation path no longer
+    exists; the current design is simpler and `REQUESTED` is transient-only.)
   - **Lock ordering (deadlock-free):** every transaction that writes both a ride
     row and a pool row acquires the RIDE row lock first, then the POOL row lock
     second. Matches already hold their ride lock from the create-INSERT; cancels
@@ -534,7 +553,7 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   tables, the capacity snapshot, and the partial unique indexes (ADR-012).
 - **Tests (beta of the required 6 behaviors):** `test/pooling.test.ts` covers
   capacity-never-exceeded (sequential + concurrent), invalid transitions
-  rejected (409), pooled fares for Nusrat/Rafiq (4449/3105 paisa), ownership
+  rejected (409), pooled fares for Nusrat/Rafiq (3999/3977 paisa), ownership
   isolation (404), cancellation rules, atomic rollback when a join recompute
   throws, and two true concurrency races (last-seat claim; first-pool creation)
   from two independent database connections.
@@ -544,9 +563,10 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   cached `available_seats` column with optimistic update (would require retry
   loops and can still oversell); Redis locks (unnecessary infra, ADR-free
   violation of "do not decorate").
-- **Switch later if:** a driver-accept step is added (claim becomes "reserve
-  pending accept" — still the same pool-row lock, just a new state); or the
-  system grows to many API instances with hot-zone contention worth sharding.
+- **Switch later if:** the system grows to many API instances with hot-zone
+  contention worth sharding. (The "a driver-accept step is added" trigger
+  **already fired** — ADR-022 implements it as a first-wins claim reusing the
+  same pool-row lock rather than a new hold state.)
 
 ## ADR-018: Cancellation routes and forced-cancel (Phase 5 follow-up)
 
@@ -564,24 +584,32 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
 
 ## ADR-019: Driver workflow — availability switch + lifecycle (Phase 6)
 
+> **Partially superseded by ADR-022.** The lifecycle route verbs, the
+> `pools_single_active_per_vehicle` references, and the offline-switch
+> narrowing in this ADR were updated below to the shipped behavior. Most
+> notably, **accept is now a first-wins claim on an unassigned wait pool**, not
+> a confirmation of a system-assigned pool (ADR-022 §5 lists every intended
+> behavior change); and the driver surface **does show fares/earnings** since
+> commit `74e1d8f` (ADR-021 §3).
+
 - **Status:** Implemented in `apps/api/src/driver/` (routes + facade),
   `apps/api/src/rides/pooling/service.ts`, migration 0005, `POST
   /api/driver/*`; covered in `test/driver.test.ts`.
 - **Decision:** give the driver an explicit **online/offline switch** and
   hands-on control of the assigned pool's lifecycle: accept → arrive → start →
-  complete. The pool is still created by the deterministic automatch
-  (ADR-016) — the driver confirms/operates it, never hunts for it. Identity
-  comes **only** from the authenticated request (`request.auth`), and every
-  driver route is `requireRole(["DRIVER"])` (401 unauthenticated, 403 for
-  passengers).
-- **Accept = confirmation (not reservation):** automatch already committed the
-  pool (MATCHED, seats held under ADR-017's pool-row lock). `accept` records
-  `pools.accepted_at` while the pool **stays MATCHED** — the acceptance is
-  idempotent (repeat accept → no-op 200) and never creates a pending-hold
-  state. A pool whose Tesla is offline is rejected (`409 VEHICLE_OFFLINE`,
-  guard reads the pool's **own** vehicle row); a pool that already left
-  MATCHED is `409 POOL_NOT_ACCEPTABLE`. Not-owned-or-unknown is a plain 404
-  (existence hidden 1:1, same envelope as rides).
+  complete. Identity comes **only** from the authenticated request
+  (`request.auth`), and every driver route is `requireRole(["DRIVER"])`
+  (401 unauthenticated, 403 for passengers).
+- **Accept = first-wins claim (changed by ADR-022):** a pool is born
+  **unassigned** (`driver_id`/`vehicle_id` NULL); `accept`
+  (`POST /api/driver/pools/:poolId/accept`) atomically writes
+  `driver_id`/`vehicle_id`/`accepted_at` under the ADR-020 vehicle → count →
+  pool-row lock order, and the pool **stays MATCHED**. Exactly one concurrent
+  accept wins (`409 POOL_ALREADY_ACCEPTED` for the loser); a same-driver
+  re-accept is idempotent (the active-pool count excludes `:poolId`); a pool
+  whose driver has no online eligible Tesla is rejected (`409 VEHICLE_OFFLINE`).
+  (Under pre-ADR-022 automatch this was a *confirmation* of a system-assigned
+  pool — that path no longer exists.)
 - **Lifecycle semantics (PRD §4):** `arrive` requires a prior accept
   (`409 POOL_NOT_ACCEPTABLE` otherwise, ADR-017's documented improvement);
   the *aggregate* (pool **and** every member ride together) moves
@@ -590,16 +618,21 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   `completed_at` timestamps. Every step validates the state machine first —
   an illegal move (arrive twice, start before arrive, complete before start)
   is a `409 INVALID_STATE_TRANSITION`, never a silent write. Completing a pool
-  drops it out of `pools_single_active_per_vehicle` (status terminal) and
-  thereby **frees the Tesla** for new matching — no separate "release" action.
-- **Offline switch (strict §21.J):** going offline while **any** of the
-  driver's pools is non-terminal is refused (`409 DRIVER_HAS_ACTIVE_POOL`).
-  This is strict: a driver whose pool the *system* matched cannot duck the
-  trip by flipping the switch. Going online merely flips the vehicle(s).
-- **Driver surface excludes fares (P9):** the driver hub lists member names,
-  seats, and zone names — never per-passenger fare amounts. Individual fares
-  are the passenger's view (ADR-015); the driver learns only who is aboard and
-  where they go.
+  drops it out of the accepted-pool partial indexes (status terminal, ADR-022)
+  and thereby **frees the Tesla** for new matching — no separate "release"
+  action.
+- **Offline switch (strict §21.J, narrowed by ADR-022):** going offline while
+  any of the driver's **accepted** pools is non-terminal is refused
+  (`409 DRIVER_HAS_ACTIVE_POOL`). This is strict: a driver cannot duck an
+  accepted trip by flipping the switch. Unassigned wait pools in the lobby do
+  **not** block going offline (they have no owner). Going online merely flips
+  the vehicle(s).
+- **Driver surface shows fares/earnings (P9 relaxed, ADR-021 §3):** the driver
+  hub lists member names, seats, and zone names plus each ACTIVE member's
+  `fare` and the pool's `earnings.totalCollectedPaisa` (commit `74e1d8f`).
+  Individual fares come from the stored `fares` rows — the driver surfaces the
+  money the pool collects, never recomputing it (ADR-015). The earlier
+  "no fares on driver surface" rule was deliberately relaxed in ADR-021 §3.
 - **Passenger cancellation stays legal through DRIVER_ARRIVED (P8):** after
   the driver arrives but *before* the trip starts a passenger may still cancel
   (free up the seat, recompute remaining fares, or terminate a now-empty pool),
@@ -610,10 +643,13 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   ('DRIVER_ARRIVED','STARTED','COMPLETED')`) so a progressed pool can never
   lack an acceptance — while `MATCHED → CANCELLED` (Phase 5 semantics) stays
   fully legal. Partial index `driver_pools_accept_idx` covers the progression
-  audit read. No per-driver single-active-pool index (defensive decoration:
-  the vehicle-level invariant already bounds it, ADR-017's switch note).
-- **Why a thin `DriverService` facade:** driver routes get exactly the seven
-  driver operations and cannot (by typing) reach the passenger-facing
+  audit read. Migration 0007 later **added** the per-accepted-pool indexes
+  `pools_single_accepted_per_driver` / `pools_single_accepted_per_vehicle`
+  (binding the wait-pool model; ADR-022).
+- **Why a thin `DriverService` facade:** driver routes get exactly the driver
+  operations (availability + accept/arrive/start/complete + the read routes —
+  nine total in `apps/api/src/driver/service.ts`) and cannot (by typing) reach
+  the passenger-facing
   match/cancel/force-cancel surface. It is a narrowing, not an abstraction —
   all rules, locks, and errors live in the pooling service.
 - **Alternatives rejected:** accept-as-reservation (MATCHED→"RESERVED" hold)
@@ -624,12 +660,58 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
 - **Switch later if:** real routing/geo turns ARRIVAL into a verifiable event,
   or payment gates require the driver to confirm fares before starting.
 
+## ADR-020: Driver lifecycle lock order — vehicle → rides → pool (Phase 6)
+
+- **Status:** implemented across `apps/api/src/rides/pooling/service.ts`
+  (`lockDriverVehicles`, `lockOwnedPool`, `byId`-ordered ride locks);
+  exercised by `test/driver.test.ts` (concurrent accept/arrive/complete races,
+  offline-vs-booking race).
+- **Decision:** every driver lifecycle transition acquires locks in a fixed
+  order: **driver's VEHICLE rows `FOR UPDATE` (id-ascending) → the pool's
+  member RIDE rows `FOR UPDATE` (id-ascending) → the POOL row `FOR UPDATE`**.
+  The availability toggle locks only vehicle rows and then COUNTs pools
+  (never waits on a pool row). This keeps the whole system deadlock-free with
+  the Phase 5 order:
+  - Passengers (cancel/match) already take **ride → pool** (ADR-017), so the
+    driver's rides-before-pool tail cannot cycle with them.
+  - The **vehicle lock is the shared serialization point** for the driver: the
+    automatch's Tesla pick (commit 2 of Phase 6) locks the same vehicle rows,
+    so an offline toggle and a racing new-booking serialize on Bullet's row —
+    a pool can never be created on a Tesla that is (committed) offline, and an
+    offline toggle can never strand a pool on an offline Tesla
+    (requirements §15, tested).
+  - The availability toggle never locks pool rows, so it cannot deadlock with
+    a transition that holds a pool row.
+- **Why not a single pool-row lock only:** the driver's own offline/online
+  transition needs the vehicle serialization the pool row does not mediate
+  (a pool may not exist yet while a booking races it), and ownership checks on
+  the pool alone would leave a race where two drivers of the same vehicle
+  could act interleaved. Vehicle-then-pool is the one canonical order the
+  data model supports.
+- **READ COMMITTED is sufficient:** every transition acts on a pool that
+  already committed (automatch committed its whole create+match transaction),
+  so an action never needs to "see" an uncommitted pool. The recheck under the
+  pool lock (status still the actionable state) is what makes the loser of a
+  concurrent arrive/complete see a clean `409 INVALID_STATE_TRANSITION`
+  instead of writing on stale state.
+- **Tests:** two independent postgres connections race accept (both succeed
+  idempotently, one `accepted_at`), arrive (exactly one wins), complete (one
+  wins, Tesla freed), and offline-vs-booking (the invariant holds either way:
+  an offline Bullet holds no non-terminal pool).
+- **Switch later if:** the system grows to many API instances with one driver
+  contested from multiple hot paths — then per-vehicle advisory locks or a
+  reservation table (`FOR UPDATE SKIP LOCKED`) would spread the serialization
+  point; the order documented here stays the ordering rule either way.
+
 ## ADR-021: One active ride per passenger, estimate endpoint, and the web UI (Phases 7–8)
 
 - **Status:** implemented on `feature/full-ride-driver-ux` (branched from
   `feature/passenger-ui`). Backend additions in `apps/api` (migration 0006 +
-  `rides`/`driver` routes); the full web UI in `apps/web` with 36 Vitest + RTL
-  tests, clean `next build`.
+  `rides`/`driver` routes); the full web UI in `apps/web` — this ADR launched the
+  passenger UI, and the web app has since been redesigned twice (plain-CSS
+  always-dark design system in §4; driver-workspace UX + Leaflet maps in the
+  `09a3824`…`53abeb3` redesign). The web suite is now **80 Vitest + RTL tests
+  across 15 files**, `next build` clean.
 
 ### 1. One active ride per passenger — database-enforced (requirements §21.L)
 - **Decision:** partial unique index `ride_requests_one_active_per_passenger`
@@ -677,6 +759,9 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   Clerk v7 API — `theme`, not `baseTheme`; variables keys are
   `colorPrimary/colorBackground/colorForeground/colorMutedForeground/colorInput/
   colorInputForeground/colorPrimaryForeground/colorDanger/borderRadius/fontFamily`).
+  The palette has since evolved to a lime-accent always-dark scheme (`--accent
+  #b6f36b`; the original GitHub-blue `--primary` token is gone —
+  `docs/frontend-design.md` §2/§12 documents the spec).
 - **Why now:** ADR-001 listed Tailwind + shadcn/ui for later, but AGENTS'
   "never introduce a dependency without a reason" applies the other way too —
   the MVP's surface (forms, cards, badges, a switch, a timeline, a member list)
@@ -703,54 +788,12 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   forever (waste on finished trips), and a manual refresh button alone (the MVP
   driver demo needs status to move without a click).
 
-- **Web tests:** 36 Vitest + RTL tests cover the rules helpers
+- **Web tests:** 80 Vitest + RTL tests across 15 files cover the rules helpers
   (describeApiError, isTerminal/isCancellable, formatPaisa/formatStatus,
   nextPoolAction), the two-step cancel button, active-ride gating of the
   booking area, shared-discount visibility, the availability toggle, driver
-  pool actions, and the role gates.
-
-## ADR-020: Driver lifecycle lock order — vehicle → rides → pool (Phase 6)
-
-- **Status:** implemented across `apps/api/src/rides/pooling/service.ts`
-  (`lockDriverVehicles`, `lockOwnedPool`, `byId`-ordered ride locks);
-  exercised by `test/driver.test.ts` (concurrent accept/arrive/complete races,
-  offline-vs-booking race).
-- **Decision:** every driver lifecycle transition acquires locks in a fixed
-  order: **driver's VEHICLE rows `FOR UPDATE` (id-ascending) → the pool's
-  member RIDE rows `FOR UPDATE` (id-ascending) → the POOL row `FOR UPDATE`**.
-  The availability toggle locks only vehicle rows and then COUNTs pools
-  (never waits on a pool row). This keeps the whole system deadlock-free with
-  the Phase 5 order:
-  - Passengers (cancel/match) already take **ride → pool** (ADR-017), so the
-    driver's rides-before-pool tail cannot cycle with them.
-  - The **vehicle lock is the shared serialization point** for the driver: the
-    automatch's Tesla pick (commit 2 of Phase 6) locks the same vehicle rows,
-    so an offline toggle and a racing new-booking serialize on Bullet's row —
-    a pool can never be created on a Tesla that is (committed) offline, and an
-    offline toggle can never strand a pool on an offline Tesla
-    (requirements §15, tested).
-  - The availability toggle never locks pool rows, so it cannot deadlock with
-    a transition that holds a pool row.
-- **Why not a single pool-row lock only:** the driver's own offline/online
-  transition needs the vehicle serialization the pool row does not mediate
-  (a pool may not exist yet while a booking races it), and ownership checks on
-  the pool alone would leave a race where two drivers of the same vehicle
-  could act interleaved. Vehicle-then-pool is the one canonical order the
-  data model supports.
-- **READ COMMITTED is sufficient:** every transition acts on a pool that
-  already committed (automatch committed its whole create+match transaction),
-  so an action never needs to "see" an uncommitted pool. The recheck under the
-  pool lock (status still the actionable state) is what makes the loser of a
-  concurrent arrive/complete see a clean `409 INVALID_STATE_TRANSITION`
-  instead of writing on stale state.
-- **Tests:** two independent postgres connections race accept (both succeed
-  idempotently, one `accepted_at`), arrive (exactly one wins), complete (one
-  wins, Tesla freed), and offline-vs-booking (the invariant holds either way:
-  an offline Bullet holds no non-terminal pool).
-- **Switch later if:** the system grows to many API instances with one driver
-  contested from multiple hot paths — then per-vehicle advisory locks or a
-  reservation table (`FOR UPDATE SKIP LOCKED`) would spread the serialization
-  point; the order documented here stays the ordering rule either way.
+  pool actions, the role gates, and the redesigned driver-workspace and
+  passenger-surfaces components.
 
 ## ADR-022: Unassigned wait pools + first-wins driver accept (Phase 6/8 follow-up)
 
@@ -760,7 +803,7 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   driver **selection** step while keeping every passenger invariant intact.
 
 ### 1. Problem
-- ADR-016/019&nbsp;P12 assigned the matched pool to a driver/vehicle
+- ADR-016/019¶12 assigned the matched pool to a driver/vehicle
   *inside the booking transaction* (an "automatch"); containership was
   implicit (the pool referenced the driver, but the driver never acted on
   the assignment). "Accept" was only a **confirmation** that mutated no
@@ -775,11 +818,17 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
 - A `REQUESTED` ride that cannot join an existing eligible pool **always
   creates a new pool**, but the pool is created **`MATCHED` with
   `driver_id`/`vehicle_id`/`accepted_at` NULL** — an *unassigned wait
-  pool* sitting in every driver's lobby. It joins an existing pool only
-  when friend-trip constraints match an **already-claimed** pool.
+  pool* sitting in every driver's lobby. Joining is **assignment-agnostic**:
+  `loadCandidatePools` filters on `status = 'MATCHED'` only (no
+  `driver_id IS NOT NULL` predicate), so a compatible ride joins an
+  **unassigned wait pool or an already-claimed pool** alike — whoever
+  eventually accepts the pool takes the whole group. `pooling.test.ts`
+  "joins an overlapping ride into the same pool and recomputes BOTH fares"
+  exercises the unassigned case.
 - Assignment is now **`DRIVER accept = first-wins claim`**: any online
   driver with an eligible Tesla claims an unassigned pool atomically
-  (`PATCH /api/driver/pools/:poolId/accept`). `accept` records `driver_id`,
+  (`POST /api/driver/pools/:poolId/accept` — the lifecycle verbs are POST;
+  some early ADR drafts wrote `PATCH`). `accept` records `driver_id`,
   `vehicle_id`, and `accepted_at` on the pool row; the first committed
   transaction wins (see §4), every later driver gets
   `409 POOL_ALREADY_ACCEPTED`. The pool itself stays `MATCHED` (per the
@@ -792,7 +841,7 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   ownership key, and the lobby empty state is text, not a graceful-hunt.
 - **Booking no longer depends on driver availability:** an offline fleet
   never blocks a ride — the request always lands in a wait pool. This is a
-  deliberate change from ADR-019&nbsp;P12 (offline-vs-booking race test now
+  deliberate change from ADR-019¶12 (offline-vs-booking race test now
   asserts both sides succeed).
 
 ### 3. DB invariants (migration 0007) — why they hold
@@ -808,7 +857,7 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
   because accepted ⇒ active and a vehicle has ≤1 accepted pool.
 - Passenger `REQUESTED` is now transient-only by construction: every
   request leaves creation inside an accepted-CAPACITY `MATCHED` pool
-  (either a claimed pool or a fresh wait pool).
+  (either an existing pool — claimed or unassigned — or a fresh wait pool).
 
 ### 4. Concurrency — still ADR-017, refitted
 - The seat-claim transaction is **unchanged** (`claimSeatIn`: pool row
@@ -839,7 +888,7 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
 
 ### 5. Behavior changes vs ADR-016/019 (intended, tested)
 - **arrive before accept:** an unassigned pool has no owner, so
-  `PATCH …/arrive` → `404 NOT_FOUND` (ownership is defined by acceptance
+  `POST …/arrive` → `404 NOT_FOUND` (ownership is defined by acceptance
   only; the `accepted_at` guard is defensive/dead under the CHECK).
 - **offline toggle narrowed:** only **accepted** pools block going offline
   (`DRIVER_HAS_ACTIVE_POOL`); unassigned wait pools in the lobby never
@@ -847,7 +896,7 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
 - **interloper 404 superseded by open competition:** any driver may
   attempt an accept; only the first wins. No "this pool is yours" 404 on
   the claim path.
-- Hotel/indirect consequences: `getAvailablePools()` no longer takes a
+- **Knock-on/indirect consequences:** `getAvailablePools()` no longer takes a
   `driverId`; the seeded cast gains Karim/Rahim/Faruq + Tesla 2/3/4 (all
   online) so the accept story (Jashim vs. Rahim race, Karim the eligible
   Tesla-2 competitor; the no-Tesla case is a dedicated fixture) is
@@ -856,7 +905,7 @@ service logic the PRD asks us to own — see `docs/database.md` §5.10 and §7.
 ### 6. Web UI (Phase 8 follow-up)
 - Driver hub gains a **"Waiting requests" lobby**: `useAvailablePools()`
   polls `GET /api/driver/pools/available` (5 s, while any pool is
-  non-terminal, ADR-021&nbsp;§6) and each lobby card offers an **Accept**
+  non-terminal, ADR-021§6) and each lobby card offers an **Accept**
   button that fires the first-wins claim inline (the detail page 404s for
   unclaimed pools, so the claim must live on the lobby card). A lost race
   surfaces `POOL_ALREADY_ACCEPTED` with a refresh hint, and the refetch

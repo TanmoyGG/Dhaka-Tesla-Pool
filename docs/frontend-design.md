@@ -1,15 +1,15 @@
 # Frontend Design Specification — Dhaka Tesla Pool
 
-> **Status:** design specification (source of truth for UX/design). Written
-> *before* the frontend redesign is implemented. Nothing here is implemented
-> yet; follow-up work builds against this document, the state machine and
-> contracts in `docs/requirements.md`, and the architecture in
-> `docs/architecture.md` / `docs/decisions.md` (ADR-021, ADR-022).
+> **Status:** design specification (source of truth for UX/design) **and
+> record of what shipped.** The design is **implemented** through commit
+> `53abeb3` (web) — §11.7 tracks build progress; §1 has been re-grounded to the
+> shipped app. Where this spec needed a backend capability that did not exist,
+> it is **flagged** in §11 — never silently redefined.
 >
 > Scope: passenger + driver **web application** (`apps/web`). Backend logic,
-> database, and API contracts are untouched by this document. Where the spec
-> needs a backend capability that does not exist yet, it is **flagged** in
-> §11 — never silently redefined.
+> database, and API contracts are untouched by this document. §12 tracks
+> conflicts/assumptions: items 1–4 and 10–11 are now **decided and
+> implemented**; 5–7 and 9 remain open or standing.
 
 ## Contents
 
@@ -24,45 +24,50 @@
 9. MVP scope / non-goals
 10. State-driven UI philosophy
 11. Implementation principles
-12. Conflicts, gaps and assumptions (review before implementation)
+12. Conflicts, gaps and assumptions — decisions and open items
 
 ---
 
-## 1. Current state (what exists today)
+## 1. Current state (the shipped app)
 
-Grounded inventory of `apps/web` (do not treat as finished design):
+Grounded inventory of `apps/web` **as shipped** (commit `53abeb3`):
 
 **Routes (App Router)**
-| Path | Today |
+| Path | Shipped |
 |---|---|
-| `/` | Landing — pitch, a numbered `<ol>` instruction block, sign-in/up CTAs |
-| `/sign-in`, `/sign-up` | Clerk-managed pages |
+| `/` | Landing — animated wordmark, tagline + subline, GitHub corner, sign-in/up CTAs; redirects signed-in users to their workspace |
+| `/sign-in`, `/sign-up` | Clerk-managed pages in an `(auth)` route group with a dedicated centered layout (ADR-023) |
 | `/account` | Profile page (`useMe` + Clerk `UserButton`) |
-| `/rides` | "Book a ride" — booking form + confirmed-booking banner + full ride history on one page |
-| `/rides/[rideId]` | Ride detail with status timeline, pool info, fare breakdown, two-step cancel |
-| `/driver` | "Driver hub" — availability toggle, waiting-request lobby, open pools, completed-trip history stacked vertically |
-| `/driver/[poolId]` | Pool detail — status, passengers (no fares), single next action |
+| `/rides` | Workspace (`WorkspaceShell` + `MapPane`): booking area (1\|2\|3 seat stepper, route swap, live estimate, zone-selection map feedback) + active-trip panel |
+| `/rides/[rideId]` | Ride detail with status timeline, pool info, fare breakdown, two-step cancel, completion modal |
+| `/rides/history` | Dedicated ride history (reached from the header menu, §7) |
+| `/driver` | Workspace (`WorkspaceShell` + `MapPane`): availability toggle, **"Waiting requests" lobby** (Accept claim), active-pool card |
+| `/driver/[poolId]` | Pool detail — status, passengers with per-member `fare` + pool `earnings`, single next action |
+| `/driver/history` | Dedicated completed-trip history (capped at 10 by the API) |
 
-**Design system today (ADR-021 §4):** always-dark, hand-written plain CSS in
-`apps/web/app/globals.css`, no Tailwind/shadcn. Tokens: `--bg #0d1117`,
-`--panel`, `--border`, `--text #e6edf3`, **`--primary #2f81f7` (GitHub blue)**,
-`--ok`, `--warn`, `--danger`. Responsive breakpoints only at
-36/40/44 rem (container/row/nav tweaks). Clerk is themed via
-`@clerk/themes` `dark` with the same blue variables.
+**Design system (ADR-021 §4):** always-dark, hand-written plain CSS in
+`apps/web/app/globals.css`, no Tailwind/shadcn. Lime-accent tokens:
+`--bg #0a0b0d`, `--bg-elevated`/`--bg-raised`, `--border`/`--border-strong`,
+`--muted`, **`--accent #b6f36b`** (+ `--accent-hover`, `--accent-text`,
+`--accent-soft`) — the original GitHub-blue `--primary` token is gone. Clerk is
+themed via `@clerk/themes` `dark` with matching variables.
 
-**Key components to reuse as-is** wherever possible:
-`RoleGate`, `LoadingState`/`ErrorCard`/`EmptyState` (`state-components.tsx`),
+**Key components:** `RoleGate`, `WorkspaceShell`, `MapPane`,
+`LoadingState`/`ErrorCard`/`EmptyState` (`state-components.tsx`),
 `StatusBadge`, `StatusTimeline`, `FareBreakdown`, `AvailabilityToggle`,
-`PoolActions`, `MemberList`, `LobbyPoolCard` (Accept claim), `CancelRideButton`,
+`PoolActions`, `MemberList` (with `member.fare`), `LobbyPoolCard` (Accept claim),
+`CancelRideButton`, `BookingArea`, `RideCompletionModal`,
+`driver-completion-modal.tsx`, `app-menu.tsx` (hamburger drawer),
 `describeApiError` (`lib/api.ts`), `formatPaisa` / `formatDateTime`
 (`lib/format.ts`), the TanStack Query hooks in `lib/queries.ts`, and the type
 mirror in `lib/types.ts`.
 
-**No map yet.** No Leaflet/`@types/leaflet` dependency is installed. No
+**Map:** shipped — `MapPane` (Leaflet + OpenStreetMap) is mounted in the
+workspace shell on both `/rides` and `/driver`, rendering predefined Dhaka zones
+and pickup→destination polylines (visualization only; no routing). No
 websockets/SSE — status is polled at 5 s and **stops at terminal status**
-(ADR-021 §6). No payment UI, no modal, no hamburger/menu component exists.
-`middleware.ts` protects `/account`, `/rides`, `/driver`; `/`, `/sign-in`,
-`/sign-up` are public.
+(ADR-021 §6). `middleware.ts` protects `/account`, `/rides*`, `/driver*`;
+`/`, `/sign-in`, `/sign-up` are public.
 
 ---
 
@@ -86,8 +91,8 @@ or intermediate pages.
   default.
 
 ### 2.2 Color
-Replace the current GitHub-blue `--primary` with a lime accent while keeping
-the neutral near-black scale. Token proposal (update `globals.css`):
+**Implemented.** The GitHub-blue `--primary` was replaced with a lime accent
+while keeping the neutral near-black scale. Shipped `globals.css` tokens:
 
 ```css
 :root {
@@ -131,9 +136,10 @@ the neutral near-black scale. Token proposal (update `globals.css`):
 ### 2.4 Layout & responsiveness
 - **Desktop (≥ 900 px):** full-height map + fixed-width (≈ 360–400 px) left
   control panel on the workspace routes.
-- **Mobile (< 900 px):** map fills the viewport; content lives in a **bottom
-  sheet** that can be pulled/interacted with and which collapses to a
-  floating action dock to keep the map usable.
+- **Mobile (< 900 px):** map fills the top of the viewport (~40 vh) with the
+  control panel scrolling below it. *(The original bottom-sheet + floating
+  action dock was deliberately **not** built — gesture work stayed deferred;
+  the shipped layout is map-top + scrolling panel. Consistent with §11.7 step 3.)*
 - Breakpoints: mobile-first `@media (min-width: 56rem)` for the desktop
   side-panel split. Current 36/40/44 rem rules are retained where useful.
 - Max content width stays ~62 rem for the (rare) non-workspace pages (landing,
@@ -148,9 +154,10 @@ the neutral near-black scale. Token proposal (update `globals.css`):
 ### 2.6 Component vocabulary
 Standardize on the existing pieces: `.card`, `.btn` (primary/secondary/ghost),
 `.notice`, `.ridelist`, `.dl`, `StatusBadge`, `StatusTimeline`. New primitives
-added only where required: bottom sheet, hamburger drawer, completion modal,
-map layer. Add motion via a single reusable `FadeIn`/`Sheet` wrapper rather
-than ad-hoc CSS.
+added only where required: hamburger drawer, completion modal, map layer, the
+live-ride panel. *(The bottom sheet was scoped here but never built — the
+mobile layout is map-top + scrolling panel, §2.4.)* Add motion via a single
+reusable `FadeIn` wrapper rather than ad-hoc CSS.
 
 ---
 
@@ -488,11 +495,12 @@ The MVP is deliberately **not** building:
       behind `/rides`; desktop panel-split + mobile map-top stacking. The
       mobile bottom-sheet behavior stays deferred — no gesture work yet.)**
    4. Passenger book/live/pay flow.
-      **— Phase 4 (book-mode UX): segmented 1|2|3 seat stepper, route swap,
-      live estimate card (FareView verbatim), zone-selection map feedback
-      (pickup/destination pins + route fit), responsive form hierarchy. The
-      live-ride workspace (§5.3) and completion/payment modal (§5.4) stay
-      deferred.**
+      **— done (Phase 4 + the redesigns): segmented 1|2|3 seat stepper, route
+      swap, live estimate card (FareView verbatim), zone-selection map feedback
+      (pickup/destination pins + route fit), responsive form hierarchy, plus
+      the live-ride workspace (§5.3) and the completion/payment modal (§5.4)
+      (`booking-area.tsx`, `ride-completion-modal.tsx`, `(main)/rides/page.tsx`)
+      — both now shipped.**
    5. Driver workspace (availability + lobby + active-trip card + cash flow)
       with earnings rendered from the API field.
       **— done (driver workspace UX phase): map+panel workspace, active-pool
@@ -501,32 +509,37 @@ The MVP is deliberately **not** building:
       and a cash-received completion modal (once-per-pool localStorage ack).**
 8. **Document driver-facing map behavior** (markers/polyline pulls zone
    coords via `GET /api/zones`) in code comments referencing this spec.
+   **— done**: `components/workspace/map-pane.tsx` renders zone markers from
+   `GET /api/zones`, an accent pickup→destination polyline, and per-member
+   destination pins; it is mounted on both `/rides` and `/driver`.
 
 ---
 
-## 12. Conflicts, gaps and assumptions (review before implementation)
+## 12. Conflicts, gaps and assumptions — decisions and open items
 
 The following were found while grounding this spec. None is silently
-changed — each needs a conscious decision:
+changed — each is listed with its current decision state. Items 1, 3, 4, 10
+and 11 are **decided and implemented**; 2 is **resolved**; 5, 6, 7 and 9 are
+standing/open items:
 
-1. **Accent color conflicts with the shipped design system.** ADR-021 §4
-   established GitHub-blue `--primary`. This spec requires a lime accent and
-   therefore a **token + Clerk appearance change** (a deliberate visual
-   direction decision, not a token renaming). ADR-021 §4's "switch later if
-   the design surface grows" applies. **Assumption:** lime replaces blue
-   everywhere in the app (not a secondary flavor).
+1. **Accent color conflicts with the shipped design system — RESOLVED &
+   IMPLEMENTED.** ADR-021 §4 originally established GitHub-blue `--primary`;
+   this spec's lime accent replaced it. `globals.css` now carries the lime
+   palette (`--accent #b6f36b` + hover/text/soft variants); no `--primary`
+   token remains, and the Clerk appearance uses matching variables. ADR-021 §4's
+   "switch later if the design surface grows" still applies.
 2. **Driver fares/earnings backend gap (P9) — RESOLVED.** §6.4/§6.5 once
    required fare fields the driver API lacked. That gap closed in commit
    `74e1d8f` (per-passenger `fare` + `earnings.totalCollectedPaisa` on
    `DriverPoolView`, read from the stored `fares` rows), and the driver
    workspace now renders them verbatim. The web mirror (`lib/types.ts`) was
    updated in the same phase; the UI never recomputes money.
-3. **Landing is the single auth control set.** Signed-out visitors reach
+3. **Landing is the single auth control set — DONE.** Signed-out visitors reach
    auth only from the landing CTAs; the reworked `AppShell` header (Phase 2)
    no longer renders a sign-in/up pair at all.
-4. **`.page.tsx` has a numbered instruction block to remove**, and the
+4. **`.page.tsx` has a numbered instruction block to remove — DONE**, and the
    passenger `/rides` page stacks booking + history; both are superseded by
-   §3/§5/§7.
+   §3/§5/§7 (the `<ol>` is removed; history moved to `/rides/history`).
 5. **Driver history cap.** `GET /api/driver/pools/history` returns at most
    10 pools (not client-configurable). The history drawer shows the newest
    10; no "load more" is spec'd for MVP. **Assumption:** acceptable; note in
@@ -539,12 +552,14 @@ changed — each needs a conscious decision:
 7. **Money stays integer paisa / BDT wire format.** UI formats via
    `formatPaisa`; completion modals acknowledge only — **no payment table or
    endpoint exists** (requirements §6 cash/ simulated wallet; ADR-018).
-8. **Stale docs noticed (not changed here):** `README.md` "Known
-   Limitations" still lists the two driver-UX bugs fixed in commit `e6fa0a1`
-   (204 JSON parse; offline lobby visibility), and `docs/requirements.md` /
-   `docs/architecture.md` still cite the pre-coordinate-update fare pins
-   (5932 / 4140 paisa) from before commit `506971c`. These are documentation
-   drift, outside this doc's scope, and should be corrected in a docs pass.
+8. **Stale docs noticed — RESOLVED in the docs-consistency pass.** When this
+   spec was written, `README.md` "Known Limitations" still listed the two
+   driver-UX bugs fixed in commit `e6fa0a1` (204 JSON parse; offline lobby
+   visibility), and `README.md` / `docs/requirements.md` /
+   `docs/architecture.md` / `docs/decisions.md` / `docs/development-plan.md`
+   still cited the pre-coordinate-update fare pins (5932 / 4140 paisa) from
+   before commit `506971c`. Both are now corrected: the fare pins are
+   5332 / 5303 (pooled 3999 / 3977) and the known-limitations list is current.
 9. **"Searching" is a transient state.** Because `REQUESTED` is transient-only
    (ADR-022), the passenger's "searching" phase is effectively "booked into a
    wait pool, driver not yet claimed". The UI labels are phrased accordingly

@@ -2,754 +2,1161 @@
 
 *Share a seat. Split the fare. Survive Dhaka traffic.*
 
-## Status
-
-**Phase 2 — Database schema, migrations, and seed: complete.** The full
-relational schema is implemented and migrated (users, vehicles, zones, ride
-requests, pools, memberships, fares, ride-status history), seeded with the PRD
-cast (Jashim + Bullet, Nusrat, Rafiq, Shirin and 8 Dhaka zones), and covered by
-23 schema-integration tests. See [docs/database.md](docs/database.md).
-
-**Phase 3 — Authentication (Clerk): complete.** Authentication is managed by
-Clerk (ADR-013). The frontend uses `@clerk/nextjs` (sign-in/sign-up, a
-protected `/account` page, route middleware); the Fastify API verifies Clerk
-session bearer tokens via `@clerk/backend` and resolves them to the local
-PostgreSQL user (`users.clerk_user_id`) for role-based authorization
-(`request.auth` + `requireAuth`/`requireRole`). New Clerk identities are
-provisioned as `PASSENGER` users on their first authenticated request
-(ADR-014), atomically and race-safe. Password storage and the application
-`sessions` table are gone (migrations 0001/0002). Covered by 23 auth tests
-(deterministic fakes — no network) and 29 database tests.
-
-**Phase 4 — Passenger ride requests & fare estimation: complete.** Passengers
-can create a ride request and receive its deterministic initial fare estimate
-(`POST /api/rides`), list their own rides (`GET /api/rides`), fetch one
-(`GET /api/rides/:rideId`), and read the zone pick-list
-(`GET /api/zones`). Fare = `3000` base + `roundHalfUp(haversine × 1.3 × 1200)`
-paisa/km, stored per seat; Nusrat Banani→Mohakhali = **5932 paisa**,
-Rafiq Banani→Gulshan 1 = **4140 paisa** (pinned in tests). Ride + fare + initial
-status journal row commit in one transaction; an optional `client_request_id`
-makes creation idempotent (migration 0003, replay → HTTP 200). Zod strict
-validation on routes; PASSENGER-only; errors carry additive `details`. Covered
-by 7 fare and 22 rides integration tests. See
-[the API section](#api-phase-4) below and ADR-015.
-
-**Phase 5 — Pool matching, lifecycle & concurrency: complete.** Matching and
-pooling are implemented on `feature/matching-pooling` (ADR-016/017/018) and
-refitted by ADR-022: requests are auto-matched at creation onto an eligible
-existing pool when they share the pickup zone and their drop-offs are within a
-2.0 km spread (Nusrat + Rafiq pool; Banani→Dhanmondi does not); a request that
-cannot join one **always starts its own unassigned wait pool**
-(driver/Tesla chosen later by the driver's accept — ADR-022). A single explicit
-transition map (`src/rides/state.ts`) enforces the PRD lifecycle and rejects
-illegal moves with `409 INVALID_STATE_TRANSITION`. Seat claims are
-database-transactional — `SELECT … FOR UPDATE` on the pool row + derived
-occupancy — so the last-seat race (Rafiq vs Shirin on Bullet's final seat) can
-never exceed capacity: exactly one wins the seat, the loser lands MATCHED in
-its own wait pool. Pooled fares are recomputed **in place** on the same `fares`
-row: 25% off base+distance when the pool holds ≥ 2 active members (Nusrat
-**4449** / Rafiq **3105** paisa, pinned); passengers cancel via
-`POST /api/rides/:rideId/cancel` (owner-only, REQUESTED/MATCHED). Migration 0004
-adds `fares.updated_at` (additive). Full suite **122/122** across 8 test files,
-including two real concurrent-claim races. See
-[the API section](#api-phase-5) below.
-Drivers and the driver-flow transitions are the next phase per
-[docs/development-plan.md](docs/development-plan.md).
-
-**Phase 6 — Driver workflow: complete (and reworked by ADR-022).**
-Implemented on `feature/driver-workflow` + merged to `master` (ADR-019/020),
-then reworked on `feature/driver-accept-selection`. Drivers get an online/offline
-switch (`POST /api/driver/availability`; refused while any pool the driver
-**accepted** is non-terminal — §21.J, narrowed by ADR-022 so lobby wait pools
-never block the toggle). Pools are born **unassigned** (migration 0007):
-a request that cannot join an eligible pool starts its own `MATCHED` wait pool
-in the **driver lobby** (`GET /api/driver/pools/available`, identical for every
-driver). **Accept is a first-wins claim** — the first online driver with a
-capacity-fitting Tesla locks vehicle → active-pool count → contested pool row
-and assigns `driver_id`/`vehicle_id`/`accepted_at`; losers get `409
-POOL_ALREADY_ACCEPTED`, a no-Tesla/offline driver gets `409 VEHICLE_OFFLINE`,
-and re-accepting your own pool is idempotent. Then `arrive` → `start` →
-`complete`, each moving the pool **and** every member ride together with
-per-ride journaling and timestamps (arrive on an unclaimed pool → 404). The
-driver hub lists their accepted pools with passengers, seats, zones — deliberately
-**no fares**. Completion frees the Tesla/driver for a new pool. Passenger
-cancellation stays legal through DRIVER_ARRIVED (P8). Driver identity always
-comes from the session (never the body); interloper/unknown non-accept routes
-are a plain 404. Concurrency is database-transactional on a canonical lock
-order **vehicle → rides → pool** (ADR-020) — real races proven for cross-driver
-first-wins accept, double arrive/complete, and the decoupled offline-vs-booking
-race. Migrations 0005 + 0007 (`pools.accepted_at` + progression CHECK; nullable
-assignment + one-accepted-pool-per-driver/vehicle). Full suite **173/173**
-across 9 test files. See [Driver workflow](#driver-workflow-phase-6) below.
-
-**Phase 7 — One active ride, pre-booking estimates & driver read surface:
-complete.** Implemented on `feature/full-ride-driver-ux` (branch off
-`feature/passenger-ui`, ADR-021). A passenger may hold at most **one
-non-terminal ride** — enforced by the database (partial unique index
-`ride_requests_one_active_per_passenger`, migration 0006 → `409
-ACTIVE_RIDE_EXISTS`, race-safe even for two concurrent bookings). New
-`GET /api/rides/estimate` shows the deterministic fare **before** booking
-(PRD "See estimated fare"). New driver read routes `GET /api/driver/availability`
-(current switch state) and `GET /api/driver/pools/history` (terminal trips, still
-fare-free). Backend suite now **173/173 across 9 test files** (ADR-022).
-
-**Phase 8 — Passenger + driver web UI: complete** (ADR-021/022). `apps/web`
-exposes the full product flow against the complete API in an always-dark,
-plain-CSS design system (Clerk sign-in/sign-up themed dark via `@clerk/themes`):
-role-aware nav with `PASSENGER`/`DRIVER` gates, passenger booking with a live
-estimate preview, an active-trip banner that hides the booking form while a ride
-is in flight, pooled 25%-shared-ride discount visible in the fare breakdown, a
-state timeline that follows REQUESTED → MATCHED → DRIVER_ARRIVED → STARTED →
-COMPLETED, and a two-step cancel confirm. Passenger surfaces show
-"Waiting for a driver…" while the pool is unassigned. The driver hub adds the
-online/offline switch (true state from the API), a **Waiting requests lobby**
-where the driver claims a pool first-wins with an inline Accept button (ADR-022),
-open pools with passenger/seat/zone detail, the accept → arrive → start →
-complete journey, and completed-trip history — still **no fares** anywhere in
-the driver view (P9). State pages poll at 5 s and stop at terminal status.
-Verified by 39 Vitest + RTL tests, clean `next build`, `typecheck`, and `lint`.
-The free Leaflet/OSM map stays optional (ADR-007/ADR-021 §4); see [Docs](#documentation).
-
-## Project Description
-
 A ride-pooling MVP for Dhaka. Battery-powered, three-seat "Teslas" (easy-bike
-style, unaffiliated) carry multiple passengers between predefined Dhaka zones.
-Passengers request a ride; when it makes sense, compatible requests share one
-Tesla, each passenger gets an individual fare, and occupied seats never exceed
-capacity.
+style, unaffiliated vehicles) carry multiple passengers between **predefined
+Dhaka zones**. Passengers request a ride and get a deterministic fare estimate;
+compatible requests share one Tesla, every passenger keeps an individual fare,
+occupied seats never exceed capacity, and drivers claim pooled trips
+first-wins, run them through a shared lifecycle, and collect cash at the end.
 
-## Problem
+**Status: feature-complete MVP.** Passenger flow, driver flow, pooling,
+fare model, ride lifecycle, Clerk authentication, and both web + API test
+suites are implemented and green. Public deployment (Vercel/Render/Neon) is
+**planned, not yet executed** — see [Deployment](#deployment). The final
+six-minute demo video is [pending](#demo-video).
+
+---
+
+## Table of contents
+
+- [Project overview](#project-overview)
+- [The problem](#the-problem)
+- [Core features](#core-features)
+- [Actors and system concepts](#actors-and-system-concepts)
+- [Complete application flow](#complete-application-flow)
+- [Application screenshots](#application-screenshots)
+- [Architecture](#architecture)
+- [Database / ERD](#database--erd)
+- [Technology stack](#technology-stack)
+- [Project structure](#project-structure)
+- [Prerequisites](#prerequisites)
+- [Environment variables](#environment-variables)
+- [Local development setup](#local-development-setup)
+- [Docker setup](#docker-setup)
+- [Database migrations and seed](#database-migrations-and-seed)
+- [Running the frontend and backend](#running-the-frontend-and-backend)
+- [Running tests](#running-tests)
+- [Demo / seed accounts](#demo--seed-accounts)
+- [API overview](#api-overview)
+- [Fare calculation](#fare-calculation)
+- [Pooling and concurrency](#pooling-and-concurrency)
+- [Authentication and security](#authentication-and-security)
+- [Key engineering decisions](#key-engineering-decisions)
+- [Known limitations](#known-limitations)
+- [Future improvements](#future-improvements)
+- [AI usage](#ai-usage)
+- [Demo video](#demo-video)
+- [Deployment](#deployment)
+- [PRD traceability](#prd-traceability)
+- [Documentation](#documentation)
+- [License](#license)
+
+---
+
+## Project overview
+
+Dhaka Tesla Pool matches ride requests onto shared three-seat Teslas. When two
+passengers need roughly the same route (for example Nusrat going Banani →
+Mohakhali and Rafiq going Banani → Gulshan 1), they are pooled onto the same
+Tesla instead of taking two separate rides. Each passenger pays an individual
+fare — cheaper than riding alone thanks to a **25% pool discount** — and the
+driver collects the combined total in cash at the end.
+
+The MVP is a **modular monolith**: a Next.js frontend, a Fastify REST API, and
+PostgreSQL. Identity comes from **Clerk**; the application role and all
+business rules live in the database and are enforced by the API. The whole
+stack reproduces locally with **Docker Compose**.
+
+## The problem
 
 Nusrat needs to get from Banani to Mohakhali. Rafiq needs almost the same route
-to Gulshan 1. Jashim's Tesla, Bullet, has three seats. Passengers should be able
-to request a ride and share a Tesla when it makes sense; the driver needs to see
-who's assigned and at what stage; each passenger sees only their own fare and
-status; and history must stay explainable after the ride ends.
+to Gulshan 1. Jashim's Tesla, Bullet, has three seats. Passengers should be
+able to request a ride and share a Tesla when it makes sense; the driver needs
+to see who is aboard and at which stage; each passenger sees only their own
+fare and status; and history must stay explainable after the ride ends.
 
-## Actors
+Getting this right means solving some genuinely tricky problems that the rest
+of this README explains in detail:
 
-- **Passenger** — requests rides, tracks status, cancels while valid, sees own fare/history.
-- **Driver/Tesla** — goes online/offline, owns a Tesla with fixed capacity, accepts a ride/pool, marks arrival/start/complete.
-- **Pool/Ride** — multiple requests may share one Tesla; explicit membership; seats never exceed capacity; individual fares preserved.
+- a **deterministic, hand-verifiable fare model** (integer paisa, never floats);
+- a **documented matching rule** that decides which requests share a Tesla;
+- a **database-backed concurrency story** for the full capacity last seat and
+  for a pool being claimed by racing drivers (no Redis, no queues — real
+  PostgreSQL transactions with row locks);
+- an **explicit ride state machine** that rejects invalid transitions;
+- and **ownership enforcement** so no user can touch another user's ride.
+
+## Core features
+
+**Passenger**
+
+- Sign in/up with Clerk; role is granted by the project owner in the database.
+- Book a ride between predefined Dhaka zones with a live, pre-booking fare
+  estimate.
+- See your *own* rides, status timeline, fare breakdown and history.
+- Cancel while the trip is not yet started (REQUESTED / MATCHED /
+  DRIVER_ARRIVED); cancellation frees the seat and recomputes the other
+  passengers' fares.
+- One active ride at a time (enforced by the database).
+- "Paid cash" completion confirmation with your final fare.
+
+**Driver**
+
+- Online/offline switch for their Tesla fleet.
+- Waiting-request **lobby** — claim an unassigned pool **first-wins**.
+- Active-trip card with the next legal action right on the workspace:
+  accept → arrive → start → complete.
+- Pool detail with every passenger, their seats, route and **individual fare**,
+  plus the **total to collect**.
+- "Cash received" completion confirmation and a completed-trip history.
+- The workspace map highlights the pool's shared pickup and **every distinct
+  drop-off** (Nusrat to Mohakhali, Rafiq to Gulshan 1 — both shown).
+
+**Platform**
+
+- Always-dark, hand-written plain-CSS design system (no UI framework pulled in
+  without a documented reason).
+- REST API with 18 authenticated endpoints, Zod validation, and a typed error
+  envelope.
+- 8-table relational schema with database-enforced invariants (capacity,
+  single active ride, single accepted pool per driver/vehicle, fare formula,
+  timestamps).
+- 250 tests: 170 API integration/unit tests + 80 web component tests.
+
+## Actors and system concepts
+
+| Concept | Meaning in the system |
+|---|---|
+| **Passenger** | A `users` row with `role = PASSENGER`. Books rides, views own fares/history, cancels while valid. |
+| **Driver** | A `users` row with `role = DRIVER`. Owns Tesla(s), toggles online/offline, claims and drives pools. |
+| **Tesla / vehicle** | A `vehicles` row owned by a driver, fixed **3-seat** capacity (`capacity = 3`), online/offline state. E.g. Jashim's **Bullet**. |
+| **Zone** | A `zones` row — one of 8 predefined Dhaka areas with a plain lat/long point (Banani, Gulshan 1, Mohakhali, Dhanmondi, Mirpur, Uttara, Farmgate, Bashundhara). |
+| **Ride request** | A `ride_requests` row: a passenger's pickup, destination, requested seats, status, and (once matched) its pool. |
+| **Pool** | A `pools` row: a group of matched ride requests. Every pool starts **unassigned** (no driver/Tesla) and is claimed by a driver. |
+| **Pool member** | A `pool_members` row linking a ride request to a pool with its seat count and an explicit ACTIVE / LEFT status. |
+| **Fare** | A `fares` row per ride request: base fare, distance charge, pool discount, and final fare in integer paisa. |
+| **Ride status history** | An append-only `ride_status_history` journal of every transition a ride went through. |
+
+## Complete application flow
+
+### Ride lifecycle (state machine)
+
+The PRD lifecycle is stored as a single enum:
+`REQUESTED → MATCHED → DRIVER_ARRIVED → STARTED → COMPLETED` (+ `CANCELLED`).
+Implementation notes:
+
+- `REQUESTED` is **transient-only**: the moment a ride is created it is
+  auto-matched, so a persisted ride is almost always born `MATCHED` inside a
+  pool.
+- `MATCHED` covers the PRD's "MATCHED/ACCEPTED" — acceptance is a separate
+  **first-wins claim** recorded on the pool row (`accepted_at`), not a new enum
+  value.
+- Transitions are implemented as one explicit map in
+  [`apps/api/src/rides/state.ts`](apps/api/src/rides/state.ts); every state
+  change goes through it, and an illegal move is rejected with
+  `409 INVALID_STATE_TRANSITION`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> REQUESTED
+    REQUESTED --> MATCHED : auto-match (transient state, rarely visible)
+    REQUESTED --> CANCELLED : passenger cancels
+    MATCHED --> DRIVER_ARRIVED : driver arrives
+    MATCHED --> CANCELLED : passenger cancels
+    DRIVER_ARRIVED --> STARTED : driver starts trip
+    DRIVER_ARRIVED --> CANCELLED : passenger cancels
+    STARTED --> COMPLETED : driver completes trip
+    COMPLETED --> [*]
+    CANCELLED --> [*]
+```
+
+### Passenger flow
+
+```mermaid
+flowchart TD
+    A["Landing / sign-in with Clerk"] --> B["Role resolved from PostgreSQL → redirected to passenger workspace"]
+    B --> C["Pick pickup zone, destination zone, seats<br/>live fare estimate + map pins"]
+    C --> D["Book ride (auto-matched into an eligible pool<br/>or a brand-new unassigned wait pool)"]
+    D --> E["Matched — see driver/Tesla when assigned,<br/>seat fill, fare breakdown, status timeline"]
+    E --> F["Driver arrives → driver starts trip<br/>(polled at 5 s)"]
+    F --> G["Completed — 'Paid cash' modal with final fare"]
+    G --> H["Ride history"]
+    E --> I["Cancel (REQUESTED/MATCHED/DRIVER_ARRIVED only)<br/>frees seat, recomputes remaining fares"]
+```
+
+### Driver flow
+
+```mermaid
+flowchart TD
+    A["Sign-in → driver workspace"] --> B["Online/offline toggle (refused while an<br/>accepted pool is active)"]
+    B --> C["Waiting-request lobby — unassigned MATCHED pools"]
+    C --> D["Accept pool (first-wins claim)<br/>races another driver → 409 POOL_ALREADY_ACCEPTED"]
+    D --> E["Active trip card on the workspace + map pins<br/>(shared pickup + every distinct drop-off)"]
+    E --> F["Arrive → Start → Complete"]
+    F --> G["'Cash received' modal: per-passenger fares + total collection"]
+    G --> H["Back to the lobby — trip history updated"]
+```
+
+### Pooling flow
+
+```mermaid
+flowchart TD
+    N["Nusrat books Banani → Mohakhali (1 seat)"] --> P["New unassigned wait pool (capacity 3, MATCHED)"]
+    R["Rafiq books Banani → Gulshan 1 (1 seat)"] --> M{"Same pickup zone?<br/>drop-off spread ≤ 2.0 km?<br/>capacity available?"}
+    M -->|"yes"| P
+    M -->|"no (e.g. Bashundhara → Uttara)"| Q["Separate new wait pool"]
+    P --> D["Driver claims the pool first-wins (Jashim + Bullet)"]
+    D --> L["Shared lifecycle: arrive → start → complete"]
+    L --> F["Individual fares preserved per passenger<br/>25% pool discount applied to each"]
+```
+
+### Screens: which URL does what
+
+| URL | How to read it |
+|---|---|
+| `/` | Landing; signed-in users are redirected to their role's workspace |
+| `/sign-in`, `/sign-up` | Clerk-managed auth (dark-themed, on this origin) |
+| `/rides` | Passenger workspace: map + booking form, or active-trip banner |
+| `/rides/[rideId]` | Ride details: timeline, pool, fare breakdown, cancel |
+| `/rides/history` | The caller's ride history |
+| `/driver` | Driver workspace: availability, active trip, or waiting-request lobby |
+| `/driver/[poolId]` | Pool details: passengers + fares, total collection, next action |
+| `/driver/history` | Completed trips |
+| `/account` | Profile (identity from Clerk, role from the application DB) |
+
+## Application screenshots
+
+Captured from the local development build against the current implementation
+(commit `53abeb3`). They live in [`docs/Screenshots/`](docs/Screenshots).
+
+### Landing & authentication
+
+| | |
+|---|---|
+| ![Landing page](<docs/Screenshots/Dhaka Tesla pool.png>) | The public landing page — brand wordmark, tagline, sign-in/sign-up CTAs. |
+| ![Clerk sign-in](<docs/Screenshots/sign in-clerk.png>) | Sign-in screen, dark-themed via `@clerk/themes`. |
+| ![Clerk sign-up](<docs/Screenshots/sign-up-clerk.png>) | Sign-up screen, dark-themed via `@clerk/themes`. |
+| ![Account page](<docs/Screenshots/account page.png>) | The account page — Clerk identity plus the application role and status from PostgreSQL. |
+
+### Passenger experience
+
+| | |
+|---|---|
+| ![Passenger workspace](<docs/Screenshots/landing page of passenger.png>) | The passenger workspace after sign-in. |
+| ![Ride selection (desktop)](<docs/Screenshots/ride-selection-pc.png>) | Ride selection on desktop — zones, seats, map. |
+| ![Ride selection (mobile)](<docs/Screenshots/ride-selection-mobile.png>) | Ride selection on a narrow mobile viewport. |
+| ![Booking with map selection (Banani to Mohakhali)](<docs/Screenshots/creating pool or ride with map selection(banani to mohakhali).png>) | Booking Banani → Mohakhali — pickup and destination pins selected on the map, live fare estimate. |
+| ![Rafiq matched into the pool](<docs/Screenshots/another passenger booked(banani to gulshan1) and mathced with the pool previously created of (banani to mohakhali).png>) | Rafiq books Banani → Gulshan 1 and is **matched into the existing Banani → Mohakhali pool** — both passengers now share a Tesla. |
+| ![Separate, non-matching ride](<docs/Screenshots/another user booked different ride at the same the(bashundhara to uttara).png>) | A second user books Bashundhara → Uttara — farther than the 2.0 km spread rule, so it stays its own pool. |
+| ![Passenger completion — paid cash](<docs/Screenshots/after ride complete individual passenger see their fare and pop up for  paid cash.png>) | After the trip completes, the passenger sees their **individual final fare** with the "Paid cash" acknowledgment. |
+| ![Passenger ride history](<docs/Screenshots/ride-history.png>) | The passenger's ride history with status, seat fill and fares. |
+
+### Driver experience
+
+| | |
+|---|---|
+| ![Waiting requests lobby](<docs/Screenshots/from driver view both rides showing in the waiting request.png>) | The driver's **waiting-request lobby** — both pooled rides shown, waiting for a first-wins accept. |
+| ![Accepted pool with map](<docs/Screenshots/driver accept the pool of banani to mohakhali and gulshan 1(pickup and destination selected on map).png>) | Jashim accepts the pool — the workspace map highlights Banani as pickup and **both** Mohakhali and Gulshan 1 as destinations. |
+| ![Pool details with fares](<docs/Screenshots/in the driver pool details both passenger's details and fare showing.png>) | Pool detail — both passengers' details and each passenger's fare, plus the total to collect. |
+| ![Driver completion — cash received](<docs/Screenshots/after driver complete trip..showing total fare and pop up for cash receive.png>) | After the trip completes, the driver sees the total fare with the "Cash received" acknowledgment. |
+| ![Waiting requests reappear](<docs/Screenshots/after completing a ride..driver can see the pending ride request again.png>) | Completion frees the driver — the next waiting request appears in the lobby again. |
+| ![Driver trip history](<docs/Screenshots/driver trip history.png>) | The driver's completed-trip history with total collected per trip. |
 
 ## Architecture
 
-A modular monolith:
+A modular monolith. The browser talks only to the Next.js frontend, which
+talks only to the Fastify API, which owns every business rule and talks to
+PostgreSQL. The frontend never touches the database. Identity is delegated to
+Clerk (external), and the map renders OpenStreetMap tiles read-only.
 
+```mermaid
+flowchart TB
+    subgraph Browser["Browser"]
+        P["Passenger / Driver"]
+    end
+
+    P --> WEB
+
+    subgraph WEB["Frontend — apps/web (Next.js 15, React 19, TypeScript)"]
+        UI["App Router pages</br>rides · driver · account · history"]
+        Q["TanStack Query + API client"]
+        MAP["Leaflet + OpenStreetMap</br>(visualization only)"]
+        CW["@clerk/nextjs middleware + provider"]
+    end
+
+    subgraph CLERK["Clerk — external identity provider"]
+        CLS["Sign-in / sign-up, sessions, tokens"]
+    end
+
+    CW <-->|"session tokens"| CLS
+
+    subgraph API["Backend — apps/api (Node.js, Fastify 5, TypeScript)"]
+        RT["18 REST endpoints under /api"]
+        AU["Auth preHandler — @clerk/backend</br>verifies the bearer token"]
+        SV["Services</br>rides · pooling · driver · fare · matching · state machine"]
+        ORM["Drizzle ORM (postgres.js driver)"]
+    end
+
+    WEB -->|"Authorization: Bearer &lt;Clerk token&gt;"| API
+    AU --> RT
+    RT --> SV
+    SV --> ORM
+    ORM --> DB[("PostgreSQL 16</br>Docker locally · Neon at deploy")]
+
+    MAP -.->|"map tiles (read-only)"| OSM["OpenStreetMap"]
+
+    DOCKER["Docker Compose</br>web + api + db (local reproduction)"]
+    DB -.-> DOCKER
 ```
-Browser
-  → Next.js (apps/web) + Clerk (identity provider)
-      └─ web verifies the user with Clerk and sends its session token
-         to the API as  Authorization: Bearer <clerk-session-token>
-  → Node.js/Fastify API (apps/api)
-      └─ verifies the token (@clerk/backend), resolves the local user
-         (users.clerk_user_id), attaches request.auth
-  → PostgreSQL
-      └─ application data + users.role / users.active (authorization source)
+
+Design boundaries:
+
+- **Identity vs. authorization.** *Who you are* is Clerk's job. *What you may
+  do* is the application's job: `users.role` lives in PostgreSQL and is resolved
+  from the database on every request — never from the browser.
+- **Backend owns the rules.** Capacity, matching, fares, lifecycle transitions
+  and ownership are enforced in the API and the database, never trusted to the
+  frontend.
+- **Data integrity over polish.** State transitions are explicit
+  (`ride_status_history`), money is integer paisa, and history stays
+  explainable after a trip ends.
+
+See [`docs/architecture.md`](docs/architecture.md) for the full design,
+`docs/decisions.md` (ADRs) for every decision, and
+[Pooling and concurrency](#pooling-and-concurrency) below for the consistency
+strategy.
+
+## Database / ERD
+
+Eight tables. Key design choices:
+
+- UUID primary keys, `timestamptz` timestamps (UTC), integer **paisa** money.
+- PostgreSQL-native enums for role, ride status and pool member status.
+- `ON DELETE RESTRICT` on the ride domain (history must stay explainable);
+  `ON DELETE CASCADE` for a user's vehicles (infrastructure).
+- No `sessions` table — Clerk owns sessions (ADR-013).
+- Business invariants are enforced in the schema where an index/CHECK can carry
+  them (see below), and transactionally in the pooling service where it cannot.
+
+```mermaid
+erDiagram
+    users ||--o{ vehicles : "owns (driver_id)"
+    users ||--o{ ride_requests : "books (passenger_id)"
+    users ||--o{ pool_members : "rides in (passenger_id)"
+    users ||--o{ pools : "drives (driver_id, nullable)"
+    zones ||--o{ ride_requests : "pickup_zone_id"
+    zones ||--o{ ride_requests : "destination_zone_id"
+    ride_requests |o--|| pools : "belongs to pool (nullable)"
+    pools ||--o{ pool_members : "contains"
+    ride_requests ||--o{ pool_members : "has membership"
+    ride_requests ||--o| fares : "has one fare (1:1)"
+    ride_requests ||--o{ ride_status_history : "audit journal"
+    vehicles |o--o| pools : "assigned on accept (nullable)"
+
+    users {
+        uuid id PK
+        text clerk_user_id UK
+        text name
+        text email UK
+        user_role role
+        boolean active
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    vehicles {
+        uuid id PK
+        uuid driver_id FK
+        text name
+        integer capacity
+        boolean is_online
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    zones {
+        uuid id PK
+        text name UK
+        double latitude
+        double longitude
+        timestamptz created_at
+    }
+    pools {
+        uuid id PK
+        uuid vehicle_id FK "nullable"
+        uuid driver_id FK "nullable"
+        ride_status status
+        integer capacity_snapshot
+        timestamptz created_at
+        timestamptz updated_at
+        timestamptz accepted_at "nullable"
+        timestamptz started_at "nullable"
+        timestamptz completed_at "nullable"
+    }
+    ride_requests {
+        uuid id PK
+        uuid passenger_id FK
+        uuid pickup_zone_id FK
+        uuid destination_zone_id FK
+        integer requested_seats
+        ride_status status
+        uuid client_request_id "nullable"
+        uuid pool_id FK "nullable"
+        timestamptz created_at
+        timestamptz updated_at
+        timestamptz cancelled_at "nullable"
+        timestamptz completed_at "nullable"
+    }
+    pool_members {
+        uuid id PK
+        uuid pool_id FK
+        uuid ride_request_id FK
+        uuid passenger_id FK
+        integer seats
+        pool_member_status status
+        timestamptz joined_at
+        timestamptz left_at "nullable"
+    }
+    fares {
+        uuid id PK
+        uuid ride_request_id FK "unique"
+        integer base_fare_paisa
+        integer distance_charge_paisa
+        integer pool_discount_paisa
+        integer final_fare_paisa
+        char currency
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    ride_status_history {
+        uuid id PK
+        uuid ride_request_id FK
+        ride_status from_status "nullable"
+        ride_status status
+        timestamptz created_at
+    }
 ```
 
-The frontend never talks to PostgreSQL directly; all business rules live in the
-API. Identity (who you are) is Clerk's job; authorization (what you may do) is
-the application's job and lives in PostgreSQL. See
-[docs/architecture.md](docs/architecture.md) for the full diagram and §3.4 for
-route policy.
+**Database-enforced invariants** (the schema, not the app, is the last line of
+defense):
 
-## Technology Stack
+- Occupancy is never cached — it is derived from `SUM(seats)` over ACTIVE
+  `pool_members` under a pool-row lock; there is no `available_seats` column.
+- `fares.final_fare_paisa = base + distance − discount` (CHECK).
+- One active (non-terminal) ride per passenger — partial unique index →
+  `409 ACTIVE_RIDE_EXISTS`, race-safe.
+- One **accepted** non-terminal pool per driver and per vehicle — partial
+  unique indexes (ADR-022).
+- `pools.accepted_at` required before the driver-flow states; COMPLETED must
+  carry `completed_at` and a `started_at`; driver and vehicle are assigned
+  together (all CHECKs).
+- A cancellation timestamp and a completion timestamp can never both be set.
 
-Recorded as ADRs in [docs/decisions.md](docs/decisions.md).
+See [`docs/database.md`](docs/database.md) for the full catalog of
+constraints, indexes, invariants and the concurrency write-up.
 
-- **Frontend:** Next.js 15 (App Router), React 19, TypeScript. TanStack Query,
-  React Hook Form, Zod. The UI is a hand-written always-dark plain-CSS design
-  system (no Tailwind/shadcn pulled in — ADR-021 §4); Clerk surfaces are themed
-  dark via `@clerk/themes`. Leaflet + OpenStreetMap remains an
-  optional/visualization-only later step (ADR-007).
-- **Backend:** Node.js, Fastify 5, TypeScript, REST, Pino. Zod validation is
-  used by the rides endpoints (Phases 4/5); Pino logs errors.
-- **Database:** PostgreSQL 16 (Docker), Drizzle ORM (`postgres.js` driver),
-  integer paisa/poysha money. Schema, enums, constraints and indexes are
-  implemented; see [docs/database.md](docs/database.md).
-- **Auth:** Clerk (`@clerk/nextjs` on the web, `@clerk/backend` +
-  `authenticateRequest` on the API). Role-based authorization stays in
-  PostgreSQL (`users.role`); no passwords or sessions are stored by the
-  application. See [Authentication](#authentication) and ADR-013.
-- **Testing:** Vitest — **173 API tests across 9 files** (database, auth, fare,
-  rides + matching/state/pooling + driver) and **39 web tests across 7 files**
-  (Vitest + React Testing Library). Playwright E2E (later phase).
-- **Infrastructure:** Docker, Docker Compose, GitHub Actions.
-- **Deployment:** Vercel, Render, Neon — free tier only (later phase).
+## Technology stack
+
+Everything below is what the repository actually runs on (from the workspace
+`package.json` files). For the *reason* behind each choice, see
+[Key engineering decisions](#key-engineering-decisions) and
+[`docs/decisions.md`](docs/decisions.md).
+
+| Layer | Technology | What it does here | Why it fits |
+|---|---|---|---|
+| Frontend framework | **Next.js 15** (App Router), React 19, TypeScript 5.9 | Pages, route groups, layouts, `middleware.ts` route policy | Server/client hybrid, familiar App Router structure, easy Vercel target |
+| Data fetching | **TanStack Query 5** | Server-state cache, 5 s polling while a trip is active, invalidation | Declarative loading/error/empty states and per-route invalidation |
+| Forms & validation | **React Hook Form 7 + Zod 3** | Ride booking form, seat stepper, estimate gating | Typed schema on the client; the API re-validates with its own Zod schemas |
+| Styling | **Hand-written always-dark plain CSS** (`app/globals.css`, ~1,500 lines) | Entire design system: tokens, components, responsive grid, Leaflet restyle | Deliberate deviation from Tailwind/shadcn (ADR-021 §4); no dependency without a reason |
+| Map | **Leaflet 1.9 + OpenStreetMap tiles** | Zone pins, pickup/destination highlights, route fit | Free, works without a key, **visualization only** |
+| Backend framework | **Fastify 5** + TypeScript, ESM | REST API, plugin-scoped routes, Pino logging | Fast, typed, the auth/role decorators slot into its hook lifecycle |
+| API validation | **Zod** on the API | Strict request schemas; `400 VALIDATION_ERROR` with `details` | Same mental model as the frontend |
+| ORM / DB driver | **Drizzle ORM 0.45 + postgres.js** | Schema, migrations, typed queries, transactions | Lightweight, SQL-native, gives us explicit `SELECT … FOR UPDATE` control |
+| Database | **PostgreSQL 16** | The single source of truth (data + role + invariants) | Real transactions, row locks, partial unique indexes, enums, CHECKs |
+| Auth | **Clerk** (`@clerk/nextjs` web, `@clerk/backend` API) | Sign-in/sign-up/sessions/tokens; API verifies bearer tokens | External identity provider — no passwords/sessions stored in-app (ADR-013) |
+| Testing | **Vitest 4** (+ React Testing Library, jsdom) | 170 API tests (9 files), 80 web tests (15 files) | Fast, TS-native, real concurrent DB integration tests |
+| Infra | **Docker + Docker Compose**, GitHub Actions CI | Reproducible `web + api + db` stack; `postgres:16-alpine` service | PRD requires reproducibility; compose is the fallback if free hosting is unavailable |
+| Linting/type | **ESLint 9**, `typescript-eslint`, `tsc --noEmit` | `npm run lint`, `npm run typecheck` | Both run in CI |
+
+## Project structure
+
+```text
+.
+├── apps/
+│   ├── web/                         # Next.js 15 frontend
+│   │   ├── app/                     # App Router: layout, (auth), (main), middleware
+│   │   │   ├── (auth)/              #   sign-in, sign-up (Clerk, dark-themed)
+│   │   │   ├── (main)/              #   landing, rides, rides/[rideId],
+│   │   │   │                        #   rides/history, driver, driver/[poolId],
+│   │   │   │                        #   driver/history, account
+│   │   ├── components/              # app-shell, role-gate, booking-area, ride-form,
+│   │   │   │                        #   fare-breakdown, pool-info, status-timeline,
+│   │   │   │                        #   ride/driver completion modals, driver/*, workspace/*
+│   │   ├── lib/                     # api client, queries (hooks), types, format, rules
+│   │   ├── test/                    # 80 Vitest + RTL tests (15 files)
+│   │   └── app/globals.css          # the entire always-dark design system
+│   └── api/                         # Fastify 5 REST API
+│       ├── src/
+│       │   ├── app.ts / server.ts   # Fastify bootstrap, error envelope, CORS
+│       │   ├── config.ts            # env-driven config
+│       │   ├── auth/                # Clerk verification, provisioning, role guards
+│       │   ├── rides/               # routes + service + state machine + pooling
+│       │   ├── driver/              # availability, lifecycle, hub routes
+│       │   ├── fare/                # deterministic fare formula + constants
+│       │   ├── matching/            # pool eligibility rule
+│       │   └── db/                  # Drizzle schema, migrate, seed, check
+│       ├── drizzle/                 # migrations 0000–0007 (+ meta)
+│       ├── test/                    # 170 Vitest tests (9 files)
+│       └── scripts/                 # dev-only helpers (incl. Clerk-ID mapping)
+├── docs/
+│   ├── reference/PRD.pdf            # primary source of truth (unmodified)
+│   ├── requirements.md              # PRD interpretation
+│   ├── architecture.md              # architecture (+ ADR-022 driver accept)
+│   ├── database.md                  # schema, invariants, concurrency strategy
+│   ├── decisions.md                 # ADR-style decision record
+│   ├── development-plan.md          # phased implementation plan
+│   ├── frontend-design.md           # frontend design specification
+│   └── Screenshots/                 # UI walkthrough screenshots
+├── .github/workflows/ci.yml         # lint → typecheck → test → build (with Postgres)
+├── docker-compose.yml               # web + api + db, healthchecked
+└── .env.example                     # every env var a fresh setup needs
+```
 
 ## Prerequisites
 
-- **Node.js** >= 20 (developed on v24). Verify with `node --version`.
-- **npm** (>= 10 recommended). Verify with `npm --version`.
+- **Node.js ≥ 20** (developed and CI-tested on v24). Check: `node --version`
+- **npm** (workspaces). Check: `npm --version`
 - **Docker Desktop** for PostgreSQL and/or the full compose stack.
-  Verify with `docker --version` and `docker compose version`.
+  Check: `docker --version` and `docker compose version`
+- A free **Clerk** account (only needed for live sign-in/sign-up — the stack
+  still boots without real keys; authenticated routes then return
+  `AUTH_CONFIGURATION`).
 
-## Repository Structure
+## Environment variables
 
-```
-apps/
-  web/        Next.js 15 App Router frontend (Phase 8: full passenger + driver UI)
-              app/globals.css      always-dark design system (ADR-021 §4)
-              app/{page,rides,driver,account}/  role-aware passenger/driver flows
-              middleware.ts        Clerk route policy (Phase 3)
-              app/sign-in|sign-up  Clerk-managed auth pages (Phase 3)
-              components/          app-shell, role-gate, booking-area, ride-form,
-                                   pool-info, status-timeline, cancel, driver/*
-              lib/{api,queries,types,format,pool-actions}.ts  client layer + state rules
-              test/                Vitest + RTL suite (39 tests)
-  api/        Fastify 5 + Drizzle REST API (Phase 1 scaffold)
-              src/db/schema.ts        schema (Phases 2–5)
-              src/db/seed.ts          idempotent cast seed (Phases 2 + 3)
-              src/auth/               Clerk verification + authorization (Phase 3)
-              src/fare/               deterministic fare estimation (Phase 4, ADR-015)
-              src/matching/           pool matching rule (Phase 5, ADR-016)
-              src/rides/              rides service/routes + state machine (Phases 4/5)
-              src/rides/pooling/      seat-claim + fare recompute service (Phase 5)
-              src/driver/             availability + hub + lifecycle routes (Phases 6/7)
-              drizzle/                generated migrations (Phases 2–7)
-              test/                   suite (database, auth, fare, rides, matching,
-                                      state, pooling — Phases 2–5)
-docs/
-  reference/PRD.pdf   primary source of truth (unmodified)
-  requirements.md     implementation-oriented PRD interpretation
-  architecture.md     architecture (updated as implemented)
-  database.md         schema + invariants + concurrency strategy
-  decisions.md        ADR-style technology decisions
-  development-plan.md phased implementation plan
-.github/workflows/    CI workflow
-```
+All variables are documented with placeholders in
+[`.env.example`](.env.example) — copy it to `.env`. **Real secrets are never
+committed**; `.env*` is git-ignored, except `.env.example`.
 
-## Local development
+### Frontend (`apps/web`) — `.env` (browser + server)
 
-### 1. Install dependencies
+| Variable | Purpose | Where to get it |
+|---|---|---|
+| `NEXT_PUBLIC_API_URL` | Browser-visible base URL of the API (e.g. `http://localhost:3001`) | You choose it |
+| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | Browser-safe Clerk key (required to build) | Clerk dashboard → API Keys |
+| `NEXT_PUBLIC_CLERK_SIGN_IN_URL` | `/sign-in` — keep Clerk flows on this origin | Fixed |
+| `NEXT_PUBLIC_CLERK_SIGN_UP_URL` | `/sign-up` | Fixed |
+| `NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL` | `/` (role resolves the final redirect) | Fixed |
+| `NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL` | `/` | Fixed |
+| `NEXT_PUBLIC_CLERK_SIGN_OUT_FALLBACK_REDIRECT_URL` | `/` | Fixed |
+
+### Backend (`apps/api`) — `.env` (server only)
+
+| Variable | Purpose | Where to get it |
+|---|---|---|
+| `API_HOST` | Bind address (`0.0.0.0` inside Docker, `127.0.0.1` locally) | You choose it |
+| `API_PORT` | API port (`3001`) | You choose it |
+| `WEB_URL` | Web origin; the default authorized party + CORS domain | You choose it |
+| `CLERK_SECRET_KEY` | **Server secret** — verifies bearer tokens. Never expose to the browser, never commit | Clerk dashboard → API Keys |
+| `CLERK_PUBLISHABLE_KEY` | Publishable key passed to the Clerk client | Clerk dashboard |
+| `CLERK_AUTHORIZED_PARTIES` | Comma-separated origins allowed to present tokens (CSRF/cookie-leak defence); defaults to `WEB_URL` | You choose it |
+
+### Database & Docker (shared)
+
+| Variable | Purpose | Where to get it |
+|---|---|---|
+| `DATABASE_URL` | `postgres://user:pass@host:5432/dhaka_tesla_pool` (used by the API for local runs; compose overrides host to `db`) | Your PostgreSQL / Neon |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Credentials for the compose Postgres container (`postgres` / `postgres` / `dhaka_tesla_pool` by default) | You choose them |
+
+> The placeholders shipped in `.env.example` and `docker-compose.yml` are
+> well-formed but deliberately **not** real Clerk keys (so secret scanners
+> never misflag them). Everything boots with them, but authenticated flows
+> need real keys from the [Clerk dashboard](https://dashboard.clerk.com).
+
+## Local development setup
 
 ```bash
+# 1. Clone the repository
+git clone https://github.com/TanmoyGG/Dhaka-Tesla-Pool.git
+cd Dhaka-Tesla-Pool
+
+# 2. Install dependencies (npm workspaces)
 npm install
-```
 
-### 2. Environment
+# 3. Configure environment
+cp .env.example .env        # edit with real Clerk keys for live auth
 
-Copy the example file (no real secrets in the repo):
-
-```bash
-cp .env.example .env
-```
-
-Defaults work for local development with Docker Postgres. For live Clerk
-flows you must put real Clerk keys in `.env` (see [Authentication](#authentication)).
-Without them the stack still starts, but authenticated API routes fail with a
-clear `AUTH_CONFIGURATION` error and the web `/account` redirect targets
-`/sign-in` (its route policy is unchanged). Both `npm run dev` scripts
-(API and web) auto-load the repo-root `.env` via Node's `--env-file`, so no
-manual `export` is needed locally.
-
-### 3. Start PostgreSQL (Docker)
-
-```bash
+# 4. Start PostgreSQL (Docker)
 docker compose up db
-```
 
-- Postgres 16 on `localhost:5432` (user/password/db: `postgres` / `postgres` /
-  `dhaka_tesla_pool`, overridable via `.env`).
-- Data persists in the named volume `dhaka-tesla-pool_pgdata`.
-- Verify Drizzle connectivity:
+# 5. Apply migrations + seed the canonical cast
+npm run db:migrate -w @dhaka-tesla-pool/api
+npm run db:seed   -w @dhaka-tesla-pool/api
+npm run db:check  -w @dhaka-tesla-pool/api   # "database connection OK"
 
-```bash
-npm run db:check -w @dhaka-tesla-pool/api
-```
-
-### 4. Schema, migrations, seed
-
-```bash
-npm run db:migrate -w @dhaka-tesla-pool/api   # apply pending migrations
-npm run db:seed   -w @dhaka-tesla-pool/api    # idempotent cast seed
-npm run db:generate -w @dhaka-tesla-pool/api  # regenerate after schema edits
-```
-
-`db:seed` is safe to run any number of times (inserts with
-`ON CONFLICT DO NOTHING`; never deletes). Seeded users carry a reserved
-development-only `clerk_user_id` placeholder (`dev-only::seed::<email>`) — see
-[Authentication](#mapping-clerk-users-to-seeded-characters).
-
-### 5. Start the API
-
-```bash
+# 6. Start the API (http://localhost:3001)
 npm run dev -w @dhaka-tesla-pool/api
+
+# 7. Start the web app (http://localhost:3000)
+npm run dev -w @dhaka-tesla-pool/web
+
+# 8. Open http://localhost:3000 — sign up, or map the seed cast to Clerk accounts
+#    (see "Demo / seed accounts" below), then sign in.
 ```
 
-Starts on `http://localhost:3001`. Health check:
+Both `npm run dev` scripts load the repo-root `.env` automatically via Node's
+`--env-file`, so no manual `export` is needed.
+
+**Smoke test the API:**
 
 ```bash
 curl http://localhost:3001/health
-# {"status":"ok","service":"dhaka-tesla-pool-api",...}
+# {"status":"ok","service":"dhaka-tesla-pool-api", ...}
 ```
 
-### 6. Start the web app
+## Docker setup
+
+The compose file builds three services with healthchecks, using the
+**repository root** as the build context.
+
+| Service | Image | Exposed port | Depends on |
+|---|---|---|---|
+| `db` | `postgres:16-alpine` | `5432` | — (volume `pgdata`) |
+| `api` | `node:24-alpine` (multi-stage build of `apps/api`) | `3001` | `db` healthy |
+| `web` | `node:24-alpine` (multi-stage build of `apps/web`) | `3000` | `api` healthy |
 
 ```bash
-npm run dev -w @dhaka-tesla-pool/web
+docker compose up --build    # start the whole stack (production builds)
+docker compose down          # stop (keeps the DB volume)
+docker compose down -v       # stop AND delete the DB volume (destructive)
+docker compose logs -f api   # follow a service's logs
 ```
 
-Starts on `http://localhost:3000`.
+Notes:
 
-### 7. Run checks / tests
+- The stack needs **no real Clerk keys to boot** — compose falls back to
+  invalid-but-well-formed placeholders; authenticated routes then return the
+  documented `AUTH_CONFIGURATION` error. Put real keys in `.env`.
+- The compose stack runs **production builds**; source changes need
+  `docker compose up --build` again. For day-to-day development use the
+  per-workspace `npm run dev` commands with `docker compose up db` for
+  hot-reload PostgreSQL (this is the documented Windows-friendly workflow).
+- `NEXT_PUBLIC_*` variables are baked into the browser bundle at **build
+  time** (they are Docker `build args`), so change them in `.env` and rebuild.
 
-From the repository root (runs every workspace):
+## Database migrations and seed
+
+Migrations are generated by Drizzle (`drizzle-kit`) and applied from
+`apps/api/drizzle/` (migrations `0000`→`0007`):
 
 ```bash
-npm run typecheck
-npm run lint
-npm test
-npm run build
+npm run db:generate -w @dhaka-tesla-pool/api   # regenerate after schema edits
+npm run db:migrate   -w @dhaka-tesla-pool/api  # apply pending migrations
+npm run db:seed      -w @dhaka-tesla-pool/api  # idempotent seed
+npm run db:check     -w @dhaka-tesla-pool/api  # connectivity smoke test
 ```
 
-The API test suite runs its database-integration tests against a disposable
-`dhaka_tesla_pool_test` database when PostgreSQL is reachable (`DATABASE_URL`
-or the `.env` default), and skips cleanly when it is not. The auth tests use
-deterministic fakes for the Clerk boundary and never need a network or keys.
+`db:seed` is fully idempotent (every insert uses `ON CONFLICT DO NOTHING`,
+never deletes). Seed data is limited to the **canonical cast** — 7 users, 4
+Teslas, 8 zones. No rides/pools/fares are seeded: the demo story (below) is
+played live through the API.
 
-### 8. Database type changes (dev)
-
-Adding a `NOT NULL` column (like `clerk_user_id` in migration 0001) cannot be
-applied to a populated table, so the local dev database must be recreated and
-remigrated:
+> **If a migration adds a `NOT NULL` column to a populated table** (migration
+> 0001 did), the local dev database must be recreated and re-migrated:
 
 ```bash
 docker compose exec db psql -U postgres -c "DROP DATABASE IF EXISTS dhaka_tesla_pool WITH (FORCE);" -c "CREATE DATABASE dhaka_tesla_pool;"
 npm run db:migrate -w @dhaka-tesla-pool/api
-npm run db:seed   -w @dhaka-tesla-pool/api
+npm run db:seed    -w @dhaka-tesla-pool/api
 ```
 
-CI and the `*_test` database always build from a fresh database, so they are
-unaffected.
+CI and the `*_test` database always build fresh, so they are unaffected.
 
-## Authentication (Clerk)
+## Running the frontend and backend
 
-Authentication is managed by [Clerk](https://clerk.com) (ADR-013) — the
-application does **not** store passwords or sessions.
+| Task | Command (from repo root) |
+|---|---|
+| API (dev, hot reload) | `npm run dev -w @dhaka-tesla-pool/api` |
+| Web (dev, hot reload) | `npm run dev -w @dhaka-tesla-pool/web` |
+| API production build | `npm run build -w @dhaka-tesla-pool/api` → `npm run start -w @dhaka-tesla-pool/api` |
+| Web production build | `npm run build -w @dhaka-tesla-pool/web` → `npm run start -w @dhaka-tesla-pool/web` |
+| All workspaces | `npm run dev` / `npm run build` / `npm run start` |
 
-- **Web (`@clerk/nextjs`):** `ClerkProvider` in the root layout, sign-in /
-  sign-up pages, protected passenger pages, and `middleware.ts` route policy
-  (`/`, `/sign-in*`, `/sign-up*` public; `/account*`, `/rides*`, and
-  `/driver*` require a signed-in user and redirect to `/sign-in`).
-- **API (`@clerk/backend`):** Fastify verifies every request under `/api` with
-  `authenticateRequest()` (bearer token). `apps/api/src/auth/` implements the
-  flow as three injectable boundaries — `SessionVerifier` (token → Clerk
-  userId), `LocalUserResolver` (Clerk userId → local `users` row), and
-  `ProvisionLocalUser` (first-request user creation, see Ad hoc provisioning
-  below) — so the behavior is unit-tested with fakes. The API **never** trusts
-  a `userId`, `role`, `name`, or `email` from a request body.
-- **Authorization:** `request.auth.user` carries the PostgreSQL `role`
-  (`PASSENGER` | `DRIVER` | `ADMIN`), `active`. Route guards:
-  `requireAuth()` (any signed-in user) and `requireRole([...])`. The role is
-  granted by the project owner in the database — it is application policy, not
-  identity.
-- **Environment:**
-  - Web: `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` (browser-safe) and (server-side)
-    `CLERK_SECRET_KEY` used by middleware/ClerkProvider SSR.
-  - API: `CLERK_SECRET_KEY`, `CLERK_PUBLISHABLE_KEY`,
-    `CLERK_AUTHORIZED_PARTIES` (comma-separated origins allowed to present
-    tokens; defaults to `WEB_URL`). `CLERK_SECRET_KEY` is server-side only and
-    must never reach the browser or be committed.
-  - The placeholder values in `.env.example`/compose are well-formed **but
-    invalid** (they only keep builds and the stack starting); real keys come
-    from the [Clerk dashboard](https://dashboard.clerk.com).
-- **Ad hoc provisioning (first authenticated request, ADR-014):** a valid
-  Clerk identity with no local `users` row is provisioned on first use —
-  anything new signing up just works. The Clerk profile is loaded server-side;
-  the local user is created atomically (role `PASSENGER`, `active`, name =
-  Clerk **username**, email = primary Clerk email) via
-  `INSERT … ON CONFLICT (clerk_user_id) DO NOTHING`, so concurrent first
-  requests yield exactly one row. If the email already belongs to another
-  user, provisioning aborts with `500 AUTH_PROVISION_FAILED` — it never
-  rebinds the existing row. `DRIVER`/`ADMIN` are **never** self-assignable.
-- **Unauthenticated/unmapped behavior:** no token → `401 AUTH_UNAUTHENTICATED`;
-  reserved seed placeholder → `401`; provisioning failure (e.g. email already
-  taken) → `500 AUTH_PROVISION_FAILED`; inactive user → `403 AUTH_INACTIVE`;
-  Clerk unconfigured → `500 AUTH_CONFIGURATION`. `403 AUTH_USER_NOT_FOUND`
-  remains only as a defensive backstop for identities that are deliberately
-  not provisionable.
+## Running tests
 
-### Mapping Clerk users to seeded characters
-
-The seed uses a reserved placeholder (`dev-only::seed::<email>`) because we
-never invent real Clerk IDs. Reserved values are rejected during auth, so they
-can never authenticate. **Brand-new** Clerk identities are now provisioned
-automatically (PASSENGER, see Ad hoc provisioning above), so the only mapping
-step left is for demo characters, e.g. giving Nusrat access to the seeded
-`nusrat@example.com` user with a real Clerk account:
-
-```sql
--- Replace <clerk-user-id> with the real Clerk user ID (starts with "user_").
-UPDATE users SET clerk_user_id = '<clerk-user-id>' WHERE email = 'nusrat@example.com';
+```bash
+npm test            # all workspaces (vitest run)
+npm run typecheck   # tsc --noEmit for API + web
+npm run lint        # ESLint for API + web
+npm run build       # production build for API + web
 ```
 
-Real Clerk IDs cannot collide with placeholders (`user_...` vs
-`dev-only::seed::...`).
+The API suite runs its **database-integration tests against a disposable
+`dhaka_tesla_pool_test` database** when PostgreSQL is reachable (the CI
+workflow and the compose `db` service both provide one) and skips cleanly when
+it is not. The auth tests use deterministic fakes for the Clerk boundary —
+they never need a network or keys.
 
-The seven Development-cluster cast identities (below) are applied for you by the
-ready-made development-only script
-[`apps/api/scripts/map-cast-clerk-ids.sql`](apps/api/scripts/map-cast-clerk-ids.sql);
-it only updates `clerk_user_id` on the exact seeded rows and preserves every
-role.
+**Current suite:**
 
-### Demo guide (local)
+| Suite | Count | Files | Covers |
+|---|---|---|---|
+| API — Vitest | **170** tests | 9 | schema/database invariants, Clerk auth (fakes), fare formula pins, matching rule, state machine, pooling (incl. real concurrent last-seat + first-wins races), rides ownership, driver workflow, health |
+| Web — Vitest + RTL | **80** tests | 15 | booking form, fare estimate gating, active-ride banner, cancellation, completion modals, driver workspace, pool actions, driver history, role gating, API client, nav rules, availability toggle |
 
-A complete local demo of the passenger flow (roles come from the seed — they
-are never derived from email):
+The PRD's six required behaviors map to first-class tests:
 
-1. **Start PostgreSQL (Docker):**
-   ```bash
-   docker compose up db
-   ```
-2. **Run migrations:**
-   ```bash
-   npm run db:migrate -w @dhaka-tesla-pool/api
-   ```
-3. **Run seed** (idempotent — adds Jashim, Nusrat, Rafiq, Shirin, Karim, Rahim,
-   Faruq, the four-Tesla fleet, and the 8 zones):
-   ```bash
-   npm run db:seed -w @dhaka-tesla-pool/api
-   ```
-4. **Map the seven seeded cast users to their real Clerk Development
-   identities.** These seven users are **Development-instance test users** (the
-   IDs are not secrets, but a matching `CLERK_SECRET_KEY` is required to verify
-   their sessions). The script preserves the seeded roles exactly:
-   ```bash
-   docker compose exec -T db psql -U postgres -d dhaka_tesla_pool -f - `
-     < apps/api/scripts/map-cast-clerk-ids.sql
-   ```
-   Result — `jashim@example.com`, `karim@example.com`, `rahim@example.com`,
-   `faruq@example.com` → DRIVER; `nusrat@example.com`, `rafiq@example.com`,
-   `shirin@example.com` → PASSENGER.
-5. **Sign in through Clerk** at `http://localhost:3000` with one of the seven
-   Development accounts (any brand-new identity is provisioned automatically).
-6. **Scripted story:**
-   - Nusrat → book **Banani → Mohakhali** and watch the fare estimate before
-     confirming; the booked trip shows as an active banner that hides the
-     booking form. Cancel (with the two-step confirm) then **rebook** — the
-     active-ride rule only blocks while a trip is non-terminal.
-   - Rafiq → book **Banani → Gulshan 1** on Bullet → verify the pooled fare
-     (both riders see the 25% discount).
-   - Shirin → grab Bullet's **last seat** after it is 2/3 full — the
-     concurrency/capacity case.
-   - Jashim → the **driver hub** at `/driver`: go online, open the **Waiting
-     requests** lobby, and claim a request first-wins with **Accept ride**
-     (ADR-022 — another driver racing you loses with a refresh hint). The pool
-     moves to your open pools; on the pool detail run arrive → start → complete.
-Pool completion frees Bullet/Tesla for a new pool. The toggle is refused
-      while a pool you accepted is non-terminal (§21.J). Every seeded driver
-      (Jashim→Bullet, Karim→Tesla 2, Rahim→Tesla 3, Faruq→Tesla 4) is online
-      and eligible; a driver whose Teslas are all offline (toggle off) can
-      watch the lobby but cannot accept (`VEHICLE_OFFLINE`).
+1. **Bullet's capacity can never be exceeded** — `pooling.test.ts` concurrent
+   last-seat claims (Rafiq vs Shirin), occupancy derivation under lock.
+2. **Invalid ride state transitions are rejected** — `state.test.ts` +
+   lifecycle arms in `rides.test.ts`/`driver.test.ts` (`409
+   INVALID_STATE_TRANSITION`).
+3. **Nusrat's and Rafiq's pooled fares calculate correctly** — `fare.test.ts`
+   pins 3999 / 3977 paisa; driver views assert them over the wire.
+4. **Users can't modify another user's ride** — `rides.test.ts` cross-user
+   404s; owner-only routes; role guards (`403 FORBIDDEN`).
+5. **Cancellation rules hold** — `pooling.test.ts` (seat freed, remaining
+   fares recomputed, cancel-while-started refused).
+6. **Two concurrent requests can't corrupt pool capacity** — real
+   two-connection races in `pooling.test.ts` / `driver.test.ts`.
 
-No passwords appear in the README, source, seed, script, or git history. The
-seven Clerk accounts are **Development-instance** test users in the project's
-dev Clerk application; any production instance uses separate real identities.
+## Demo / seed accounts
 
-## API
+The seed creates the canonical PRD cast. **No passwords are stored anywhere** —
+authentication belongs to Clerk, and the seeded `users` rows carry a reserved
+`dev-only::seed::<email>` placeholder that the API refuses to authenticate.
 
-All `/api` routes require a Clerk session **bearer token**
-(`Authorization: Bearer <token>`); the web client attaches it automatically
-(`apps/web/lib/api.ts`). Errors use `{ error: { code, message, details? } }`.
+| User | Role | Clerk account needed for | Tesla |
+|---|---|---|---|
+| Jashim Ahmed (`jashim@example.com`) | DRIVER | the driver stories | **Bullet** (3 seats, online) |
+| Karim Hossain (`karim@example.com`) | DRIVER | the cross-driver accept race | Tesla 2 (online) |
+| Rahim Mia (`rahim@example.com`) | DRIVER | the cross-driver accept race | Tesla 3 (online) |
+| Faruq Hasan (`faruq@example.com`) | DRIVER | the cross-driver accept race | Tesla 4 (online) |
+| Nusrat Haque (`nusrat@example.com`) | PASSENGER | the primary passenger story | — |
+| Rafiq Rahman (`rafiq@example.com`) | PASSENGER | the pooling story | — |
+| Shirin Islam (`shirin@example.com`) | PASSENGER | the last-seat concurrency case | — |
 
-| Endpoint | Policy | Notes |
+**To play the cast with live Clerk identities:**
+
+1. Create the seven accounts in a Clerk **Development** instance.
+2. Map each real `user_...` id to the seeded row. A dev-only script does this
+   for you (it updates only the seeded rows, never the role):
+
+```bash
+docker compose exec -T db psql -U postgres -d dhaka_tesla_pool -f - `
+  < apps/api/scripts/map-cast-clerk-ids.sql
+```
+
+3. Sign in at `http://localhost:3000` as any of the seven.
+4. Any **brand-new** Clerk identity is provisioned automatically on first
+   request as a PASSENGER (ADR-014) — sign-up just works.
+
+**Scripted story to demo end-to-end:**
+
+1. **Nusrat** books **Banani → Mohakhali** — live estimate shown before
+   confirming; the active-trip banner replaces the booking form.
+2. **Rafiq** books **Banani → Gulshan 1** — matched into the same pool
+   (drop-off spread ≈ 1.10 km ≤ 2.0 km rule); both see the 25% pool discount.
+3. **Shirin** grabs Bullet's **last seat** — the capacity/concurrency case.
+4. **Jashim** opens the driver workspace, goes online, sees the pool in the
+   **Waiting requests** lobby, and **accepts** it first-wins.
+5. Run **arrive → start → complete**; the driver sees per-passenger fares and
+   the total collection; Nusrat/Rafiq each see their individual final fare.
+6. A **non-matching** route (e.g. **Bashundhara → Uttara**) stays its own pool.
+
+Reproducing this requires real Clerk Development keys. Without them the stack
+still boots and the unauthenticated shape of every screen works; sign-in/up
+and authenticated data require `CLERK_SECRET_KEY`/publishable keys.
+
+## API overview
+
+All API routes live under `/api` (except the public health probe `GET
+/health`) and require an `Authorization: Bearer <clerk-token>` header; the web
+client attaches it automatically. Errors use the envelope
+`{ "error": { "code", "message", "details?" } }`. There are **18 endpoints**;
+roles are enforced per route from the database role, never from the request.
+
+| Endpoint | Policy | Purpose |
 |---|---|---|
-| `GET /api/me` | any signed-in user | authenticated identity / role |
-| `POST /api/rides` | `PASSENGER` | create a ride request; auto-matched & pooled (Phase 5); refused `409 ACTIVE_RIDE_EXISTS` while the caller has a non-terminal ride |
-| `GET /api/rides/estimate` | `PASSENGER` | read-only pre-booking fare estimate (`?pickupZoneId=&destinationZoneId=&requestedSeats=`), nothing persisted |
-| `GET /api/rides` | `PASSENGER` | the caller's own requests, newest first |
-| `GET /api/rides/:rideId` | `PASSENGER` (owner) | 404 for unknown/another user's ride |
-| `POST /api/rides/:rideId/cancel` | `PASSENGER` (owner) | cancel own ride while REQUESTED/MATCHED/DRIVER_ARRIVED (409 otherwise) |
-| `GET /api/zones` | any signed-in user | pickup/destination pick-list (8 zones) |
-| `GET /api/driver/availability` | `DRIVER` | current online/offline switch state |
-| `POST /api/driver/availability` | `DRIVER` | switch the driver's Teslas online/offline (`{ "isOnline": boolean }` → 204; refused while any pool the driver accepted is non-terminal) |
-| `GET /api/driver/pools` | `DRIVER` | the caller's accepted non-terminal pools (newest first) |
-| `GET /api/driver/pools/available` | `DRIVER` | the **lobby**: every unassigned MATCHED wait pool, identical for all drivers (ADR-022) |
-| `GET /api/driver/pools/history` | `DRIVER` | the caller's terminal (completed/cancelled) pools |
-| `GET /api/driver/pools/:poolId` | `DRIVER` (owner) | one pool with passengers/seats/zones — no fares; 404 if not theirs or unknown |
-| `POST /api/driver/pools/:poolId/accept` | `DRIVER` | **first-wins claim** of an unassigned pool (assigns driver/Tesla; idempotent for the owner; `409 POOL_ALREADY_ACCEPTED` if another driver won) |
-| `POST /api/driver/pools/:poolId/arrive` | `DRIVER` (owner) | requires accept first (else 404 for unclaimed pools / 409) |
-| `POST /api/driver/pools/:poolId/start` | `DRIVER` (owner) | requires arrival first |
-| `POST /api/driver/pools/:poolId/complete` | `DRIVER` (owner) | requires start first; frees the Tesla/driver for a new pool |
+| `GET /health` | public | liveness probe |
+| `GET /api/me` | any signed-in user | identity + role |
+| `GET /api/zones` | any signed-in user | the 8-zone pick list (also feeds the map) |
+| `POST /api/rides` | PASSENGER | create a ride; auto-match/pool; `201` new / `200` idempotent replay |
+| `GET /api/rides/estimate` | PASSENGER | pre-booking fare estimate (read-only) |
+| `GET /api/rides` | PASSENGER | the caller's own rides |
+| `GET /api/rides/:rideId` | PASSENGER (owner) | one ride (404 for others') |
+| `POST /api/rides/:rideId/cancel` | PASSENGER (owner) | cancel while REQUESTED/MATCHED/DRIVER_ARRIVED |
+| `GET /api/driver/availability` | DRIVER | current online/offline state |
+| `POST /api/driver/availability` | DRIVER | toggle fleet online/offline (204); refused while an accepted pool is active |
+| `GET /api/driver/pools` | DRIVER (owner) | the driver's non-terminal accepted pools |
+| `GET /api/driver/pools/available` | DRIVER | the **lobby** — every unassigned MATCHED pool (same for all drivers) |
+| `GET /api/driver/pools/history` | DRIVER (owner) | completed trips (capped at 10) |
+| `GET /api/driver/pools/:poolId` | DRIVER (owner) | one pool (404 if not theirs) with members + fares + earnings |
+| `POST /api/driver/pools/:poolId/accept` | DRIVER | first-wins claim; `409 POOL_ALREADY_ACCEPTED` / `VEHICLE_OFFLINE` / `DRIVER_HAS_ACTIVE_POOL` |
+| `POST /api/driver/pools/:poolId/arrive` | DRIVER (owner) | → DRIVER_ARRIVED (404 on unclaimed pools) |
+| `POST /api/driver/pools/:poolId/start` | DRIVER (owner) | → STARTED |
+| `POST /api/driver/pools/:poolId/complete` | DRIVER (owner) | → COMPLETED; frees the driver/Tesla |
 
-`POST /api/rides` body (Zod, strict — unknown keys rejected, identity/role is
-taken from the session, never from the body):
+The driver pool views include every passenger's **individual fare** and the
+pool's total collection (`earnings`), sourced verbatim from the stored `fares`
+rows.
 
-```json
-{
-  "pickupZoneId": "uuid-from-/api/zones",
-  "destinationZoneId": "uuid-from-/api/zones",
-  "requestedSeats": 1,
-  "clientRequestId": "uuid" 
-}
-```
+## Fare calculation
 
-- `requestedSeats` is 1–3; an unknown zone id is `400 VALIDATION_ERROR`;
-  pickup === destination is rejected.
-- HTTP **201** on creation; a repeat submission with the **same
-  `clientRequestId`** replays the existing ride and returns HTTP **200**
-  (idempotent, migration 0003). Without a `clientRequestId`, each submission
-  creates a new ride — documented MVP behavior.
-- **One active ride per passenger (ADR-021):** while the caller already has a
-  non-terminal ride (REQUESTED/MATCHED/DRIVER_ARRIVED/STARTED), a new booking is
-  refused with `409 ACTIVE_RIDE_EXISTS` — enforced by the database
-  (`ride_requests_one_active_per_passenger`, migration 0006), so even two
-  concurrent bookings from the same passenger race safely. Cancelled or
-  completed trips free the passenger to book again.
-- Same-zone-partner hint: riding with Nusrat (`Banani → Mohakhali`) or Rafiq
-  (`Banani → Gulshan 1`) both use `pickupZoneId = Banani`.
+The formula is deterministic and **hand-verifiable** — computed from the seed
+zone coordinates, integer paisa throughout, with values pinned in tests
 
-### Fare formula (worked examples)
-
-Integer paisa, never floating point. Per seat stored; total = final × seats.
-
-```
-roadKm = haversine(pickup, destination) × 1.3        // R = 6371 km
-distanceChargePaisa = roundHalfUp(roadKm × 1200)     // 12 BDT/km
-finalFarePaisa = 3000 + distanceChargePaisa − 0      // base 30 BDT; poolDiscount = 0 pre-pooling
+```text
+roadKm = haversine(pickup, destination) × 1.3        // R = 6371 km; no routing
+distanceChargePaisa = roundHalfUp(roadKm × 1200)     // 12 BDT/km, per seat
+poolDiscountPaisa   = 0 before pooling
+                    = roundHalfUp(25% × (base + distance)) once the pool has ≥ 2 ACTIVE members
+finalFarePaisa      = 3000 + distanceCharge − poolDiscount       // base 30 BDT, per seat
 estimatedTotalPaisa = finalFarePaisa × requestedSeats
 ```
 
-| Route | distance (km) | fare per seat | BDT |
+The components are stored **per seat** in `fares`; the passenger's total is
+`final × seats`. The 25% "share a seat, split the fare" pool discount is exact
+in binary for the paisa sizes handled (0.25 is a power of two), so the
+discount is deterministic.
+
+### Worked examples (pinned in tests)
+
+| Passenger | Route | Solo fare | Pooled fare (25% off) |
 |---|---|---|---|
-| Nusrat | Banani → Mohakhali | 2.932 km × 1.3 ≈ 3.812 km | **5932 paisa** | 59.32 |
-| Rafiq | Banani → Gulshan 1 | 1.140 km × 1.3 ≈ 1.483 km | **4140 paisa** | 41.40 |
+| Nusrat | Banani → Mohakhali | **5332 paisa** (BDT 53.32) | **3999 paisa** (BDT 39.99) |
+| Rafiq | Banani → Gulshan 1 | **5303 paisa** (BDT 53.03) | **3977 paisa** (BDT 39.77) |
 
-A two-seat booking of Nusrat's route costs 2 × 5932 = **11864 paisa**.
-These values are pinned in `test/fare.test.ts` and `test/rides.test.ts` from
-the seed coordinates, so any drift is a test failure. See ADR-015 and
-`apps/api/src/fare/calculate.ts` for the exact code.
+Nusrat: distance ≈ 1.49 km → road ≈ 1.94 km → charge 2332 → final 5332.
+Rafiq: distance ≈ 1.48 km → road ≈ 1.92 km → charge 2303 → final 5303.
+Pooled discount: `roundHalfUp(0.25 × 5332) = 1333` → 3999; `roundHalfUp(0.25 ×
+5303) = 1326` → 3977.
 
-### Pooling (Phase 5)
+- Two seats on Nusrat's route alone cost `2 × 5332 = 10664` paisa.
+- The bank-verifiable values are pinned in `apps/api/test/fare.test.ts` from
+  the seed coordinates, so any formula drift fails CI.
+- Money is **always integer paisa** (`fares`), displayed with the BDT taka
+  sign and two decimals (`formatPaisa`) — never recomputed in the UI.
 
-`POST /api/rides` now runs the match inside its own create transaction
-(ADR-016/017). A request joins the best **eligible** pool — same pickup zone,
-all-pairs drop-off spread ≤ **2.0 km**, enough seats — or, when no eligible
-pool exists, is placed into a new **unassigned wait pool** (`driver_id`/
-`vehicle_id` NULL) that any online driver claims first-wins from the lobby
-(ADR-022). Either way it responds `MATCHED` with an additive `pool` object on
-the ride (`capacitySnapshot`, `occupiedSeats`; `vehicle`/`driver` are `null`
-until a driver accepts the pool).
-Nusrat + Rafiq pool (drop-off spread ≈ 1.906 km); `Banani → Dhanmondi`
-(≈ 4.6 km away) does not.
+See [`apps/api/src/fare/`](apps/api/src/fare) for the code and `docs/database.md`
+for the invariants.
+
+## Pooling and concurrency
+
+Two races matter, and both are solved **inside PostgreSQL transactions with
+row locks** — no Redis, no queues, no application mutexes (ADR-017/020/022).
+
+### 1. The final-seat race (capacity can never be exceeded)
+
+Canonical case from the PRD: Bullet has one seat left; **Nusrat and Shirin
+claim it at the same time**.
+
+`createRideRequest` runs its match inside a transaction and calls
+`claimSeatIn`, the seat-claim **source of truth**:
 
 ```
-poolDiscountPaisa = roundHalfUp(25% · (baseFare + distanceCharge))  // pool ≥ 2 ACTIVE members, else 0
-finalFarePaisa    = baseFare + distanceCharge − poolDiscount         // same row, updated in place
+SELECT … FOR UPDATE          -- lock the chosen pool row (the serialization point)
+re-check pool status         -- terminal/closed pool → try the next candidate
+derive occupancy             -- SUM(seats) over ACTIVE pool_members, under the lock
+if capacity remains          -- admit the new member, write membership + fare + journal
+else                         -- no eligible pool with room → start a NEW unassigned
+                               MATCHED wait pool (INSERT … RETURNING)
 ```
 
-| Passenger | Route | solo (initial) | pooled (25% off) |
+Exactly one admission happens; the loser (or any request with no eligible
+pool) lands `MATCHED` in its **own unassigned wait pool**. `REQUESTED` is
+transient-only and capacity can never be exceeded — there is no cached
+`available_seats` count to drift. The DB partial unique indexes on
+`pool_members` additionally forbid two ACTIVE memberships per ride request and
+duplicate memberships per (pool, request).
+
+### 2. The first-wins driver accept race
+
+Canonical case: **Jashim and Rahim both try to claim the same unassigned wait
+pool at the same time.**
+
+`acceptPool` serializes on the canonical lock order **vehicle → rides →
+pool** (ADR-020):
+
+```
+lock the caller's VEHICLE rows          -- their fleet is the parallel unit
+count owned active pools                -- excluding THIS pool (so re-accept is idempotent)
+   active count > 0 → 409 DRIVER_HAS_ACTIVE_POOL
+lock the contested POOL row             -- the first to get here wins
+   driver_id already set by someone else → 409 POOL_ALREADY_ACCEPTED
+   no online Tesla with capacity ≥ snapshot → 409 VEHICLE_OFFLINE
+write driver_id + vehicle_id + accepted_at atomically
+```
+
+A second driver's accept returns `409 POOL_ALREADY_ACCEPTED`; a no-Tesla or
+offline-Tesla driver gets `409 VEHICLE_OFFLINE`. The schema's partial unique
+indexes (`pools_single_accepted_per_driver` / `_per_vehicle`) back this with a
+second, non-bypassable guarantee.
+
+### Invalid lifecycle transitions
+
+An explicit transition map in `src/rides/state.ts` makes every move legal only
+if it is declared. `REQUESTED→STARTED` or a second `complete` are rejected with
+`409 INVALID_STATE_TRANSITION`, and every accepted move writes an append-only
+`ride_status_history` row and its timestamp, so history is always explainable.
+
+### Ownership
+
+Passenger routes are scoped to the authenticated user (cross-user reads return
+the same 404 as "does not exist"); driver routes are owner-only after accept
+(an unclaimed pool is a 404 for everyone); roles are enforced per request from
+the database.
+
+### What changes at larger scale (future, not built)
+
+- The pool row is a single hot serialization point. If a single Tesla becomes
+  a hotspot under load, split per-pool**seat ledgers** or reservation rows and
+  use `FOR UPDATE SKIP LOCKED`; move seats/occupancy to an append-only ledger
+  so reads never lock.
+- Multi-writer / cross-region adds a coordination layer; that (and a queue or
+  event bus) is when Redis/Kafka-style infrastructure earns its keep — the MVP
+  deliberately has none.
+- The PRD's "Oi Tesla Goes Viral" bonus analysis (geospatial indexes,
+  partition-by-status, eventual notification fan-out) is documented as
+  reasoning in `docs/requirements.md` §15 and `docs/database.md` §7.
+
+## Authentication and security
+
+- **Identity is Clerk.** The web uses `@clerk/nextjs` (`middleware.ts` route
+  policy + `ClerkProvider`); the API verifies every `/api` request with
+  `@clerk/backend`'s `authenticateRequest` over the bearer token. No passwords
+  or sessions are stored by the application (`sessions` table was removed,
+  ADR-013).
+- **Authorization is the database.** `users.role` (`PASSENGER` | `DRIVER` |
+  `ADMIN`) and `users.active` are the application's source of truth, attached
+  to `request.auth` on every request and enforced by `requireAuth()` /
+  `requireRole([...])`. The role **never** comes from the body or from Clerk.
+- **Provisioning is on-demand (ADR-014).** A valid Clerk identity with no
+  local row is created on first request as a `PASSENGER`
+  (`INSERT … ON CONFLICT (clerk_user_id) DO NOTHING RETURNING`, race-safe).
+  `DRIVER`/`ADMIN` are never self-assignable. Reserved `dev-only::seed::…`
+  placeholder ids are rejected (401).
+- **User-scoped data.** Every authenticated query key embeds the Clerk
+  `userId`; `SessionCacheSync` clears the TanStack cache when the user changes;
+  cross-user ride reads 404 identically to missing rides.
+- **Input validation.** Zod strict schemas on route bodies (unknown keys →
+  400), zone ids validated, `pickup ≠ destination`, seats 1–3. Even so, the
+  backend re-derives identity/role from the session.
+- **Error envelope.** `{ error: { code, message?, details? } }` — codes like
+  `ACTIVE_RIDE_EXISTS`, `POOL_ALREADY_ACCEPTED`, `FORBIDDEN`, `NOT_FOUND`.
+- **Environment hygiene.** `CLERK_SECRET_KEY` is server-side only; only
+  publishable keys reach the browser; `CLERK_AUTHORIZED_PARTIES` constrains
+  which origins may present tokens; nothing is logged.
+
+## Key engineering decisions
+
+Every choice is recorded with alternatives and trade-offs in
+[`docs/decisions.md`](docs/decisions.md) (ADRs 001–023). The highlights:
+
+| Decision | Chosen | Alternative | Why / when to revisit |
 |---|---|---|---|
-| Nusrat | Banani → Mohakhali | **5932 paisa** | **4449 paisa** |
-| Rafiq | Banani → Gulshan 1 | **4140 paisa** | **3105 paisa** |
-| Shirin | Banani → ... (any) | full fare | 25% off once pooled with a partner |
+| Architecture | Modular monolith (web + API + DB) | Microservices | One team, one domain, one deployable — simpler; split deploys only if load demands |
+| Database | PostgreSQL 16 | SQLite/MySQL | Real transactions, row locks, partial unique indexes, enums, Neon free tier; revisit only for exotic scale |
+| ORM | Drizzle + postgres.js | Prisma/Knex | SQL-native, lightweight, explicit `FOR UPDATE` control |
+| Auth | Clerk (external IdP) | Self-hosted cookies | No password/session storage, battle-tested; revisit if self-host is required |
+| UI styling | Hand-written plain CSS, always dark | Tailwind + shadcn/ui | No dependency without a reason (ADR-021 §4); revisit as the design surface grows |
+| Geography | Predefined zones + lat/long points | Geocoding/routing | MVP needs no routing; OSRM/routing is a documented future step |
+| Map | Leaflet + OSM, visualization only | Google Maps / paid tiles | Free and key-less; no traffic/GPS/E TA features in scope |
+| Matching | Same pickup + drop-off spread ≤ 2.0 km, fullest pool first | Opaque ML / route-overlap rules | Deterministic and hand-checkable; revisit with real road-time routing |
+| Fare | Integer paisa formula + 25% pool discount, stored per request | Float money / live pricing | PRD-mandated hand-verifiability; 0.25 is exact in binary |
+| Pool creation | Unassigned MATCHED wait pool; driver claims first-wins | Reserve a Tesla at booking | Decouples booking from fleet availability (ADR-022) |
+| Concurrency | PostgreSQL transactions + `FOR UPDATE` row locks | Redis locks / queues | Exactly one writer, one hot row; proven by concurrent tests (ADR-017/020) |
+| Status refresh | 5 s polling, stopping at terminal state | WebSockets/SSE | Simplest correct approach for an MVP (ADR-021 §6); push later |
+| Money collection | Cash acknowledgment (both roles) | Real payment gateway | PRD allows cash + simulated wallet; a gateway is a documented future step |
+| Driver earnings visibility | Fares + total shown on the driver surface (commit `74e1d8f`) | Fare-free driver view (original P9) | The driver must see what they collect; sourced verbatim from stored fares |
+| OSRM | **Intentionally deferred** | Real road-following routes | Straight-line ×1.3 is honest for the MVP; OSRM/Routing is a future improvement |
 
-Pooled values are pinned in `test/pooling.test.ts`, `test/rides.test.ts`, and
-`test/fare.test.ts`. `POST /api/rides/:rideId/cancel` (owner-only) cancels
-`REQUESTED`/`MATCHED`/`DRIVER_ARRIVED` rides (P8, Phase 6), frees the seats,
-recomputes remaining members' fares in place, and cancels a pool that empties
-(403/409/404 semantics in `test/pooling.test.ts`). The last-seat and first-pool
-races are covered by real concurrent tests against two database connections.
+## Known limitations
 
-### Driver workflow (Phase 6 — ADR-022: first-wins accept from a lobby)
+Honest list of what the MVP intentionally does (and does not) do — none of
+these are defects in the shipped scope, but a reviewer should know them:
 
-Drivers hold no session-visible data themselves — every route is
-`requireRole(["DRIVER"])` and derives identity purely from the bearer session
-(`request.auth`), never from the body. Endpoints:
+- **Predefined zones, no geocoding or routing.** Geography is 8 fixed
+  lat/long points; distances are great-circle × 1.3 — road-following routes
+  (OSRM) are an explicit future enhancement, not an omission.
+- **No live GPS / real-time Tesla tracking.** Positions are not tracked; the
+  map visualizes zones, not vehicles in motion.
+- **No real payment gateway.** Money is collected in cash; the passenger and
+  driver completion modals are cash acknowledgments ("Paid cash" / "Cash
+  received"). In-app balances don't exist.
+- **5-second polling instead of push.** Status changes from *other* actors
+  (the driver arriving, a new passenger joining) surface on the next poll —
+  up to ~5 s of UI delay (ADR-021 §6).
+- **Public OSM tile dependency.** The map needs network access to
+  `tile.openstreetmap.org`; if it fails the app degrades gracefully with a
+  "Live map unavailable" fallback while the controls stay usable.
+- **Deployment not executed yet.** The target is Vercel (web) + Render (API) +
+  Neon (Postgres), all free tier — see [Deployment](#deployment).
+- **No Playwright E2E yet.** Browser-level coverage is component tests;
+  full E2E is parked as future work (Phase 10).
+- **Driver history is capped at 10 and shows completed (not cancelled) trips.**
+  Documented MVP behavior.
+- **Local multi-user demo steps.** Playing the full cast live requires real
+  Clerk Development keys and the (documented) Clerk-ID mapping script.
 
-- `POST /api/driver/availability` body `{ "isOnline": true|false }` → **204**.
-  Flips all of the driver's Teslas. Refused while** any pool the driver
-  **accepted** is non-terminal (`409 DRIVER_HAS_ACTIVE_POOL`, §21.J — narrowed
-  by ADR-022: unassigned wait pools waiting in the lobby never block the
-  toggle). Idempotent — setting the already-current state succeeds.
-- `GET /api/driver/pools` → `{ "pools": [...] }`: the driver's **accepted**
-  non-terminal pools, `created_at DESC, id DESC`. Each view is fare-free: `pool`
-  fields plus ACTIVE `members[]` (`passengerName`, `seats`, `pickupZone`/
-  `destinationZone` names) and the assigned Tesla (NULL while unassigned).
-- `GET /api/driver/pools/available` → `{ "pools": [...] }`: the **lobby** —
-  every unassigned `MATCHED` pool (newest first). Identical for all drivers by
-  construction; claims happen here.
-- `GET /api/driver/pools/:poolId` → `{ "pool": {...} }`, same shape as a list
-  item; **404** for an unknown or another driver's pool (existence hidden 1:1).
-- `POST /api/driver/pools/:poolId/accept|arrive|start|complete` → `{ "pool": ... }`.
-  - `accept` is the **first-wins claim**: atomically assigns `driver_id`/
-    `vehicle_id`/`accepted_at` to an unassigned pool while the pool stays
-    `MATCHED`. **Idempotent** for the owner (the active-pool count excludes the
-    pool being re-accepted); the first of several concurrent drivers wins, the
-    rest get `409 POOL_ALREADY_ACCEPTED`; a pool already past MATCHED → `409
-    POOL_NOT_ACCEPTABLE`; no online Tesla with `capacity >= capacity_snapshot`
-    → `409 VEHICLE_OFFLINE`; already owning another active pool → `409
-    DRIVER_HAS_ACTIVE_POOL`.
-  - `arrive` requires an **accepted** MATCHED pool — on an unclaimed pool it is
-    `404 NOT_FOUND` (ownership exists only through acceptance); the pool and
-    every member ride move together (per-ride `ride_status_history` rows).
-  - `start` → `STARTED`; `complete` → `COMPLETED` and the Tesla/driver are free
-    for a new pool (terminal status drops the pool out of the per-driver/
-    vehicle partial unique indexes — no separate "release" action).
-  - Every driver action locks **vehicle rows → member rides → pool** (ADR-020)
-    so concurrent actions serialize: two accepts of the same pool → exactly one
-    winner, two `arrive`s/`complete`s have exactly one winner.
-- Passenger-facing consequence (P8): `POST /api/rides/:rideId/cancel` is legal
-  while the pool is `MATCHED` **or `DRIVER_ARRIVED`** (seat freed, remaining
-  fares recomputed); refused once the trip is `STARTED` or `COMPLETED`.
+## Future improvements
 
-No fares appear on any driver endpoint by design (P9): fare breakdown is a
-passenger concern. Migrations `0005` (`pools.accepted_at` + progression CHECK)
-and `0007` (nullable assignment + wait-pool CHECKs + one-accepted-pool-per-
-driver/vehicle) drive the driver flow; `test/driver.test.ts` (40 tests) is
-pinned against the seed cast — Jashim drives Bullet, Nusrat/Rafiq book the
-pool, Shirin's concurrent grab is the canonical capacity race, and Karim/Rahim/
-Faruq (Tesla 2/3/4, all online) cover the cross-driver race and multi-pool
-accept cases (the no-Tesla `VEHICLE_OFFLINE` case uses a dedicated non-cast
-driver fixture).
+- **Road-following routes via OSRM** (or a paid routing provider) replacing the
+  straight-line × 1.3 approximation, enabling true detour/time-based matching.
+- **Live GPS / vehicle tracking** on the map.
+- **Real-time updates** — WebSocket/SSE (or Server-Sent-Events) status push
+  instead of 5 s polling, plus push notifications.
+- **Real payment gateway** (bKash/Nagad/Stripe) consuming the stored fare rows.
+- **Geospatial matching** — PostGIS and spatial indexes; the "Oi Tesla Goes
+  Viral" scaling analysis in `docs/requirements.md` §15.
+- **Larger-scale concurrency** — per-pool seat ledgers, `FOR UPDATE SKIP
+  LOCKED` reservation rows, and an event/queue layer only when the pool row
+  becomes a real hotspot.
+- **Observability** — structured request tracing, metrics, richer health
+  checks for deployed environments.
+- **Playwright E2E** for the critical passenger/driver journeys.
+- **Admin tooling** — the `ADMIN` role exists in the schema but no
+  admin-only routes are built yet.
 
-## Known Limitations (accepted — not fixed in this phase)
+## AI usage
 
-Two minor runtime behaviors are known and intentionally left unfixed — neither
-affects data integrity or backend-enforced business rules.
+AI coding tools are explicitly allowed by the PRD and are used as a normal
+engineering tool — never hidden. The PRD record, from the actual development
+history:
 
-- **Driver online/offline toggle can surface `Failed to execute 'json' on
-  'Response': Unexpected end of JSON input`.** The switched state is still
-  applied and becomes visible on refresh. Suspected cause: the web API client
-  eagerly parses the JSON body of the toggle's `204 No Content` response
-  (`POST /api/driver/availability`). A future fix should make the client's
-  `request()` skip JSON parsing for empty 2xx responses.
-- **An offline driver can still *see* waiting requests in the lobby.**
-  `GET /api/driver/pools/available` lists every unassigned pool regardless of
-  the caller's availability; the backend correctly refuses such an accept with
-  `409 VEHICLE_OFFLINE` (the security boundary is the API, never the UI). A
-  future UX improvement could hide the lobby (or gray out Accept) while the
-  driver is offline; optionally the backend could filter the list by the
-  caller's availability.
+- **Tool:** an AI CLI coding agent (opencode) used across the project for
+  implementation, testing, docs, and verification. Every line of AI-assisted
+  code was reviewed and is owned/explainable by the human engineer.
+- **What it was used for:** the database schema/migrations/seed, the Clerk
+  authentication wiring (middleware, Fastify auth plugin, provisioning), fare
+  and pooling services, the state machine, both web surfaces, all tests, and
+  this documentation.
 
-## Docker (full stack, reproducible)
+**Accepted suggestions:**
 
-Builds and starts `web` + `api` + `db` with healthchecks:
+- Enforce "one application user per Clerk identity" in the **database**
+  (`users.clerk_user_id NOT NULL + UNIQUE`) and resolve identities from that
+  unique index, instead of an application-level query.
+- Provision application users lazily on the **first authenticated request**
+  (`INSERT … ON CONFLICT (clerk_user_id) DO NOTHING`, ADR-014).
+- Enforce "one active ride per passenger" with a **partial unique index**
+  (`ride_requests_one_active_per_passenger`, migration 0006) that the service
+  maps to `409 ACTIVE_RIDE_EXISTS` — the DB is the arbiter even under two
+  concurrent bookings.
+- Poll status **only while the trip is non-terminal** and stop at
+  COMPLETED/CANCELLED, instead of polling forever.
+- During the driver-accept rework, the agent found and fixed a real bug: the
+  "one accepted pool per driver" pre-check counted the pool being re-accepted,
+  so idempotent re-accept self-refused — fixed by excluding that pool
+  (`id <> :poolId`).
 
-```bash
-docker compose up --build
+**Rejected or modified suggestions (and why):**
+
+- Keeping an application-owned `sessions` table alongside Clerk — rejected:
+  Clerk owns the session lifecycle (ADR-013); a second session store would
+  reintroduce the manual-auth surface the decision removed (`sessions` was
+  dropped in migration 0001).
+- Clerk **webhooks** or **email-binding** to create users — rejected: no event
+  system needed yet, and email-binding would let anyone self-assign a seeded
+  identity (including, with a crafted email, a DRIVER). On-demand provisioning
+  stayed.
+- A cached `available_seats` counter with optimistic `UPDATE … WHERE
+  available >= n` and retries — rejected: a counter is a second, desyncable
+  source of truth. Occupancy is derived from ACTIVE `pool_members` under a
+  `SELECT … FOR UPDATE`.
+- A Redis lock/`SETNX` gate for the last-seat race — rejected: the MVP has one
+  writer and one hot row; PostgreSQL transactions prove the claim in
+  concurrent tests (no unnecessary Redis per AGENTS.md).
+- The original accept design kept accept-as-confirmation with only a read-only
+  pools list — rejected during review: the first-wins lobby story needs a real
+  claim. Final design makes `accept` assign `driver_id`/`vehicle_id`/
+  `accepted_at` under vehicle → count → pool-row locks.
+
+## Demo video
+
+> **Demo video: Coming soon.**
+
+The PRD requires a final video (max 6 minutes, e.g. Loom) covering the
+problem, architecture/ERD, engineering decisions, a product tour (passenger +
+driver + pooling + fares + status), one interesting edge case, and deployment
+if available. This README section will be updated with the link when the video
+is recorded.
+
+## Deployment
+
+**Not deployed yet.** The sections below describe the *planned* architecture
+and checklist; nothing here is live.
+
+### Planned deployment architecture
+
+```text
+Next.js frontend  →  Vercel            (free tier)
+Fastify API       →  Render            (free tier)
+PostgreSQL        →  Neon              (free tier)
 ```
 
-- `http://localhost:3000` — web
-- `http://localhost:3001/health` — API health
-- `http://localhost:5432` — PostgreSQL
+### Deployment checklist
 
-Notes:
+**Frontend (Vercel):**
+- Set build-time env: `NEXT_PUBLIC_API_URL` (the deployed API origin),
+  `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, the `NEXT_PUBLIC_CLERK_*` routing vars.
+- Runtime env: `CLERK_SECRET_KEY` for middleware/SSR.
+- Add the production web origin to Clerk **Authorized parties** / CORS.
 
-- The compose stack runs **production builds** of `web`/`api`; source changes
-  require `docker compose up --build` again. For hot reload during development
-  use the per-workspace `npm run dev` commands (API/web) with `docker compose
-  up db` for PostgreSQL.
-- Without real `CLERK_SECRET_KEY`/`CLERK_PUBLISHABLE_KEY` in `.env`, compose
-  falls back to invalid-but-well-formed placeholders: the stack boots and the
-  unauthenticated shape of every route works, while authenticated API routes
-  return the documented `AUTH_CONFIGURATION` error.
-- `docker compose down` stops containers and keeps the DB volume.
-  `docker compose down -v` also deletes the database volume (destructive).
+**Backend (Render):**
+- Set `DATABASE_URL` (Neon), `CLERK_SECRET_KEY`, `CLERK_PUBLISHABLE_KEY`,
+  `CLERK_AUTHORIZED_PARTIES` (comma-separated production origins),
+  `WEB_URL`, `API_HOST=0.0.0.0`, `API_PORT=3001`.
+- Start command: `node apps/api/dist/server.js` after `npm run build`.
 
-## Development Approach
+**Database (Neon):**
+- Provision a free database; run migrations against it
+  (`npm run db:migrate -w @dhaka-tesla-pool/api`) and seed demo data
+  (`npm run db:seed`).
+- Configure application roles (DRIVER for the demo drivers) and map Clerk
+  production identities to seeded rows.
 
-Implementation proceeds in phases (see
-[docs/development-plan.md](docs/development-plan.md)), one logical change per
-feature branch (`feature/<feature-name>`), merged to `master` when it works.
-Long-lived branches: `master`, `pre-release`, `release/v1.0.0`. Commits follow
-`<type>(<scope>): <description>` with a meaningful, inspectable history.
+**Verification:**
+- `GET /health` returns ok on the API.
+- Sign-in/sign-up round-trip works from the deployed web origin.
+- CORS/origin errors are absent (authorized parties match the real origin).
+- One end-to-end passenger + driver story plays against the deployed stack.
+
+## PRD traceability
+
+The PRD submission requirements map to the repository as follows
+(`docs/reference/PRD.pdf` is the source of truth; `docs/requirements.md` is the
+interpretation):
+
+| PRD submission item | Status | Where it lives |
+|---|---|---|
+| Working MVP (passenger + driver + pooling + fares) | ✅ complete | this README, `apps/*`, tests |
+| Docker / reproducible run | ✅ complete | `docker-compose.yml` + [Docker setup](#docker-setup) |
+| `.env.example` | ✅ complete | [`.env.example`](.env.example) |
+| Migrations | ✅ complete | `apps/api/drizzle/` 0000–0007 |
+| Seed / demo data | ✅ complete | `apps/api/src/db/seed.ts` (canonical cast) |
+| Architecture diagram | ✅ complete | [Architecture](#architecture) + `docs/architecture.md` |
+| ERD | ✅ complete | [Database / ERD](#database--erd) + `docs/database.md` |
+| Meaningful Git history | ✅ complete | `master` (feature-branch workflow, conventional commits) |
+| Testing | ✅ complete | 170 API + 80 web tests; six required behaviors covered |
+| README | ✅ complete | this file |
+| AI usage | ✅ complete | [AI usage](#ai-usage) |
+| Six-minute video | ⏳ pending | [Demo video](#demo-video) |
+| Deployment | ⏳ planned | [Deployment](#deployment) |
+| Concurrency explanation | ✅ complete | [Pooling and concurrency](#pooling-and-concurrency) |
+| Engineering decisions | ✅ complete | [Key engineering decisions](#key-engineering-decisions) + ADRs |
+| Known limitations | ✅ complete | [Known limitations](#known-limitations) |
 
 ## Documentation
 
-- PRD (primary source of truth): [docs/reference/PRD.pdf](docs/reference/PRD.pdf)
-- Requirements: [docs/requirements.md](docs/requirements.md)
-- Architecture: [docs/architecture.md](docs/architecture.md)
-- Database design: [docs/database.md](docs/database.md)
-- Decisions: [docs/decisions.md](docs/decisions.md)
-- Development plan: [docs/development-plan.md](docs/development-plan.md)
+- PRD (primary source of truth): [`docs/reference/PRD.pdf`](docs/reference/PRD.pdf)
+- Requirements interpretation: [`docs/requirements.md`](docs/requirements.md)
+- Architecture: [`docs/architecture.md`](docs/architecture.md)
+- Database design & concurrency strategy: [`docs/database.md`](docs/database.md)
+- Decision record (ADRs): [`docs/decisions.md`](docs/decisions.md)
+- Phased development plan: [`docs/development-plan.md`](docs/development-plan.md)
+- Frontend design specification: [`docs/frontend-design.md`](docs/frontend-design.md)
+- Screenshots: [`docs/Screenshots/`](docs/Screenshots)
 
-## Known Security Notes (accepted)
+## License
 
-- `npm audit` reports moderate advisories reachable only through the
-  dev-time CLI dependency `drizzle-kit` → `@esbuild-kit/esm-loader` → esbuild
-  < 0.24.3. The proposed "fix" downgrades drizzle-kit (breaking); the exposure
-  is development-time only, so it is accepted and revisited when tooling
-  allows.
-- Clerk keys are server-side secrets (`CLERK_SECRET_KEY`); only the publishable
-  key is browser-safe. Neither is committed, and tokens/sessions are never
-  logged by the API. `CLERK_AUTHORIZED_PARTIES` constrains which origins may
-  present tokens to the API.
-
-## AI Usage
-
-AI coding tools are explicitly allowed by the PRD and are used as a normal
-engineering tool — never hidden. This is the record the PRD requires.
-
-- **Tool:** an AI CLI coding agent (opencode) used throughout the project for
-  implementation, testing, docs, and verification.
-- **For what:** scaffolding; the database schema, migrations and seed; the
-  Clerk authentication implementation (SDK wiring, middleware, Fastify auth
-  plugin); tests; and this documentation.
-- **Accepted suggestion:** generate the `users.clerk_user_id` NOT NULL +
-  UNIQUE constraint so the DB — not the application — enforces "one application
-  user per Clerk identity", and drive the lookup from that unique index.
-- **Rejected/modified suggestion:** the agent proposed keeping an
-  application-owned `sessions` table alongside Clerk for local revocation
-  bookkeeping. This was rejected: Clerk owns the session lifecycle
-  (ADR-013), the API re-validates every request with `authenticateRequest()`,
-  and a second session store would reintroduce exactly the manual-auth surface
-  the decision removed — so the `sessions` table was dropped (migration 0001).
-- **Accepted suggestion:** for the `AUTH_USER_NOT_FOUND` gap, provision the
-  application user lazily on the **first authenticated request** (ADR-014)
-  using `INSERT … ON CONFLICT (clerk_user_id) DO NOTHING`, rather than bind a
-  Clerk account to a seeded row by email.
-- **Rejected/modified suggestion:** for the same gap, the agent evaluated Clerk
-  **webhooks** to create users at signup and **email-binding** of seeded
-  characters. Both were rejected: webhooks add an event system no consumer
-  needs yet, and email-binding lets anyone self-assign a seeded identity
-  (including, with a crafted email, a DRIVER). New identities are provisioned
-  on demand; demo-character mapping remains an explicit `users` UPDATE.
-- **Accepted suggestion (Phase 5):** create the racing pool with
-  `INSERT … ON CONFLICT DO NOTHING RETURNING` instead of a plain insert +
-  uniqueness-error retry. The conflict-target partial index
-  (`pools_single_active_per_vehicle`) turns the losing concurrent insert into a
-  no-op with an empty result, so one bounded re-scan joins the winner's pool —
-  no retry loop (ADR-017).
-- **Rejected/modified suggestion (Phase 5):** the agent's first concurrency draft
-  used a cached `available_seats` counter with optimistic `UPDATE … WHERE
-  available >= n` and a bounded retry loop. Rejected: a counter is a second
-  source of truth that can desync, and it did not solve the *pool-creation*
-  race on the same Tesla. The final design derives occupancy from ACTIVE
-  `pool_members` under a `SELECT … FOR UPDATE` on the pool row and settles
-  creation via the ON CONFLICT flow above.
-- **Rejected suggestion (Phase 5):** a Redis lock/`SETNX` gate for the last-seat
-  race. Rejected — the MVP has exactly one writer (PostgreSQL) and one hot row
-  (the pool row); a cache would add a second source of truth and latency. The
-  database-transactional claim is proven by concurrent tests; Redis stays out
-  per AGENTS.md "no unnecessary Redis" (ADR-017).
-- **Accepted suggestion (Phase 7):** enforce "one active ride per passenger"
-  with a **database partial unique index**
-  (`ride_requests_one_active_per_passenger`, migration 0006) whose violation the
-  service maps to `409 ACTIVE_RIDE_EXISTS`, instead of a read-then-write
-  application check. The DB is the arbiter even when two concurrent bookings
-  race (ADR-021 §1).
-- **Rejected/modified suggestion (Phase 8):** the agent's first draft of the
-  state pages polled forever (`refetchInterval: 5000` unconditionally). Modified
-  to **poll only while the trip is non-terminal and stop at
-  COMPLETED/CANCELLED** — an infinite poll on a finished trip is wasted traffic
-  and hides the "ride is over" state (ADR-021 §6). A Tailwind/shadcn scaffold
-  for the design was likewise deferred in favor of the hand-written plain-CSS
-  system (ADR-021 §4): no dependency without a reason.
-- **Accepted suggestion (Phase 6/8 follow-up, ADR-022):** the agent discovered a
-  real bug during rework — `acceptPool`'s "one active pool per driver" pre-check
-  counted the very pool being (re-)accepted, so an idempotent re-accept of an
-  own pool was refused with `DRIVER_HAS_ACTIVE_POOL`. Fixed by excluding the
-  pool itself (`AND id <> :poolId`) in the count, which is what makes re-accept
-  idempotent while still refusing a genuine second pool.
-- **Rejected/modified suggestion (Phase 6/8 follow-up, ADR-022):** the agent's
-  first accept design kept ADR-019's **accept-as-confirmation** and only added a
-  read-only "available pools" list. Rejected during review: with no driver-facing
-  decision, the open first-wins lobby story could not work. Final design makes
-  `accept` the **claim** (assigns `driver_id`/`vehicle_id`/`accepted_at` under
-  vehicle → count → pool-row locks) and the lobby a genuine competition — every
-  unassigned wait pool is claimable by any eligible driver, first-wins
-  (`409 POOL_ALREADY_ACCEPTED`), with booking decoupled from fleet availability.
-- The human engineer owns and must be able to explain every line of code.
+`UNLICENSED` — private project (see root `package.json`). No license grants
+are implied.

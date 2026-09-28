@@ -84,25 +84,29 @@ flowchart LR
 
 ## 3. Component Responsibilities
 
-> Phase-1 note: the sections below describe the **target** architecture. As of
-> Phase 1 the implemented surface is: minimal Next.js App Router app, Fastify
-> app with `GET /health`, env config, Pino logging, JSON error envelope, and a
-> Drizzle client + migration tooling. Everything not yet implemented is marked.
+> The sections below describe the **current MVP architecture** as implemented.
+> Historically they began as a Phase-1 target (minimal Next.js App Router app,
+> Fastify app with `GET /health`, env config, Pino logging, JSON error envelope,
+> and a Drizzle client + migration tooling) and grew through the phases below,
+> each annotated with its status.
 
 ### 3.1 Frontend (`apps/web`)
 - Phase 1: minimal App Router scaffold (`app/layout.tsx`, `app/page.tsx`
   status page), dev server, production build, tsc type check, ESLint.
 - Phase 3 (complete): Clerk authentication UI — `ClerkProvider` in the root
   layout, `/sign-in` and `/sign-up` pages, a protected `/account` profile page,
-  and `middleware.ts` route policy.
-- Later phases: passenger and driver flows (request ride, status tracking,
-  driver accept/arrive/start/complete).
+  and `middleware.ts` route policy. The auth screens now live in an `(auth)`
+  route group with Clerk catch-all routing (ADR-023).
+- Passenger + driver flows (complete): request ride, live status tracking,
+  pooled-fare display, ride history (`/rides/history`), driver accept/
+  arrive/start/complete, driver earnings, and driver history (`/driver/history`).
 - **Runs client-side form validation with Zod (via React Hook Form) but never
   relies on it** — it is UX-only (Phase 9).
 - Uses TanStack Query for data fetching, caching, and loading/error/empty states
   (Phase 9).
 - Leaflet renders predefined Dhaka zones and route polylines on OpenStreetMap —
-  **visualization only**, no routing (Phase 9).
+  **visualization only**, no routing (Phase 9; mounted in the `WorkspaceShell`
+  on both `/rides` and `/driver`).
 - Communicates with the API only through the API client layer
   (`apps/web/lib/api.ts`), which attaches the Clerk session token as a Bearer
   token using `NEXT_PUBLIC_API_URL`.
@@ -170,9 +174,9 @@ flowchart LR
   the in-place pooling recompute; pools/pool_members and their partial unique
   indexes already existed (Phase 2, ADR-012), so pooling required **no** new
   table.
-- Later phases: single source of truth for ride behavior; driver-flow
+- Phase 6 (complete): single source of truth for ride behavior; driver-flow
   transitions (`DRIVER_ARRIVED → STARTED → COMPLETED`) on the declared state
-  map.
+  map, exercised over HTTP by the driver lifecycle routes (ADR-019/020/022).
 - Occupied seats are always **derived** from ACTIVE `pool_members` rows — there
   is no cached "available seats" counter. Concurrency approach documented in
   `docs/database.md` §7.
@@ -186,7 +190,7 @@ flowchart LR
 | `GET/POST /api/driver/availability` (API) | `DRIVER` | current switch state + toggle (Phase 6; `GET` added Phase 8 for the hub UI) |
 | `GET /api/driver/pools` (API) | `DRIVER` (own) | open pools hub (Phase 6) |
 | `GET /api/driver/pools/history` (API) | `DRIVER` (own) | terminal pools view (Phase 8, ADR-021 §3) |
-| `GET /api/driver/pools/:poolId` (API) | `DRIVER` (owner); 404 otherwise | one pool with passengers/seats/zones — no fares (Phase 6) |
+| `GET /api/driver/pools/:poolId` (API) | `DRIVER` (owner); 404 otherwise | one pool with passengers/seats/zones + per-member `fare` + pool `earnings` (Phase 6, ADR-021 §3) |
 | `POST /api/driver/pools/:poolId/{accept,arrive,start,complete}` (API) | `DRIVER` (owner); 404/409 otherwise | lifecycle actions (Phase 6) |
 | `POST /api/rides` (API) | `PASSENGER` | `requireAuth` + `requireRole(["PASSENGER"])` + strict Zod body |
 | `GET /api/rides/estimate` (API) | `PASSENGER` | read-only pre-booking fare (ADR-021 §2); nothing persisted |
@@ -228,8 +232,8 @@ a ride id that does not exist — or belongs to another user — is a single
 
 ## 6. What Would Change at Larger Scale
 
-Recording potential future changes (not implemented now — see bonus analysis in
-`docs/development-plan.md` Phase 12 and `docs/requirements.md` §15):
+Recording potential future changes (not implemented now — see
+[`docs/requirements.md`](requirements.md) §15):
 
 - Split web/API into separate deploys (already separate apps in the monorepo).
 - Read replicas + bigger indexes; move seat-allocation locking under contention
@@ -312,9 +316,11 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-013,
   `/sign-in`, `/health` 200); unprovisioned Clerk yields the documented
   `AUTH_CONFIGURATION` error on authenticated routes.
 
-Not yet implemented (later phases): ride/booking UI (web), driver flow
-(`DRIVER_ARRIVED → STARTED → COMPLETED`), drivers, map visualization,
-deployment to Vercel/Render/Neon. Pool matching, the ride state machine, and
+As of this phase the following were still upcoming (all since shipped — see
+§11–§13 + the Implementation Status addendum below): ride/booking UI (web),
+driver flow (`DRIVER_ARRIVED → STARTED → COMPLETED`), drivers, map
+visualization. **Public deployment to Vercel/Render/Neon remains open** — free
+tier, not yet executed (see §7). Pool matching, the ride state machine, and
 pooled-fare recompute are implemented in Phase 5 (§12).
 
 ## 11. Implementation Status (Phase 4 — ride requests & fare estimation)
@@ -325,7 +331,7 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-015,
 - **Fare module** (`apps/api/src/fare/`): deterministic initial estimate —
   `roundHalfUp(haversine × 1.3 × 1200)` + 3000 paisa base; stored per seat,
   total = final × seats; pool discount 0 until pooling. Nusrat
-  Banani→Mohakhali 5932 paisa; Rafiq Banani→Gulshan 1 4140 paisa (pinned in
+  Banani→Mohakhali 5332 paisa; Rafiq Banani→Gulshan 1 5303 paisa (pinned in
   tests).
 - **Ride endpoints** (`apps/api/src/rides/`): `POST /api/rides` (201 new / 200
   idempotent replay via optional `client_request_id`), `GET /api/rides`,
@@ -351,7 +357,7 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-016/017/018,
   same pickup zone + all-pairs drop-off spread ≤ 2.0 km + `occupied +
   requested ≤ capacity_snapshot`; best eligible pool = fullest → newest → stable
   id; an eligible pool always beats a new one; Tesla pick is also deterministic.
-  Nusrat + Rafiq pool (spread ≈ 1.906 km); Dhanmondi does not (≈ 4.6 km).
+  Nusrat + Rafiq pool (spread ≈ 1.103 km); Dhanmondi does not (≈ 4.6 km).
 - **State machine** (`apps/api/src/rides/state.ts`): single transition map for
   the whole PRD lifecycle; every service transition goes through `canTransition`;
   illegal moves surface as `409 INVALID_STATE_TRANSITION` (Fastify built-in
@@ -372,7 +378,7 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-016/017/018,
 - **In-place pooled fare** (`src/rides/pooling/fare.ts`): ≥ 2 ACTIVE members ⇒
   every member's fare row recomputed in place (25% off base+distance, rounded
   half-up; `fares.updated_at` from migration 0004); solo pool stays at full fare.
-  Nusrat 4449 / Rafiq 3105 paisa — pinned.
+  Nusrat 3999 / Rafiq 3977 paisa — pinned.
 - **Cancellation** (`POST /api/rides/:rideId/cancel`): owner-only (404
   otherwise), legal in REQUESTED/MATCHED, else 409. MATCHED cancels flip
   membership to `LEFT`, recompute remaining fares, cancel an emptied pool.
@@ -383,14 +389,17 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-016/017/018,
   subquery — history of exactly the Phase 4 shape stays intact. Since ADR-022
   the `vehicle`/`driver` fields are NULL while the pool is unassigned (waiting
   for a driver to claim it).
-- **Validation/tests**: full suite **122/122** (8 files), root lint + typecheck +
+- **Validation/tests**: the API suite is current at **170 `it/test` blocks across
+  9 files** (this phase snapshot was 122/122 across 8), root lint + typecheck +
   build (API + Next.js web) green; migration 0004 applied to the Docker dev DB;
   `db:generate` reports no drift; `docker compose config` valid. Concurrency is
   proven with two independent PostgreSQL connections, including the canonical
   race — Bullet pre-filled to 2 seats, Rafiq vs Shirin both claiming the last
-  seat: exactly one MATCHED, one stays REQUESTED, occupancy always 3.
-- Pending (later phases): payments, map visualization; the Phase 5 "driver
-  accept" gap was closed by ADR-022 (Phase 6/8 follow-up, §13 below).
+  seat: exactly one wins the claim and lands in the pool, the other starts its
+  own unassigned wait pool, occupancy always 3.
+- Pending (later phases): payments. The Phase 5 "driver accept" gap was closed
+  by ADR-022 (Phase 6/8 follow-up, §13 below); map visualization shipped in the
+  web redesign (see the addendum after §13).
 
 ## 13. Implementation Status (Phase 6 — driver workflow)
 
@@ -412,10 +421,11 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-019/020/022,
   `GET /api/driver/pools/:poolId`) now return only pools the driver **accepted**
   (ownership = `driver_id`).
 - **Read hub**: the driver's accepted non-terminal pools (newest first) and a
-  single pool, each as a fare-free view: passenger name, seats, pickup/
-  destination zone names, vehicle (incl. `isOnline`; NULL while unassigned),
-  pool status + timestamps. Deliberately **no fares** on the driver surface
-  (P9); ACTIVE members only.
+  single pool, each showing passenger name, seats, pickup/destination zone
+  names, vehicle (incl. `isOnline`; NULL while unassigned), pool status +
+  timestamps, **per-member `fare` and pool `earnings`** (commit `74e1d8f`;
+  ADR-021 §3 explicitly relaxed the earlier "no fares on driver surface"
+  rule — P9); ACTIVE members only.
 - **Accept = first-wins claim** (`POST /api/driver/pools/:poolId/accept` →
   `{ pool }`): atomically assigns `driver_id`/`vehicle_id`/`accepted_at` to an
   unassigned pool under the ADR-020 vehicle → count → pool-row lock order
@@ -452,11 +462,39 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-019/020/022,
   `pools_driver_implies_accepted`, partial uniques
   `pools_single_accepted_per_driver` / `pools_single_accepted_per_vehicle`;
   `pools_single_active_per_vehicle` dropped).
-- **Validation/tests**: full suite **173/173** (9 files) against the Docker
-  PostgreSQL `_test` database, root lint + typecheck + build (API + web) green;
-  migration 0007 applied; `db:generate` reports no drift; web suite **36→39**
-  tests with the lobby flow.
+- **Validation/tests**: the API suite is current at **170 `it/test` blocks across
+  9 files** against the Docker PostgreSQL `_test` database, root lint +
+  typecheck + build (API + web) green; migration 0007 applied; `db:generate`
+  reports no drift; the web suite is current at **80 tests across 15 files**
+  (this phase snapshot was 36→39 with the lobby flow).
 - Routing additions: `POST /api/driver/availability`, `GET /api/driver/pools`,
   `GET /api/driver/pools/available`, `GET /api/driver/pools/:poolId`, and the
   four lifecycle POSTs, registered in `src/app.ts` via a thin `DriverService`
   facade (`src/driver/`).
+
+## 14. Implementation Status (post-Phase-6 web work)
+
+Backend + web work shipped after the Phase 6 driver-flow snapshot (see
+[docs/decisions.md](decisions.md) ADR-021/ADR-022, plus the redesign commits
+`09a3824`…`53abeb3`, the driver-fare commit `74e1d8f`, and bugfix `e6fa0a1`):
+
+- **Driver fares / earnings (`74e1d8f`, ADR-021 §3):** all driver pool views —
+  the read hub, pool detail, history (`GET /api/driver/pools/history`), and
+  lifecycle responses — now project per-member `fare` and pool
+  `earnings.totalCollectedPaisa`. The pre-ADR-021 "no fares (P9)" rule is
+  superseded (recorded in ADR-021 §3 and §13 above). Pinned in
+  `apps/api/test/driver.test.ts`.
+- **Frontend redesign (`09a3824`…`53abeb3`):** the web app was redesigned
+  twice since the Phase 6 snapshot — an always-dark hand-written-CSS design
+  system (ADR-021 §4), then a driver-workspace UX pass. Highlights:
+  Leaflet + OSM `MapPane` mounted on `/rides` and `/driver` workspace shells;
+  minimal hamburger drawer navigation (`app-menu.tsx`); dedicated
+  `/rides/history` and `/driver/history` routes; passenger booking area with a
+  1|2|3 seat stepper, live estimate, and zone-selection map feedback; pool and
+  ride-completion modals showing each passenger's own fare (`lib/completed-ack.ts`).
+- Lobby and rider surfaces poll status every 5 s only while a trip is
+  non-terminal (ADR-021 §6); role-unresolved sessions render only Account + Sign
+  out (query isolation is `userId`-scoped, ADR-023).
+- **Testing:** the web suite is 80 tests across 15 files (Vitest + RTL),
+  `next build` clean; the API suite is 170 tests across 9 files.
+  Playwright E2E (Phase 10) has not been introduced.
