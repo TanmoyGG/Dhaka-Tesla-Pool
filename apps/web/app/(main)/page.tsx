@@ -2,10 +2,11 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "@clerk/nextjs";
 import { useMe } from "@/lib/queries";
 import { ErrorCard } from "@/components/state-components";
+import { CredentialsModal } from "@/components/credentials-modal";
 
 const REPO_URL = "https://github.com/TanmoyGG/Dhaka-Tesla-Pool";
 
@@ -19,6 +20,10 @@ export default function HomePage() {
   const { isLoaded, isSignedIn } = useAuth();
   const me = useMe();
   const role = me.data?.role;
+  // Public demo credentials (frontend-design.md §6.6). Signed-out visitors
+  // only — a signed-in user is redirected to their workspace and never sees it.
+  const [credentialsOpen, setCredentialsOpen] = useState(false);
+  const closeCredentials = useCallback(() => setCredentialsOpen(false), []);
 
   useEffect(() => {
     if (isLoaded && isSignedIn && me.isSuccess && role) {
@@ -80,7 +85,16 @@ export default function HomePage() {
         <Link className="btn btn-secondary" href="/sign-in">
           Sign in
         </Link>
+        <button
+          type="button"
+          className="btn btn-ghost"
+          onClick={() => setCredentialsOpen(true)}
+        >
+          Credentials for Testing
+        </button>
       </nav>
+
+      <CredentialsModal open={credentialsOpen} onClose={closeCredentials} />
     </main>
   );
 }
