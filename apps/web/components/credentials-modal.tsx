@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 
-// Landing-page demo credentials (docs/frontend-design.md §6.6). These are
+// Landing-page demo credentials (docs/frontend-design.md §3.1). These are
 // INTENTIONALLY PUBLIC: the deployed build is a free public testing/demo
 // project, and a reviewer must be able to sign in as a passenger or a driver
 // without creating an account.

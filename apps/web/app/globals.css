@@ -1529,6 +1529,13 @@ p {
   }
 }
 
+/* Secondary action on its own line below the primary auth pair. `.btn` is
+   inline-flex, so text-align centers it without a flex wrapper. */
+.landing-secondary {
+  margin-top: 0.85rem;
+  text-align: center;
+}
+
 .landing-redirect {
   display: flex;
   flex-direction: column;

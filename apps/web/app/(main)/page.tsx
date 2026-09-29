@@ -20,7 +20,7 @@ export default function HomePage() {
   const { isLoaded, isSignedIn } = useAuth();
   const me = useMe();
   const role = me.data?.role;
-  // Public demo credentials (frontend-design.md §6.6). Signed-out visitors
+  // Public demo credentials (frontend-design.md §3.1). Signed-out visitors
   // only — a signed-in user is redirected to their workspace and never sees it.
   const [credentialsOpen, setCredentialsOpen] = useState(false);
   const closeCredentials = useCallback(() => setCredentialsOpen(false), []);
@@ -85,6 +85,9 @@ export default function HomePage() {
         <Link className="btn btn-secondary" href="/sign-in">
           Sign in
         </Link>
+      </nav>
+
+      <div className="landing-secondary">
         <button
           type="button"
           className="btn btn-ghost"
@@ -92,7 +95,7 @@ export default function HomePage() {
         >
           Credentials for Testing
         </button>
-      </nav>
+      </div>
 
       <CredentialsModal open={credentialsOpen} onClose={closeCredentials} />
     </main>

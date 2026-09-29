@@ -1,5 +1,5 @@
 // CredentialsModal — the public demo-credentials dialog on the signed-out
-// landing page (frontend-design.md §6.6). These credentials are intentionally
+// landing page (frontend-design.md §3.1). These credentials are intentionally
 // public, so the test asserts the full set is present and usable; it verifies
 // copy/reveal through the rendered UI and never asserts on clipboard internals
 // beyond the value handed to the API.

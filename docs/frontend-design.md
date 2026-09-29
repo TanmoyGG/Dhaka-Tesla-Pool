@@ -196,8 +196,14 @@ Purpose: pitch the product, get the user signed in, link the repo. Nothing else.
 
 - **Purpose.** The public demo deployment lets a reviewer exercise both roles
   without registering. The landing page's third action, **"Credentials for
-  Testing"** (`btn-ghost`, after the auth CTAs), opens it. Signed-in users never
+  Testing"** (`btn-ghost`), opens it. Signed-in users never
   see it — they are redirected to their workspace.
+- **Placement.** Deliberately **not** inside the `.landing-actions` flex row:
+  the two primary auth buttons stay side-by-side as the dominant pair, and this
+  secondary control sits on its own line **below** them, horizontally centered
+  (`.landing-secondary`). At `min-width: 36rem` the primary pair is a row; below
+  that it stacks full-width as before, and the secondary line stays centered
+  either way.
 - **Chrome.** Reuses the completion-modal shell verbatim
   (`createPortal(..., document.body)`, `role="dialog"`, `aria-modal="true"`,
   `aria-labelledby`, body scroll lock, `completion-fade` / `completion-pop`).
