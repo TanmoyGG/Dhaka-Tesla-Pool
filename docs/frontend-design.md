@@ -16,6 +16,7 @@
 1. Current state (what exists today)
 2. Overall visual direction
 3. Landing page
+   - 3.1 Demo credentials modal
 4. Authentication
 5. Passenger experience
 6. Driver experience
@@ -58,6 +59,7 @@ themed via `@clerk/themes` `dark` with matching variables.
 `PoolActions`, `MemberList` (with `member.fare`), `LobbyPoolCard` (Accept claim),
 `CancelRideButton`, `BookingArea`, `RideCompletionModal`,
 `driver-completion-modal.tsx`, `app-menu.tsx` (hamburger drawer),
+`CredentialsModal` (`credentials-modal.tsx`, landing demo credentials — §3.1),
 `describeApiError` (`lib/api.ts`), `formatPaisa` / `formatDateTime`
 (`lib/format.ts`), the TanStack Query hooks in `lib/queries.ts`, and the type
 mirror in `lib/types.ts`.
@@ -175,6 +177,9 @@ Purpose: pitch the product, get the user signed in, link the repo. Nothing else.
   Clerk `/sign-up`, secondary "Sign in" → Clerk `/sign-in`. **Exactly one
   auth control set on the page** (see §11 conflict: today the landing and the
   header both render sign-in/up when signed out).
+- **"Credentials for Testing" button** (ghost variant, after the two auth
+  CTAs) opens the demo-credentials modal — see §3.1. The demo cast is
+  intentionally public for the public testing deployment.
 - **GitHub link** in a corner (top-right, ghost icon+label). Never in the
   main content column.
 - **Remove the numbered `<ol>` instruction block** currently in
@@ -186,6 +191,45 @@ Purpose: pitch the product, get the user signed in, link the repo. Nothing else.
   The landing page must **never** act as a post-login dashboard or an
   intermediate page — signed-in users are not shown the landing page at all
   (no role-aware quick-path toggle here).
+
+### 3.1 Demo credentials modal
+
+- **Purpose.** The public demo deployment lets a reviewer exercise both roles
+  without registering. The landing page's third action, **"Credentials for
+  Testing"** (`btn-ghost`), opens it. Signed-in users never
+  see it — they are redirected to their workspace.
+- **Placement.** Deliberately **not** inside the `.landing-actions` flex row:
+  the two primary auth buttons stay side-by-side as the dominant pair, and this
+  secondary control sits on its own line **below** them, horizontally centered
+  (`.landing-secondary`). At `min-width: 36rem` the primary pair is a row; below
+  that it stacks full-width as before, and the secondary line stays centered
+  either way.
+- **Chrome.** Reuses the completion-modal shell verbatim
+  (`createPortal(..., document.body)`, `role="dialog"`, `aria-modal="true"`,
+  `aria-labelledby`, body scroll lock, `completion-fade` / `completion-pop`).
+  Only the content block is new: `.credentials-modal*` classes, existing tokens
+  only (`--bg-raised`, `--border-strong`, `--radius`, `--mono`, `--accent`).
+  Wider than the completion card (`min(100%, 34rem)`) and **left-aligned**,
+  because credential rows are text rather than a centred fare summary.
+- **Content.** Heading, then two intro lines: self-service passenger sign-up,
+  and the explicit statement that **driver registration is not available in this
+  MVP** (the API provisions every new identity as `PASSENGER`; `DRIVER`/`ADMIN`
+  are database-only). Then two groups — **Passengers** (Nusrat, Rafiq, Shirin)
+  and **Drivers** (Jashim, Karim, Rahim, Faruq) — followed by a line stating the
+  credentials are intentionally public, then a primary "Close" button.
+- **Each credential row** shows the person's name, the email, and the password
+  **masked** by default, with per-row `Show` / `Hide`, `Copy email`, and
+  `Copy password` actions. Copy uses the native `navigator.clipboard` API — no
+  new dependency — and shows a transient `Copied` label. A denied clipboard is
+  a silent no-op (the password is reachable via `Show`), never an error state.
+- **Dismissal.** Escape and the overlay both close, and reveal/copy state resets
+  on close. Unlike the one-time cash-acknowledgement modals (§5.4, §6.5) this
+  modal is purely informational, so there is **no confirmation gate**.
+- **Security posture.** These credentials are intentionally public demo logins
+  for a free testing build, backed by a Clerk **Development** instance with no
+  personal or payment data. They grant nothing beyond a row in the demo
+  database. This is an accepted, documented trade-off (`decisions.md` ADR-023),
+  not an oversight.
 
 ---
 

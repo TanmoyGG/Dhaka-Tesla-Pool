@@ -478,6 +478,145 @@ p {
   }
 }
 
+/* ----- Demo credentials modal (landing page, frontend-design.md §6.6) ----- */
+
+/* Reuses the completion modal's shell, keyframes and tokens so this reads as
+   the same dialog family — only the content block below is new. Portaled to
+   <body> for the same `backdrop-filter` containing-block reason. The card is
+   wider and left-aligned here because credential rows are text, not a
+   centred fare summary. */
+.credentials-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+
+.credentials-modal-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(6, 7, 9, 0.6);
+  backdrop-filter: blur(2px);
+  animation: completion-fade 150ms ease;
+}
+
+.credentials-modal-card {
+  position: relative;
+  width: min(100%, 34rem);
+  max-height: calc(100dvh - 2rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 1.25rem 3.5rem rgba(0, 0, 0, 0.55);
+  padding: 1.75rem 1.5rem;
+  text-align: left;
+  animation: completion-pop 160ms ease;
+}
+
+.credentials-modal-card h2 {
+  margin: 0 0 0.6rem;
+}
+
+.credentials-intro {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+}
+
+.credentials-group {
+  margin: 1.1rem 0 0;
+}
+
+.credentials-group-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.credentials-list {
+  list-style: none;
+  margin: 0;
+  padding: 0.65rem 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+}
+
+.credentials-item-head {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.credentials-name {
+  font-weight: 600;
+}
+
+/* One credential line: the value on the left, its actions on the right. Wraps
+   rather than overflowing so a long email stays readable on a phone. */
+.credentials-field-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.credentials-value {
+  flex: 1 1 12rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+/* Small secondary action (Copy / Show / Hide). Deliberately quieter than
+   .btn so the credentials read first and the controls stay secondary. */
+.credentials-action {
+  flex: 0 0 auto;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.credentials-action:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.credentials-action:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.credentials-note {
+  margin: 1.1rem 0 1.15rem;
+  font-size: 0.82rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .credentials-modal-overlay,
+  .credentials-modal-card {
+    animation: none;
+  }
+}
+
 /* ----- Shared ride workspace (map + controls) ----- */
 
 /* The workspace replaces the centered .container inside the signed-in app:
@@ -1388,6 +1527,13 @@ p {
     flex-direction: row;
     max-width: 26rem;
   }
+}
+
+/* Secondary action on its own line below the primary auth pair. `.btn` is
+   inline-flex, so text-align centers it without a flex wrapper. */
+.landing-secondary {
+  margin-top: 0.85rem;
+  text-align: center;
 }
 
 .landing-redirect {

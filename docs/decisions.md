@@ -125,13 +125,14 @@
 ## ADR-009: Deployment strategy (free-tier only)
 
 > **Status: decided, not yet executed.** `docker compose up` runs the full stack
-> locally, but none of the three hosts has been deployed to; "public deployment
-> preferred" remains an open README/checklist item.
+> locally, but none of the three hosts has been deployed to. The plan and
+> platform configuration are documented in `docs/deployment-plan.md`; the
+> public demo deployment has not been performed yet.
 
 - **Decision:** Vercel (Next.js) → Render (Fastify API) → Neon (PostgreSQL),
   all free tiers; fallback to a reproducible Docker deployment if a free
   backend host is unavailable.
-- **Alternatives:** Railway free tier, Fly.io, raw VPS (DigitalOcean droplets —
+- **Alternatives:** Railway free tier, Fly.io, raw VPS (DigitalOcean droplets -
   not free), self-hosting.
 - **Why now:** PRD: *free/free-tier only, do not pay; public deployment
   preferred.* These three fit the chosen stack with zero cost.
@@ -139,6 +140,43 @@
   limits; Render free instances spin down on idle.
 - **Switch later if:** Free tiers become paid-only or reliability demands
   endurance servers (then code is unchanged; only hosting changes).
+
+## ADR-023: Public demo runs on the Clerk *Development* instance
+
+> **Status: decided.** See ADR-009 for the hosting decision. This ADR records
+> the deliberate choice to publish the demo **without** a Clerk Production
+> instance.
+
+- **Decision:** The public demo deployment reuses the **existing Clerk
+  Development instance**, its existing 7 demo users, and its `pk_test_…` /
+  `sk_test_…` keys. No Production instance is created, cloned, or promoted, and
+  no custom domain is purchased — the free `*.vercel.app` hostname is used.
+- **Why:** This is a **free public testing/demo project**, not a commercial
+  launch. A Production instance would add cost and operational surface for no
+  benefit to a reviewer. Clerk's Development banner is expected and acceptable.
+  The demo needs no data protection beyond what the development instance
+  already provides, and the demo accounts hold no personal or payment data.
+- **Consequences:** Clerk shows a Development banner in the UI. Development
+  instances carry vendor-side limits (e.g. MAU caps) and are not a
+  durability guarantee: **resetting the instance would invalidate the 7 Clerk
+  user IDs** and break sign-in. That failure mode is documented and cheap to
+  recover from — re-run `apps/api/scripts/map-cast-clerk-ids.sql` with the new
+  IDs (`docs/deployment-plan.md` §12, §19); no redeploy is needed.
+- **Credentials in the open:** the landing page's "Credentials for Testing"
+  modal displays the 3 passenger and 4 driver demo logins. This is intentional
+  and accepted for a public demo, not an oversight.
+- **Role model unchanged:** public sign-up is enabled, and the API provisions
+  every new identity as **PASSENGER** (`apps/api/src/auth/user-resolver.ts`).
+  **DRIVER/ADMIN remain database-only** — there is no public driver
+  registration, so driver testing uses the demo driver accounts.
+- **Sign-up requires a username:** the API derives `users.name` from the Clerk
+  username and fails provisioning without one
+  (`apps/api/src/auth/provision.ts`), so the Clerk instance has *Sign-up with
+  username* and *Require username* enabled. This is a Clerk **configuration**
+  requirement, not application code.
+- **Switch later if:** the project becomes a real commercial deployment — create
+  a Clerk Production instance, publish new user IDs, and update the same two
+  `CLERK_*` values on Render and Vercel. No application code changes.
 
 ## ADR-010: Monorepo with npm workspaces
 
