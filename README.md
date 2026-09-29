@@ -1082,42 +1082,71 @@ is recorded.
 
 ## Deployment
 
-**Not deployed yet.** The sections below describe the *planned* architecture
-and checklist; nothing here is live.
+**Not deployed yet.** The sections below describe the *planned* public demo
+architecture and checklist; nothing is live. Replace `<VERCEL_URL>` and
+`<RENDER_API_URL>` with the real hosts once the cloud resources exist.
 
-### Planned deployment architecture
+### Planned deployment architecture (public demo, free tier)
 
 ```text
-Next.js frontend  →  Vercel            (free tier)
-Fastify API       →  Render            (free tier)
-PostgreSQL        →  Neon              (free tier)
+Browser → Vercel (Next.js, *.vercel.app)  →  Render (Fastify API)  →  Neon (PostgreSQL)
+                    ↘ Clerk DEVELOPMENT instance (test keys, existing 7 demo users) ↙
 ```
+
+> **This is a public testing/demo deployment, not a commercial production
+> launch.** The existing Clerk **Development** instance is retained — no
+> Production instance is created, cloned, or promoted, and `pk_test_…` /
+> `sk_test_…` keys are used as-is. Clerk's Development banner is expected and
+> acceptable. The free `*.vercel.app` domain is used (no custom domain). The
+> trade-offs of this choice are recorded in [ADR-009](docs/decisions.md).
+> The full plan is [docs/deployment-plan.md](docs/deployment-plan.md).
 
 ### Deployment checklist
 
 **Frontend (Vercel):**
-- Set build-time env: `NEXT_PUBLIC_API_URL` (the deployed API origin),
-  `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, the `NEXT_PUBLIC_CLERK_*` routing vars.
-- Runtime env: `CLERK_SECRET_KEY` for middleware/SSR.
-- Add the production web origin to Clerk **Authorized parties** / CORS.
+- Root Directory `apps/web`, Build `npm run build`, Node 24. Do **not** set
+  `output: "standalone"` (that is only for self-hosted Docker).
+- Build-time env: `NEXT_PUBLIC_API_URL` = `https://<RENDER_API_URL>`,
+  `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` (existing `pk_test_…`),
+  `NEXT_PUBLIC_CLERK_SIGN_IN_URL` / `_SIGN_UP_URL` and the three
+  `_FALLBACK_REDIRECT_URL` vars (all origin-relative).
+- Server env: `CLERK_SECRET_KEY` (existing `sk_test_…`) for middleware/SSR.
+- Never set `DATABASE_URL` on Vercel — the frontend never queries Postgres.
 
 **Backend (Render):**
-- Set `DATABASE_URL` (Neon), `CLERK_SECRET_KEY`, `CLERK_PUBLISHABLE_KEY`,
-  `CLERK_AUTHORIZED_PARTIES` (comma-separated production origins),
-  `WEB_URL`, `API_HOST=0.0.0.0`, `API_PORT=3001`.
-- Start command: `node apps/api/dist/server.js` after `npm run build`.
+- Node, Root Directory *(blank)*, Build
+  `npm ci && npm run build -w @dhaka-tesla-pool/api`, Start
+  `node apps/api/dist/server.js`, **Health Check Path `/health`**.
+- Set `NODE_ENV=production`, `DATABASE_URL` (Neon direct), `CLERK_SECRET_KEY`,
+  `CLERK_PUBLISHABLE_KEY`, `CLERK_AUTHORIZED_PARTIES` = `https://<VERCEL_URL>`,
+  `WEB_URL` = `https://<VERCEL_URL>`, `API_HOST=0.0.0.0`.
+- **Do not set `API_PORT`.** Render injects `PORT` and the API honours it when
+  `API_PORT` is absent (`apps/api/src/config.ts`).
+- Do **not** add `npm test` to the build command: the test helper drops/creates
+  a `_test` database.
 
 **Database (Neon):**
-- Provision a free database; run migrations against it
-  (`npm run db:migrate -w @dhaka-tesla-pool/api`) and seed demo data
-  (`npm run db:seed`).
-- Configure application roles (DRIVER for the demo drivers) and map Clerk
-  production identities to seeded rows.
+- Free PostgreSQL **16** project, **direct** (non-`-pooler`) connection string.
+- Run migrations and seed, then map the **existing Clerk Development** user IDs
+  into the seeded rows with `apps/api/scripts/map-cast-clerk-ids.sql` (roles and
+  vehicle ownership are preserved; only `clerk_user_id` is updated). Do this
+  **before** any demo account signs in.
+- `db:migrate` / `db:seed` do not load `.env`; export `DATABASE_URL` in the shell.
+
+**Clerk (existing Development instance):**
+- Add `https://<VERCEL_URL>` to the instance's **allowed origins** (keep
+  `http://localhost:3000` for local dev). No redirect-URL entries are needed —
+  `/sign-in` and `/sign-up` are same-origin relative paths.
+- Public sign-up is enabled; **Sign-up with username** and **Require username**
+  are enabled (the API provisions `users.name` from the Clerk username). New
+  public users become **PASSENGER**. **Driver registration is intentionally
+  unavailable** — driver testing uses the 4 demo driver accounts.
 
 **Verification:**
-- `GET /health` returns ok on the API.
-- Sign-in/sign-up round-trip works from the deployed web origin.
-- CORS/origin errors are absent (authorized parties match the real origin).
+- `GET <RENDER_API_URL>/health` returns ok; `GET <RENDER_API_URL>/` 404s.
+- `GET <RENDER_API_URL>/api/zones` returns the 8 zones (real DB round-trip);
+  `/api/me` without a token returns 401.
+- Sign-in/sign-up round-trip works from the deployed web origin; no CORS errors.
 - One end-to-end passenger + driver story plays against the deployed stack.
 
 ## PRD traceability
@@ -1140,7 +1169,7 @@ interpretation):
 | README | ✅ complete | this file |
 | AI usage | ✅ complete | [AI usage](#ai-usage) |
 | Six-minute video | ⏳ pending | [Demo video](#demo-video) |
-| Deployment | ⏳ planned | [Deployment](#deployment) |
+| Deployment | ⏳ planned (public demo, Clerk Development) | [Deployment](#deployment) + [docs/deployment-plan.md](docs/deployment-plan.md) |
 | Concurrency explanation | ✅ complete | [Pooling and concurrency](#pooling-and-concurrency) |
 | Engineering decisions | ✅ complete | [Key engineering decisions](#key-engineering-decisions) + ADRs |
 | Known limitations | ✅ complete | [Known limitations](#known-limitations) |

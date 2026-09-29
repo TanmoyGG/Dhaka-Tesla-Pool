@@ -368,15 +368,21 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 ## Phase 11 — Docker / deployment
 
 > **Status: PARTIAL.** Docker/Compose is **done and shipped** — `docker compose
-> up --build` runs the full web+api+db stack with healthchecks, migrations+seed
-> on startup, and a complete `.env.example`; verified on Windows. **Public
-> deployment (Vercel web + Render api + Neon db) is decided (ADR-009) but NOT
-> executed** — no deployment URL yet; free tier only.
+> up --build` runs the full web+api+db stack with healthchecks and a complete
+> `.env.example`; verified on Windows. (Migrations and seed are **not** run by
+> Compose on startup - run them manually first, as the Compose header and the
+> "Local development setup" section both instruct.) **Public
+> deployment (Vercel web + Render api + Neon db + the existing Clerk
+> *Development* instance) is decided (ADR-009, ADR-023) and fully planned in
+> `docs/deployment-plan.md`, but NOT executed** - no deployment URL yet; free
+> tier only.
 
 - **Objective:** `docker compose up` runs everything; public deployment.
-- **Deliverables:** app Dockerfiles, compose wiring (migrations + seed on
-  startup), `.env.example` complete, Vercel (web) + Render (api) + Neon (db)
-  configs or reproducible Docker fallback; deployment URL in README.
+- **Deliverables:** app Dockerfiles, compose wiring (healthchecks; migrations +
+  seed are run manually, not on startup), `.env.example` complete, Vercel (web)
+  + Render (api) + Neon (db) + the existing Clerk *Development* instance
+  configured through the provider dashboards (see `docs/deployment-plan.md`);
+  deployment URL in README.
 - **Dependencies:** Phases 0–10.
 - **Risks:** free-tier cold starts; CORS/cookie config between domains.
 - **Tests:** clean checkout → `docker compose up` → health checks pass;
