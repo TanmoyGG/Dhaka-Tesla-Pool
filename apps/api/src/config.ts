@@ -36,7 +36,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return {
     nodeEnv: env.NODE_ENV ?? "development",
     host: env.API_HOST ?? "0.0.0.0",
-    port: readPort(env.API_PORT, 3001),
+    // API_PORT is the explicit local/override knob. Platforms that inject the
+    // bound port themselves (Render sets PORT) are honoured when API_PORT is
+    // absent, so the API never binds a hardcoded port the router cannot reach.
+    port: readPort(env.API_PORT ?? env.PORT, 3001),
     webUrl: env.WEB_URL ?? "http://localhost:3000",
     databaseUrl:
       env.DATABASE_URL ??
