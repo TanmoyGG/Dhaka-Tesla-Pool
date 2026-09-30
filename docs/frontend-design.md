@@ -37,7 +37,7 @@ Grounded inventory of `apps/web` **as shipped** (commit `53abeb3`):
 | Path | Shipped |
 |---|---|
 | `/` | Landing — animated wordmark, tagline + subline, GitHub corner, sign-in/up CTAs; redirects signed-in users to their workspace |
-| `/sign-in`, `/sign-up` | Clerk-managed pages in an `(auth)` route group with a dedicated centered layout (ADR-023) |
+| `/sign-in`, `/sign-up` | Clerk-managed pages in an `(auth)` route group with a dedicated centered layout (ADR-024) |
 | `/account` | Profile page (`useMe` + Clerk `UserButton`) |
 | `/rides` | Workspace (`WorkspaceShell` + `MapPane`): booking area (1\|2\|3 seat stepper, route swap, live estimate, zone-selection map feedback) + active-trip panel |
 | `/rides/[rideId]` | Ride detail with status timeline, pool info, fare breakdown, two-step cancel, completion modal |
@@ -231,6 +231,27 @@ Purpose: pitch the product, get the user signed in, link the repo. Nothing else.
   personal or payment data. They grant nothing beyond a row in the demo
   database. This is an accepted, documented trade-off (`decisions.md` ADR-023),
   not an oversight.
+- **Sign-in-page auto-fill (shipped).** A reviewer testing the demo should not
+  have to read a password off the landing page and type it back in, so
+  `/sign-in` carries one quiet secondary button — **"Auto-fill demo
+  credentials"** — that opens a picker of the same seven canonical cast
+  identities, and **Auto-fill** types that identity into the sign-in form
+  (`components/sign-in-demo-autofill.tsx`). The picker reuses the
+  `DEMO_PASSENGERS` / `DEMO_DRIVERS` exports from the credentials modal, so
+  there is one source of truth for the cast and the passwords.
+  - **Clerk still owns the whole form.** Nothing in the component
+    authenticates, validates, or submits — it produces exactly the text a person
+    would have typed. Clerk's password field has no supported setter
+    (`initialValues` intentionally covers only email/username/phone), so values
+    are written into the real inputs through the native `value` setter plus an
+    `input` event, which is the sequence React's own `onChange` expects.
+  - **Placement.** The button must sit between Clerk's "Continue" submit button
+    and Clerk's own sign-up footer, both of which live inside Clerk's DOM, so
+    it is rendered through a portal into a small anchor inserted next to the
+    submit row once Clerk has mounted. If Clerk's markup moves, the anchor falls
+    back to just after the `<form>` — still below Continue, still above the
+    sign-up footer.
+  - Covered by `test/sign-in-demo-autofill.test.tsx`.
 
 ---
 
@@ -244,7 +265,7 @@ Purpose: pitch the product, get the user signed in, link the repo. Nothing else.
   colorInputForeground: <text>, colorPrimaryForeground: <accent-text>,
   colorDanger: <danger>, borderRadius: ... } }}` in `app/layout.tsx` — exactly
   the pattern of ADR-021 §4, with the accent swapped blue→lime.
-- **Auth pages own the whole flow (ADR-023).** `/sign-in` and `/sign-up`
+- **Auth pages own the whole flow (ADR-024).** `/sign-in` and `/sign-up`
   live in an `(auth)` route group with a centered layout and NO app navbar or
   duplicate auth controls. They render the **Clerk-hosted** `SignIn`/`SignUp`
   components using Clerk's catch-all App Router structure
@@ -484,10 +505,10 @@ lives in `WorkspaceShell`, not in either page.
 
 - **One grid, two rows, never an overlay.** The map, the grip and the panel are
   three rows of the same `.workspace` grid, so expanding the panel *shrinks the
-  map* instead of covering it, and spatial context is never lost. `.workspace-map`
-  keeps `height: 100%` down to the Leaflet container, so the existing
-  `ResizeObserver → invalidateSize()` (§8) already covers every drag — no second
-  resize path was added.
+  map* instead of covering it, and spatial context is never lost. The track's
+  own `.map-pane` child keeps `height: 100%` down to the Leaflet container, so
+  the existing `ResizeObserver → invalidateSize()` (§8) already covers every
+  drag — no second resize path was added.
 - **Snap points, not pixels.** The split is stored as the map's *share* of the
   map+panel box and converted to an `fr` ratio (`mapFr = share / (1 - share)`,
   panel pinned to `1fr`), so a stop is correct on any phone height, in either
@@ -563,7 +584,7 @@ The MVP is deliberately **not** building:
 6. **Don't overengineer.** No state machines library, no new data layer, no
    TanStack Query changes.
 7. **Incremental implementation.** Land in verified increments, each keeping
-   the existing 44 web tests green and `npm run build -w @dhaka-tesla-pool/web`
+   the existing web test suite green and `npm run build -w @dhaka-tesla-pool/web`
    clean:
    1. Token swap (blue→lime) + Clerk retheme + landing simplification +
       GitHub link. **— done (Phase 1).**

@@ -209,14 +209,14 @@ build(docker): add compose setup for api and postgres
 
 ## 13. README Requirements (minimum)
 
-> **Delivery status (docs pass):** met in `README.md` except the two items
-> still marked OPEN below. Screenshots/GIFs ✅ (18 PNGs in
-> `docs/Screenshots/`), architecture + ERD ✅, stack/structure/prerequisites ✅,
+> **Delivery status (docs pass):** met in `README.md`. Screenshots/GIFs ✅ (18
+> PNGs in `docs/Screenshots/`), architecture + ERD ✅,
+> stack/structure/prerequisites ✅,
 > env + local setup + Docker + migration/seed ✅, run/tests + demo credentials
 > ✅, API overview + decisions + known limitations + next improvements ✅,
-> **AI Usage** ✅. **OPEN:** deployment URL (no public deploy yet —
-> `docs/development-plan.md` Phase 11) and the **demo video link**
-> (Phase 12).
+> **AI Usage** ✅, **deployment URL** ✅ (public demo live on
+> Vercel/Render/Neon — `docs/development-plan.md` Phase 11), and the **demo
+> video link** ✅ (Phase 12).
 
 - Summary, problem statement, features implemented, screenshots/GIFs.
 - Architecture diagram and ERD/database diagram.
