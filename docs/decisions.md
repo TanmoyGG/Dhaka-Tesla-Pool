@@ -124,10 +124,12 @@
 
 ## ADR-009: Deployment strategy (free-tier only)
 
-> **Status: decided, not yet executed.** `docker compose up` runs the full stack
-> locally, but none of the three hosts has been deployed to. The plan and
-> platform configuration are documented in `docs/deployment-plan.md`; the
-> public demo deployment has not been performed yet.
+> **Status: decided and executed.** `docker compose up` runs the full stack
+> locally, and the public demo is live on all three free-tier hosts:
+> <https://dhaka-tesla-pool-demo.vercel.app> (web) and
+> <https://dhaka-tesla-pool-av68.onrender.com> (API, `/health` returns ok),
+> backed by Neon PostgreSQL 18. The plan and platform configuration are
+> documented in `docs/deployment-plan.md`.
 
 - **Decision:** Vercel (Next.js) → Render (Fastify API) → Neon (PostgreSQL),
   all free tiers; fallback to a reproducible Docker deployment if a free
@@ -748,8 +750,8 @@ pairwise haversine distance among the candidate's and every ACTIVE
   `rides`/`driver` routes); the full web UI in `apps/web` — this ADR launched the
   passenger UI, and the web app has since been redesigned twice (plain-CSS
   always-dark design system in §4; driver-workspace UX + Leaflet maps in the
-  `09a3824`…`53abeb3` redesign). The web suite is now **80 Vitest + RTL tests
-  across 15 files**, `next build` clean.
+  `09a3824`…`53abeb3` redesign). The web suite is now **128 Vitest + RTL tests
+  across 21 files**, `next build` clean.
 
 ### 1. One active ride per passenger — database-enforced (requirements §21.L)
 - **Decision:** partial unique index `ride_requests_one_active_per_passenger`
@@ -826,12 +828,13 @@ pairwise haversine distance among the candidate's and every ACTIVE
   forever (waste on finished trips), and a manual refresh button alone (the MVP
   driver demo needs status to move without a click).
 
-- **Web tests:** 80 Vitest + RTL tests across 15 files cover the rules helpers
+- **Web tests:** 128 Vitest + RTL tests across 21 files cover the rules helpers
   (describeApiError, isTerminal/isCancellable, formatPaisa/formatStatus,
   nextPoolAction), the two-step cancel button, active-ride gating of the
   booking area, shared-discount visibility, the availability toggle, driver
-  pool actions, the role gates, and the redesigned driver-workspace and
-  passenger-surfaces components.
+  pool actions, the role gates, the mobile panel resizer, sign-in demo
+  auto-fill, and the redesigned driver-workspace and passenger-surfaces
+  components.
 
 ## ADR-022: Unassigned wait pools + first-wins driver accept (Phase 6/8 follow-up)
 
@@ -968,7 +971,7 @@ pairwise haversine distance among the candidate's and every ACTIVE
 
 ---
 
-## ADR-023: Clerk-owned auth routing + per-user query isolation (web, follow-up)
+## ADR-024: Clerk-owned auth routing + per-user query isolation (web, follow-up)
 
 - **Decision:** The sign-in/sign-up pages live in an `(auth)` route group with
   Clerk's catch-all App Router structure (`[[...sign-in]]`/`[[...sign-up]]`),

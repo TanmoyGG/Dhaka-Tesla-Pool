@@ -11,9 +11,9 @@ first-wins, run them through a shared lifecycle, and collect cash at the end.
 
 **Status: feature-complete MVP.** Passenger flow, driver flow, pooling,
 fare model, ride lifecycle, Clerk authentication, and both web + API test
-suites are implemented and green. Public deployment (Vercel/Render/Neon) is
-**planned, not yet executed** — see [Deployment](#deployment). The final
-six-minute demo video is [pending](#demo-video).
+suites are implemented and green. The public demo is **live** on
+Vercel/Render/Neon — see [Deployment](#deployment). The demo video is
+[recorded](#demo-video).
 
 ---
 
@@ -116,12 +116,13 @@ of this README explains in detail:
 
 - Always-dark, hand-written plain-CSS design system (no UI framework pulled in
   without a documented reason).
-- REST API with 18 authenticated endpoints, Zod validation, and a typed error
-  envelope.
+- REST API with 17 authenticated endpoints under `/api` (plus a public
+  `/health` probe), Zod validation, and a typed error envelope.
 - 8-table relational schema with database-enforced invariants (capacity,
   single active ride, single accepted pool per driver/vehicle, fare formula,
   timestamps).
-- 250 tests: 170 API integration/unit tests + 80 web component tests.
+- 310 tests: 182 API integration/unit tests (10 files) + 128 web component
+  tests (21 files).
 
 ## Actors and system concepts
 
@@ -264,10 +265,13 @@ Captured from the local development build against the current implementation
 
 ## Architecture
 
-A modular monolith. The browser talks only to the Next.js frontend, which
-talks only to the Fastify API, which owns every business rule and talks to
-PostgreSQL. The frontend never touches the database. Identity is delegated to
-Clerk (external), and the map renders OpenStreetMap tiles read-only.
+A modular monolith. The browser renders the Next.js frontend, and the
+frontend's API client (running in the browser) calls the Fastify API
+**cross-origin** with an `Authorization: Bearer <Clerk token>` header, which
+the API verifies before any business logic runs. The API owns every business
+rule and is the only thing that talks to PostgreSQL — the frontend never
+touches the database. Identity is delegated to Clerk (external), and the map
+renders OpenStreetMap tiles read-only.
 
 ```mermaid
 flowchart TB
@@ -291,17 +295,17 @@ flowchart TB
     CW <-->|"session tokens"| CLS
 
     subgraph API["Backend — apps/api (Node.js, Fastify 5, TypeScript)"]
-        RT["18 REST endpoints under /api"]
+        RT["17 REST endpoints under /api"]
         AU["Auth preHandler — @clerk/backend</br>verifies the bearer token"]
         SV["Services</br>rides · pooling · driver · fare · matching · state machine"]
         ORM["Drizzle ORM (postgres.js driver)"]
     end
 
-    WEB -->|"Authorization: Bearer &lt;Clerk token&gt;"| API
+    Q -->|"cross-origin fetch<br/>Authorization: Bearer &lt;Clerk token&gt;"| API
     AU --> RT
     RT --> SV
     SV --> ORM
-    ORM --> DB[("PostgreSQL 16</br>Docker locally · Neon at deploy")]
+    ORM --> DB[("PostgreSQL<br/>16 in Docker locally · 18 on Neon at deploy")]
 
     MAP -.->|"map tiles (read-only)"| OSM["OpenStreetMap"]
 
@@ -465,12 +469,12 @@ Everything below is what the repository actually runs on (from the workspace
 | Frontend framework | **Next.js 15** (App Router), React 19, TypeScript 5.9 | Pages, route groups, layouts, `middleware.ts` route policy | Server/client hybrid, familiar App Router structure, easy Vercel target |
 | Data fetching | **TanStack Query 5** | Server-state cache, 5 s polling while a trip is active, invalidation | Declarative loading/error/empty states and per-route invalidation |
 | Forms & validation | **React Hook Form 7 + Zod 3** | Ride booking form, seat stepper, estimate gating | Typed schema on the client; the API re-validates with its own Zod schemas |
-| Styling | **Hand-written always-dark plain CSS** (`app/globals.css`, ~1,500 lines) | Entire design system: tokens, components, responsive grid, Leaflet restyle | Deliberate deviation from Tailwind/shadcn (ADR-021 §4); no dependency without a reason |
+| Styling | **Hand-written always-dark plain CSS** (`app/globals.css`, ~1,730 lines) | Entire design system: tokens, components, responsive grid, Leaflet restyle | Deliberate deviation from Tailwind/shadcn (ADR-021 §4); no dependency without a reason |
 | Map | **Leaflet 1.9 + OpenStreetMap tiles** | Zone pins, pickup/destination highlights, route fit | Free, works without a key, **visualization only** |
 | Backend framework | **Fastify 5** + TypeScript, ESM | REST API, plugin-scoped routes, Pino logging | Fast, typed, the auth/role decorators slot into its hook lifecycle |
 | API validation | **Zod** on the API | Strict request schemas; `400 VALIDATION_ERROR` with `details` | Same mental model as the frontend |
 | ORM / DB driver | **Drizzle ORM 0.45 + postgres.js** | Schema, migrations, typed queries, transactions | Lightweight, SQL-native, gives us explicit `SELECT … FOR UPDATE` control |
-| Database | **PostgreSQL 16** | The single source of truth (data + role + invariants) | Real transactions, row locks, partial unique indexes, enums, CHECKs |
+| Database | **PostgreSQL** (16 in the local Docker/CI image, 18 on deployed Neon) | The single source of truth (data + role + invariants) | Real transactions, row locks, partial unique indexes, enums, CHECKs |
 | Auth | **Clerk** (`@clerk/nextjs` web, `@clerk/backend` API) | Sign-in/sign-up/sessions/tokens; API verifies bearer tokens | External identity provider — no passwords/sessions stored in-app (ADR-013) |
 | Testing | **Vitest 4** (+ React Testing Library, jsdom) | 182 API tests (10 files), 128 web tests (21 files) | Fast, TS-native, real concurrent DB integration tests |
 | Infra | **Docker + Docker Compose**, GitHub Actions CI | Reproducible `web + api + db` stack; `postgres:16-alpine` service | PRD requires reproducibility; compose is the fallback if free hosting is unavailable |
@@ -491,7 +495,7 @@ Everything below is what the repository actually runs on (from the workspace
 │   │   │   │                        #   fare-breakdown, pool-info, status-timeline,
 │   │   │   │                        #   ride/driver completion modals, driver/*, workspace/*
 │   │   ├── lib/                     # api client, queries (hooks), types, format, rules
-│   │   ├── test/                    # 80 Vitest + RTL tests (15 files)
+│   │   ├── test/                    # 128 Vitest + RTL tests (21 files)
 │   │   └── app/globals.css          # the entire always-dark design system
 │   └── api/                         # Fastify 5 REST API
 │       ├── src/
@@ -504,20 +508,23 @@ Everything below is what the repository actually runs on (from the workspace
 │       │   ├── matching/            # pool eligibility rule
 │       │   └── db/                  # Drizzle schema, migrate, seed, check
 │       ├── drizzle/                 # migrations 0000–0007 (+ meta)
-│       ├── test/                    # 170 Vitest tests (9 files)
+│       ├── test/                    # 182 Vitest tests (10 files)
 │       └── scripts/                 # dev-only helpers (incl. Clerk-ID mapping)
 ├── docs/
 │   ├── reference/PRD.pdf            # primary source of truth (unmodified)
 │   ├── requirements.md              # PRD interpretation
 │   ├── architecture.md              # architecture (+ ADR-022 driver accept)
 │   ├── database.md                  # schema, invariants, concurrency strategy
-│   ├── decisions.md                 # ADR-style decision record
+│   ├── decisions.md                 # ADR-style decision record (ADR-001…024)
 │   ├── development-plan.md          # phased implementation plan
+│   ├── deployment-plan.md           # public demo deployment plan + as-deployed record
 │   ├── frontend-design.md           # frontend design specification
+│   ├── scaling-plan.md              # PRD "Oi Tesla Goes Viral" scaling analysis
 │   └── Screenshots/                 # UI walkthrough screenshots
 ├── .github/workflows/ci.yml         # lint → typecheck → test → build (with Postgres)
 ├── docker-compose.yml               # web + api + db, healthchecked
-└── .env.example                     # every env var a fresh setup needs
+├── .env.example                     # every env var a fresh setup needs
+└── AGENTS.md                        # persistent engineering instructions
 ```
 
 ## Prerequisites
@@ -699,8 +706,8 @@ they never need a network or keys.
 
 | Suite | Count | Files | Covers |
 |---|---|---|---|
-| API — Vitest | **170** tests | 9 | schema/database invariants, Clerk auth (fakes), fare formula pins, matching rule, state machine, pooling (incl. real concurrent last-seat + first-wins races), rides ownership, driver workflow, health |
-| Web — Vitest + RTL | **80** tests | 15 | booking form, fare estimate gating, active-ride banner, cancellation, completion modals, driver workspace, pool actions, driver history, role gating, API client, nav rules, availability toggle |
+| API — Vitest | **182** tests | 10 | schema/database invariants, Clerk auth (fakes), fare formula pins, matching rule, state machine, pooling (incl. real concurrent last-seat + first-wins races), rides ownership, driver workflow, health |
+| Web — Vitest + RTL | **128** tests | 21 | booking form, fare estimate gating, active-ride banner, cancellation, completion modals, driver workspace, pool actions, driver history, role gating, API client, nav rules, availability toggle, mobile panel resizer, sign-in demo auto-fill |
 
 The PRD's six required behaviors map to first-class tests:
 
@@ -720,9 +727,20 @@ The PRD's six required behaviors map to first-class tests:
 
 ## Demo / seed accounts
 
-The seed creates the canonical PRD cast. **No passwords are stored anywhere** —
-authentication belongs to Clerk, and the seeded `users` rows carry a reserved
-`dev-only::seed::<email>` placeholder that the API refuses to authenticate.
+The seed creates the canonical PRD cast. **No user passwords are stored in the
+application database** — authentication belongs to Clerk, and the seeded
+`users` rows carry a reserved `dev-only::seed::<email>` placeholder that the
+API refuses to authenticate.
+
+**The seven demo passwords are intentionally public.** Because this is a free,
+public testing/demo deployment rather than a commercial product, the passwords
+for the cast are hard-coded in the frontend
+(`apps/web/components/credentials-modal.tsx`) and shown on the landing page so
+a reviewer can sign in as any passenger or driver without creating an account.
+They are the only secrets in the web bundle, they authenticate **only** against
+the demo Clerk **Development** instance, and they carry no personal or payment
+data. This is a deliberate, documented trade-off (ADR-023, `docs/decisions.md`),
+not an oversight.
 
 | User | Role | Clerk account needed for | Tesla |
 |---|---|---|---|
@@ -734,7 +752,8 @@ authentication belongs to Clerk, and the seeded `users` rows carry a reserved
 | Rafiq Rahman (`rafiq@example.com`) | PASSENGER | the pooling story | — |
 | Shirin Islam (`shirin@example.com`) | PASSENGER | the last-seat concurrency case | — |
 
-**To play the cast with live Clerk identities:**
+**To play the cast on a local stack** (the public demo is already mapped — see
+[Deployment](#deployment)):
 
 1. Create the seven accounts in a Clerk **Development** instance.
 2. Map each real `user_...` id to the seeded row. A dev-only script does this
@@ -762,17 +781,21 @@ docker compose exec -T db psql -U postgres -d dhaka_tesla_pool -f - `
    the total collection; Nusrat/Rafiq each see their individual final fare.
 6. A **non-matching** route (e.g. **Bashundhara → Uttara**) stays its own pool.
 
-Reproducing this requires real Clerk Development keys. Without them the stack
-still boots and the unauthenticated shape of every screen works; sign-in/up
-and authenticated data require `CLERK_SECRET_KEY`/publishable keys.
+Running the cast locally requires real Clerk Development keys. Without them the
+stack still boots and the unauthenticated shape of every screen works;
+sign-in/up and authenticated data require `CLERK_SECRET_KEY`/publishable keys.
+**On the public demo this is already done** — the seven identities are mapped
+and the landing page fills the credentials modal for you
+(`credentials-modal.tsx` → Clerk sign-in auto-fill).
 
 ## API overview
 
 All API routes live under `/api` (except the public health probe `GET
 /health`) and require an `Authorization: Bearer <clerk-token>` header; the web
 client attaches it automatically. Errors use the envelope
-`{ "error": { "code", "message", "details?" } }`. There are **18 endpoints**;
-roles are enforced per route from the database role, never from the request.
+`{ "error": { "code", "message", "details?" } }`. There are **17 `/api`
+endpoints plus the public `/health` probe — 18 in total**; roles are enforced
+per route from the database role, never from the request.
 
 | Endpoint | Policy | Purpose |
 |---|---|---|
@@ -945,17 +968,18 @@ the database.
   `ACTIVE_RIDE_EXISTS`, `POOL_ALREADY_ACCEPTED`, `FORBIDDEN`, `NOT_FOUND`.
 - **Environment hygiene.** `CLERK_SECRET_KEY` is server-side only; only
   publishable keys reach the browser; `CLERK_AUTHORIZED_PARTIES` constrains
-  which origins may present tokens; nothing is logged.
+  which origins may present tokens. **Tokens and passwords are never logged** —
+  Pino logs request metadata and error codes, with the auth details redacted.
 
 ## Key engineering decisions
 
 Every choice is recorded with alternatives and trade-offs in
-[`docs/decisions.md`](docs/decisions.md) (ADRs 001–023). The highlights:
+[`docs/decisions.md`](docs/decisions.md) (ADRs 001–024). The highlights:
 
 | Decision | Chosen | Alternative | Why / when to revisit |
 |---|---|---|---|
 | Architecture | Modular monolith (web + API + DB) | Microservices | One team, one domain, one deployable — simpler; split deploys only if load demands |
-| Database | PostgreSQL 16 | SQLite/MySQL | Real transactions, row locks, partial unique indexes, enums, Neon free tier; revisit only for exotic scale |
+| Database | PostgreSQL (16 locally, 18 on Neon) | SQLite/MySQL | Real transactions, row locks, partial unique indexes, enums, Neon free tier; revisit only for exotic scale |
 | ORM | Drizzle + postgres.js | Prisma/Knex | SQL-native, lightweight, explicit `FOR UPDATE` control |
 | Auth | Clerk (external IdP) | Self-hosted cookies | No password/session storage, battle-tested; revisit if self-host is required |
 | UI styling | Hand-written plain CSS, always dark | Tailwind + shadcn/ui | No dependency without a reason (ADR-021 §4); revisit as the design surface grows |
@@ -989,14 +1013,26 @@ these are defects in the shipped scope, but a reviewer should know them:
 - **Public OSM tile dependency.** The map needs network access to
   `tile.openstreetmap.org`; if it fails the app degrades gracefully with a
   "Live map unavailable" fallback while the controls stay usable.
-- **Deployment not executed yet.** The target is Vercel (web) + Render (API) +
-  Neon (Postgres), all free tier — see [Deployment](#deployment).
+- **Free-tier hosting, so expect cold starts and sleeps.** Vercel (web) +
+  Render (API) + Neon (Postgres), all free tier — see
+  [Deployment](#deployment). A Render free instance spins down when idle, so
+  the first request after a pause can take ~30 s, and the database is a
+  non-pooled direct Neon connection sized for a demo, not production load.
+- **Clerk *Development* instance, deliberately.** The public demo reuses the
+  existing Clerk Development instance and its 7 demo users rather than
+  standing up a Production instance (ADR-009, ADR-023). This is the right call
+  for a free, non-commercial demo with no real users or payment data, but it
+  means the Clerk banner is expected and the credentials are public.
+- **Demo credentials ship in the web bundle.** See
+  [Demo / seed accounts](#demo--seed-accounts) — intentional for this demo,
+  and the one thing that must not be copied into a real product.
 - **No Playwright E2E yet.** Browser-level coverage is component tests;
   full E2E is parked as future work (Phase 10).
 - **Driver history is capped at 10 and shows completed (not cancelled) trips.**
   Documented MVP behavior.
-- **Local multi-user demo steps.** Playing the full cast live requires real
-  Clerk Development keys and the (documented) Clerk-ID mapping script.
+- **Local multi-user demo steps.** A fresh local cast needs the Clerk-ID
+  mapping script (see [Demo / seed accounts](#demo--seed-accounts)); the public
+  demo is already mapped.
 
 ## Future improvements
 
@@ -1073,25 +1109,41 @@ history:
 
 ## Demo video
 
-> **Demo video: Coming soon.**
+> **Demo video:** [Project walkthrough — Dhaka Tesla Pool](https://drive.google.com/drive/folders/18-DIXrRFF-UMYIzE8e6LZgrT7go6m36E?usp=sharing)
+> (public Google Drive folder, contains `Dhaka-Tesla-Pool_video.mkv`).
 
-The PRD requires a final video (max 6 minutes, e.g. Loom) covering the
-problem, architecture/ERD, engineering decisions, a product tour (passenger +
-driver + pooling + fares + status), one interesting edge case, and deployment
-if available. This README section will be updated with the link when the video
-is recorded.
+The PRD asks for a final video (max 6 minutes, e.g. Loom) covering the problem,
+architecture/ERD, engineering decisions, a product tour (passenger + driver +
+pooling + fares + status), one interesting edge case, and deployment if
+available. The recording above is the submitted walkthrough; the narrative it
+covers is reproducible from this README plus the
+[scripted demo story](#demo--seed-accounts).
 
 ## Deployment
 
-**Not deployed yet.** The sections below describe the *planned* public demo
-architecture and checklist; nothing is live. Replace `<VERCEL_URL>` and
-`<RENDER_API_URL>` with the real hosts once the cloud resources exist.
+**The public demo is live** (free tier throughout):
 
-### Planned deployment architecture (public demo, free tier)
+| Host | URL |
+|---|---|
+| Web (Vercel) | <https://dhaka-tesla-pool-demo.vercel.app> |
+| API (Render) | <https://dhaka-tesla-pool-av68.onrender.com> |
+| API health probe | <https://dhaka-tesla-pool-av68.onrender.com/health> |
+| Database | Neon PostgreSQL 18 (free tier, direct non-pooled connection) |
+
+> The web app's own API base URL is `NEXT_PUBLIC_API_URL`, pointed at the Render
+> host above; the browser calls the API cross-origin with a Clerk bearer token
+> (see [Architecture](#architecture)).
+
+### Deployment architecture (public demo, free tier)
 
 ```text
-Browser → Vercel (Next.js, *.vercel.app)  →  Render (Fastify API)  →  Neon (PostgreSQL)
-                    ↘ Clerk DEVELOPMENT instance (test keys, existing 7 demo users) ↙
+Browser ──HTML/JS──▶ Vercel (Next.js, *.vercel.app)
+   │
+   ├───HTTPS + Clerk bearer token──▶ Render (Fastify API)
+   │                                     │
+   │                                     └──▶ Neon (PostgreSQL 18)
+
+Browser ──sign-in / session──▶ Clerk DEVELOPMENT instance (test keys, 7 demo users)
 ```
 
 > **This is a public testing/demo deployment, not a commercial production
@@ -1099,15 +1151,16 @@ Browser → Vercel (Next.js, *.vercel.app)  →  Render (Fastify API)  →  Neon
 > Production instance is created, cloned, or promoted, and `pk_test_…` /
 > `sk_test_…` keys are used as-is. Clerk's Development banner is expected and
 > acceptable. The free `*.vercel.app` domain is used (no custom domain). The
-> trade-offs of this choice are recorded in [ADR-009](docs/decisions.md).
+> trade-offs of this choice are recorded in [ADR-009](docs/decisions.md) and
+> [ADR-023](docs/decisions.md).
 > The full plan is [docs/deployment-plan.md](docs/deployment-plan.md).
 
-### Deployment checklist
+### Deployment checklist (as deployed)
 
 **Frontend (Vercel):**
 - Root Directory `apps/web`, Build `npm run build`, Node 24. Do **not** set
   `output: "standalone"` (that is only for self-hosted Docker).
-- Build-time env: `NEXT_PUBLIC_API_URL` = `https://<RENDER_API_URL>`,
+- Build-time env: `NEXT_PUBLIC_API_URL` = `https://dhaka-tesla-pool-av68.onrender.com`,
   `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` (existing `pk_test_…`),
   `NEXT_PUBLIC_CLERK_SIGN_IN_URL` / `_SIGN_UP_URL` and the three
   `_FALLBACK_REDIRECT_URL` vars (all origin-relative).
@@ -1119,15 +1172,17 @@ Browser → Vercel (Next.js, *.vercel.app)  →  Render (Fastify API)  →  Neon
   `npm ci && npm run build -w @dhaka-tesla-pool/api`, Start
   `node apps/api/dist/server.js`, **Health Check Path `/health`**.
 - Set `NODE_ENV=production`, `DATABASE_URL` (Neon direct), `CLERK_SECRET_KEY`,
-  `CLERK_PUBLISHABLE_KEY`, `CLERK_AUTHORIZED_PARTIES` = `https://<VERCEL_URL>`,
-  `WEB_URL` = `https://<VERCEL_URL>`, `API_HOST=0.0.0.0`.
+  `CLERK_PUBLISHABLE_KEY`, `CLERK_AUTHORIZED_PARTIES` =
+  `https://dhaka-tesla-pool-demo.vercel.app`,
+  `WEB_URL` = `https://dhaka-tesla-pool-demo.vercel.app`, `API_HOST=0.0.0.0`.
 - **Do not set `API_PORT`.** Render injects `PORT` and the API honours it when
   `API_PORT` is absent (`apps/api/src/config.ts`).
 - Do **not** add `npm test` to the build command: the test helper drops/creates
   a `_test` database.
 
 **Database (Neon):**
-- Free PostgreSQL **16** project, **direct** (non-`-pooler`) connection string.
+- Free PostgreSQL **18** project (the local Docker/CI image stays on
+  `postgres:16-alpine`), **direct** (non-`-pooler`) connection string.
 - Run migrations and seed, then map the **existing Clerk Development** user IDs
   into the seeded rows with `apps/api/scripts/map-cast-clerk-ids.sql` (roles and
   vehicle ownership are preserved; only `clerk_user_id` is updated). Do this
@@ -1135,20 +1190,30 @@ Browser → Vercel (Next.js, *.vercel.app)  →  Render (Fastify API)  →  Neon
 - `db:migrate` / `db:seed` do not load `.env`; export `DATABASE_URL` in the shell.
 
 **Clerk (existing Development instance):**
-- Add `https://<VERCEL_URL>` to the instance's **allowed origins** (keep
-  `http://localhost:3000` for local dev). No redirect-URL entries are needed —
+- `https://dhaka-tesla-pool-demo.vercel.app` is in the instance's **allowed
+  origins** (with `http://localhost:3000` kept for local dev). No redirect-URL
+  entries are needed —
   `/sign-in` and `/sign-up` are same-origin relative paths.
 - Public sign-up is enabled; **Sign-up with username** and **Require username**
   are enabled (the API provisions `users.name` from the Clerk username). New
   public users become **PASSENGER**. **Driver registration is intentionally
   unavailable** — driver testing uses the 4 demo driver accounts.
 
-**Verification:**
-- `GET <RENDER_API_URL>/health` returns ok; `GET <RENDER_API_URL>/` 404s.
-- `GET <RENDER_API_URL>/api/zones` returns the 8 zones (real DB round-trip);
-  `/api/me` without a token returns 401.
-- Sign-in/sign-up round-trip works from the deployed web origin; no CORS errors.
-- One end-to-end passenger + driver story plays against the deployed stack.
+**Verification performed against the live deployment (HTTP level):**
+- `GET https://dhaka-tesla-pool-av68.onrender.com/health` returns ok;
+  `GET https://dhaka-tesla-pool-av68.onrender.com/` 404s.
+- **Every `/api` route requires a Clerk bearer token**, so
+  `GET /api/zones` and `GET /api/me` without a token both return **401** — the
+  8 zones are only readable with a signed-in session, by design.
+- The deployed web app loads and serves the app shell; it is built with
+  `NEXT_PUBLIC_API_URL` pointed at the Render host above.
+
+> Browser-level checks — the Clerk sign-in round-trip and a full passenger +
+> driver story — are scripted in
+> [docs/deployment-plan.md §17–§18](docs/deployment-plan.md). They are not
+> covered by automated tests in this repository (Playwright is still parked;
+> see [Known limitations](#known-limitations)), so run them from a browser
+> after any change.
 
 ## PRD traceability
 
@@ -1169,8 +1234,8 @@ interpretation):
 | Testing | ✅ complete | 182 API + 128 web tests; six required behaviors covered |
 | README | ✅ complete | this file |
 | AI usage | ✅ complete | [AI usage](#ai-usage) |
-| Six-minute video | ⏳ pending | [Demo video](#demo-video) |
-| Deployment | ⏳ planned (public demo, Clerk Development) | [Deployment](#deployment) + [docs/deployment-plan.md](docs/deployment-plan.md) |
+| Demo video | ✅ recorded | [Demo video](#demo-video) (public Drive folder) |
+| Deployment | ✅ live (public demo, Clerk Development) | [Deployment](#deployment) + [docs/deployment-plan.md](docs/deployment-plan.md) |
 | Concurrency explanation | ✅ complete | [Pooling and concurrency](#pooling-and-concurrency) |
 | Engineering decisions | ✅ complete | [Key engineering decisions](#key-engineering-decisions) + ADRs |
 | Known limitations | ✅ complete | [Known limitations](#known-limitations) |
@@ -1185,6 +1250,7 @@ interpretation):
 - Phased development plan: [`docs/development-plan.md`](docs/development-plan.md)
 - Future scaling plan (PRD bonus "If Oi Tesla Goes Viral"): [`docs/scaling-plan.md`](docs/scaling-plan.md)
 - Frontend design specification: [`docs/frontend-design.md`](docs/frontend-design.md)
+- Public deployment plan + as-deployed record: [`docs/deployment-plan.md`](docs/deployment-plan.md)
 - Screenshots: [`docs/Screenshots/`](docs/Screenshots)
 
 ## License

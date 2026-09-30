@@ -5,9 +5,20 @@
 >
 > **Target:** Vercel (web) → Render (API) → Neon (PostgreSQL) + **Clerk
 > Development instance**.
-> **Status: PLANNED — NOT DEPLOYED YET.** No deployment URL exists. Every URL
-> below is a placeholder (`<VERCEL_URL>`, `<RENDER_API_URL>`) to be replaced
-> once the cloud resources exist.
+> **Status: DEPLOYED.** The public demo is live on the free tier:
+>
+> | Host | URL |
+> |---|---|
+> | Web (Vercel) | `https://dhaka-tesla-pool-demo.vercel.app` |
+> | API (Render) | `https://dhaka-tesla-pool-av68.onrender.com` |
+> | Health probe | `https://dhaka-tesla-pool-av68.onrender.com/health` |
+> | Database | Neon PostgreSQL **18**, direct (non-pooled) |
+>
+> `<VERCEL_URL>` / `<RENDER_API_URL>` below are retained as **template
+> placeholders** in the reproducible setup, configuration, and deployment
+> sections (§6–§7, §9–§10, §13, §16). They are intentional, not unresolved
+> gaps. The live values are in the table above and are used verbatim in the
+> as-deployed verification steps (§17–§18).
 > **Costs: free tier only** — never pay (AGENTS.md).
 >
 > ### This is a public testing/demo deployment, not a commercial production launch
@@ -70,17 +81,18 @@ pooling, fares, ride lifecycle, and the build pipeline all need **no change**.
 
 ```mermaid
 flowchart LR
-  U["Browser (passenger / driver)"] -->|"HTTPS"| V["Vercel — Next.js 15<br/>apps/web · *.vercel.app"]
-  V -->|"HTTPS + Authorization: Bearer &lt;Clerk token&gt;"| R["Render — Fastify 5<br/>apps/api (Node) · &lt;RENDER_API_URL&gt;"]
-  V -->|"Clerk UI / session"| C["Clerk DEVELOPMENT instance<br/>pk_test_… / sk_test_…"]
-  R -->|"postgresql:// (TLS, direct)<br/>max:1 connections"| N["Neon PostgreSQL 16<br/>free tier"]
+  U["Browser (passenger / driver)"] -->|"HTML / JS"| V["Vercel — Next.js 15<br/>apps/web · *.vercel.app"]
+  U -->|"HTTPS + Authorization: Bearer &lt;Clerk token&gt;"| R["Render — Fastify 5<br/>apps/api (Node) · dhaka-tesla-pool-av68.onrender.com"]
+  U -->|"Clerk UI / session"| C["Clerk DEVELOPMENT instance<br/>pk_test_… / sk_test_…"]
+  R -->|"postgresql:// (TLS, direct)<br/>max:1 connections"| N["Neon PostgreSQL 18<br/>free tier"]
   R -->|"token verification"| C
   R -->|"GET /health"| M["Render health check"]
 ```
 
-Data flow is browser-originated: the browser holds the Clerk session token and
-calls the Render API directly. **Vercel never talks to the database, and the
-browser never talks to Neon.**
+Data flow is browser-originated: the browser loads the app from Vercel, holds
+the Clerk session token, and calls the Render API **directly, cross-origin** —
+Vercel does not proxy API traffic. **Vercel never talks to the database, and
+the browser never talks to Neon.**
 
 ---
 
@@ -115,9 +127,11 @@ ADR-020 lock order (vehicle → rides → pool).
 **Migrations 0000–0007.** `gen_random_uuid()` (core since PG13),
 `ALTER TYPE ... ADD VALUE` (0001; transaction-safe on PG12+),
 `DROP TABLE "sessions" CASCADE` (0001), and in 0007 `DROP INDEX` + partial
-unique indexes + `CHECK` constraints. All standard PostgreSQL 16 features —
-**Neon-compatible**, no extensions required. Drizzle records applied files in
-`drizzle.__drizzle_migrations`, so the sequence runs once and re-runs are no-ops.
+unique indexes + `CHECK` constraints. All standard PostgreSQL features (the
+migrations are also exercised on `postgres:16-alpine` in Docker/CI) —
+**Neon-compatible on the deployed PG 18**, no extensions required. Drizzle
+records applied files in `drizzle.__drizzle_migrations`, so the sequence runs
+once and re-runs are no-ops.
 
 **Seed and identity mapping.** `db/seed.ts` is non-destructive
 (`ON CONFLICT DO NOTHING`): 7 users (Jashim, Nusrat, Rafiq, Shirin, Karim,
@@ -315,7 +329,7 @@ override the platform port and reintroduce the bug the fix removed.
 | Setting | Value |
 |---|---|
 | Plan | Free |
-| PostgreSQL version | **16** (matches `postgres:16-alpine` and CI) |
+| PostgreSQL version | **18** on the deployed Neon project (local Docker/CI stays on `postgres:16-alpine`) |
 | Region | Singapore (or India) — nearest to Dhaka and to the Render/Vercel regions |
 | Connection type | **Direct (non-pooled)** — host `ep-….neon.tech/dbname`, **not** `ep-…-pooler.…` |
 | URL shape | `postgresql://USER:PASSWORD@HOST/DB?sslmode=require` |
@@ -539,7 +553,7 @@ before publishing.
 
 1. **Land the port fix.** Merge the `fix(api)` commit to `master`; local
    `lint && typecheck && test && build` are green.
-2. **Create the Neon project** — Free, PostgreSQL 16, Singapore. Copy the
+2. **Create the Neon project** — Free, PostgreSQL 18, Singapore. Copy the
    **direct** connection string. Take a branch/snapshot.
 3. **Run migrations and seed** against Neon (§11), then **map the existing Clerk
    Development IDs** (§12). Verify `unmapped = 0`. Do this **before** anyone
@@ -571,14 +585,22 @@ correct `NEXT_PUBLIC_API_URL`.
 
 ## 17. Smoke tests
 
-**API-only (after the Render deploy, before the frontend):**
+**API-only (after the Render deploy, before the frontend)** — run against the
+live hosts from the status table at the top of this document:
 
-1. `curl -i https://<RENDER_API_URL>/health` → `200` with `{"status":"ok"}`.
-2. `curl -i https://<RENDER_API_URL>/` → `404` (confirms no root route).
-3. `curl -i https://<RENDER_API_URL>/api/zones` → `200` with the 8 Dhaka zones —
-   proves a real database round-trip. *If this 500s the database is unreachable;
-   `/health` alone will not catch it, because postgres.js connects lazily.*
-4. `curl -i https://<RENDER_API_URL>/api/me` → `401 AUTH_UNAUTHENTICATED`.
+```bash
+API=https://dhaka-tesla-pool-av68.onrender.com
+```
+
+1. `curl -i $API/health` → `200` with `{"status":"ok","service":"dhaka-tesla-pool-api",…}`.
+2. `curl -i $API/` → `404` (confirms no root route).
+3. `curl -i $API/api/zones` → **`401 AUTH_UNAUTHENTICATED`**. *Every* `/api`
+   route sits behind the Clerk `preHandler`, so an unauthenticated 401 is the
+   **correct** result and proves the guard is installed. To prove the database
+   round-trip instead, call it with a signed-in bearer token and expect the 8
+   Dhaka zones. *A 500 here means the database is unreachable; `/health` alone
+   will not catch it, because postgres.js connects lazily.*
+4. `curl -i $API/api/me` → `401 AUTH_UNAUTHENTICATED`.
 
 **Identity binding (the decisive test):** after signing in as Nusrat, copy the
 bearer token from DevTools and call `/api/me`. Expect `"name":"Nusrat Haque"`,
@@ -590,7 +612,8 @@ applied before first sign-in.
 
 ## 18. Production QA
 
-1. Load `https://<VERCEL_URL>`; sign in as **Nusrat** → lands on `/rides`.
+1. Load `https://dhaka-tesla-pool-demo.vercel.app`; sign in as **Nusrat** →
+   lands on `/rides`.
 2. DevTools → Network: `onrender.com` calls return 200 with
    `Authorization: Bearer …`, **no CORS errors**.
 3. Clerk keys are the **test** keys; the Development banner is visible and
@@ -653,7 +676,7 @@ applied before first sign-in.
 - CORS wildcard / credentials — it would weaken the authorized-parties design
 - `apps/web/next.config.mjs` — no `standalone` output needed on Vercel
 - `apps/api/package.json` start script — it matches the Dockerfile
-- `apps/web/components/map-pane.tsx` — OpenStreetMap + attribution is correct
+- `apps/web/components/workspace/map-pane.tsx` — OpenStreetMap + attribution is correct
 
 **Intentionally NOT added:** `render.yaml`, `vercel.json`, a custom domain, a
 Clerk Production instance, any paid service, or any new authentication provider.

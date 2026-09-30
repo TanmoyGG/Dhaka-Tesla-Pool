@@ -96,7 +96,7 @@ flowchart LR
 - Phase 3 (complete): Clerk authentication UI — `ClerkProvider` in the root
   layout, `/sign-in` and `/sign-up` pages, a protected `/account` profile page,
   and `middleware.ts` route policy. The auth screens now live in an `(auth)`
-  route group with Clerk catch-all routing (ADR-023).
+  route group with Clerk catch-all routing (ADR-024).
 - Passenger + driver flows (complete): request ride, live status tracking,
   pooled-fare display, ride history (`/rides/history`), driver accept/
   arrive/start/complete, driver earnings, and driver history (`/driver/history`).
@@ -319,8 +319,10 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-013,
 As of this phase the following were still upcoming (all since shipped — see
 §11–§13 + the Implementation Status addendum below): ride/booking UI (web),
 driver flow (`DRIVER_ARRIVED → STARTED → COMPLETED`), drivers, map
-visualization. **Public deployment to Vercel/Render/Neon remains open** — free
-tier, not yet executed (see §7). Pool matching, the ride state machine, and
+visualization. **Public deployment to Vercel/Render/Neon is also live** — free
+tier, at <https://dhaka-tesla-pool-demo.vercel.app> and
+<https://dhaka-tesla-pool-av68.onrender.com> (see §7 and
+`docs/deployment-plan.md`). Pool matching, the ride state machine, and
 pooled-fare recompute are implemented in Phase 5 (§12).
 
 ## 11. Implementation Status (Phase 4 — ride requests & fare estimation)
@@ -389,8 +391,8 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-016/017/018,
   subquery — history of exactly the Phase 4 shape stays intact. Since ADR-022
   the `vehicle`/`driver` fields are NULL while the pool is unassigned (waiting
   for a driver to claim it).
-- **Validation/tests**: the API suite is current at **170 `it/test` blocks across
-  9 files** (this phase snapshot was 122/122 across 8), root lint + typecheck +
+- **Validation/tests**: the API suite is current at **182 `it/test` blocks across
+  10 files** (this phase snapshot was 122/122 across 8), root lint + typecheck +
   build (API + Next.js web) green; migration 0004 applied to the Docker dev DB;
   `db:generate` reports no drift; `docker compose config` valid. Concurrency is
   proven with two independent PostgreSQL connections, including the canonical
@@ -405,7 +407,7 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-016/017/018,
 
 Implemented and verified (see [docs/decisions.md](decisions.md) ADR-019/020/022,
 [docs/database.md](database.md) §3.6/§7/§10, [docs/requirements.md](requirements.md)
-§21.B/E/J/M, [`apps/api/test/driver.test.ts`](../../apps/api/test/driver.test.ts)):
+§21.B/E/J/M, [`apps/api/test/driver.test.ts`](../apps/api/test/driver.test.ts)):
 
 - **Availability switch** (`POST /api/driver/availability {isOnline}` → 204):
   per-driver, flips all of the driver's Teslas; going offline while any pool the
@@ -462,10 +464,10 @@ Implemented and verified (see [docs/decisions.md](decisions.md) ADR-019/020/022,
   `pools_driver_implies_accepted`, partial uniques
   `pools_single_accepted_per_driver` / `pools_single_accepted_per_vehicle`;
   `pools_single_active_per_vehicle` dropped).
-- **Validation/tests**: the API suite is current at **170 `it/test` blocks across
-  9 files** against the Docker PostgreSQL `_test` database, root lint +
+- **Validation/tests**: the API suite is current at **182 `it/test` blocks across
+  10 files** against the Docker PostgreSQL `_test` database, root lint +
   typecheck + build (API + web) green; migration 0007 applied; `db:generate`
-  reports no drift; the web suite is current at **80 tests across 15 files**
+  reports no drift; the web suite is current at **128 tests across 21 files**
   (this phase snapshot was 36→39 with the lobby flow).
 - Routing additions: `POST /api/driver/availability`, `GET /api/driver/pools`,
   `GET /api/driver/pools/available`, `GET /api/driver/pools/:poolId`, and the
@@ -494,7 +496,7 @@ Backend + web work shipped after the Phase 6 driver-flow snapshot (see
   ride-completion modals showing each passenger's own fare (`lib/completed-ack.ts`).
 - Lobby and rider surfaces poll status every 5 s only while a trip is
   non-terminal (ADR-021 §6); role-unresolved sessions render only Account + Sign
-  out (query isolation is `userId`-scoped, ADR-023).
-- **Testing:** the web suite is 80 tests across 15 files (Vitest + RTL),
-  `next build` clean; the API suite is 170 tests across 9 files.
+  out (query isolation is `userId`-scoped, ADR-024).
+- **Testing:** the web suite is 128 tests across 21 files (Vitest + RTL),
+  `next build` clean; the API suite is 182 tests across 10 files.
   Playwright E2E (Phase 10) has not been introduced.

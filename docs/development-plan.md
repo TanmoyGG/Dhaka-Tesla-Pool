@@ -3,11 +3,12 @@
 > Incremental implementation phases for the MVP. This is a *plan* updated as
 > work landed: phases are implemented step-by-step on feature branches, never
 > all at once. **Phases 0–9 are complete**; Phase 10 (Playwright + test
-> amplification) and Phase 11 (public deployment) are open; Phase 12
+> amplification) is open; Phase 11 (public deployment) is **complete** (live on
+> Vercel/Render/Neon); Phase 12
 > (documentation/video) is nearly complete: the README (incl. 18 screenshots in
-> `docs/Screenshots/`) and AI Usage section are done, and the viral-scale bonus
-> note is delivered as [`docs/scaling-plan.md`](scaling-plan.md); only the
-> **video** is still outstanding.
+> `docs/Screenshots/`) and AI Usage section are done, the viral-scale bonus
+> note is delivered as [`docs/scaling-plan.md`](scaling-plan.md), and the demo
+> **video** is recorded and linked from the README.
 > Tests and deliverables per phase are noted so a later engineer can verify
 > each stage without guessing.
 
@@ -190,8 +191,8 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
   illegal-state cancel (409).
 - **Tests:** `test/matching.test.ts`, `test/state.test.ts`, `test/pooling.test.ts`
   (new) + `test/rides.test.ts`/`test/fare.test.ts` updates — this phase's
-  snapshot was the full suite at **122 passing** (the suite is now **170 tests
-  across 9 files**), including two true concurrency races on two independent
+  snapshot was the full suite at **122 passing** (the suite is now **182 tests
+  across 10 files**), including two true concurrency races on two independent
   database connections.
 
 ## Phase 6 — Driver flow
@@ -199,7 +200,7 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 > **Status: COMPLETE + PV2 review changes absorbed** (branch
 > `feature/driver-workflow` merged; this phase's validation snapshot 152/152.
 > **ADR-022 rework** on `feature/driver-accept-selection` — its snapshot
-> **173/173**; the API suite is now **170 tests across 9 files**). Drivers get
+> **173/173**; the API suite is now **182 tests across 10 files**). Drivers get
 > an online/offline switch and hands-on control of the pool they **claim
 > first-wins from a lobby**: **accept → arrive → start → complete**, plus a
 > hub (their pools, members, seats, zones, and — since commit `74e1d8f`,
@@ -251,7 +252,7 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
   HTTP; true concurrency races (cross-driver accept → exactly one winner; double
   arrive → one winner; double complete → one winner + Tesla freed;
   offline-vs-booking decoupled — both succeed) on two independent connections —
-  this phase's snapshot: full suite **173 passing** (now **170 across 9
+  this phase's snapshot: full suite **173 passing** (now **182 across 10
   files**).
 
 ## Phase 7 — Fare calculation
@@ -330,12 +331,12 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 > State pages poll at 5 s and **stop at terminal status** (ADR-021 §6). The
 > driver hub adds a **"Waiting requests" lobby** (`useAvailablePools()`, ADR-022)
 > with an inline first-wins Accept button; passenger surfaces render
-> "Waiting for a driver…" while a pool is unassigned. **80** Vitest + RTL tests
-> across 15 files; `next build` clean. The Zebra-style **Leaflet + OSM map
+> "Waiting for a driver…" while a pool is unassigned. **128** Vitest + RTL tests
+> across 21 files; `next build` clean. The Zebra-style **Leaflet + OSM map
 > shipped** in the redesign (ADR-007 realized) — `MapPane` in the
 > `WorkspaceShell` on `/rides` and `/driver`. Playwright E2E is still parked in
 > Phase 10 — the six required
-> behaviors are covered by the API suite (170 tests) plus the web unit tests.
+> behaviors are covered by the API suite (182 tests) plus the web unit tests.
 
 - **Objective:** Passenger + driver flows with proper loading/error/empty states.
 - **Deliverables:** auth screens, ride request + fare display, status tracking,
@@ -344,7 +345,8 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 - **Dependencies:** Phases 3–6 (API surfaces exist).
 - **Risks:** state/caching consistency between TanStack Query and API;
   owner-isolation leaks in the UI.
-- **Tests:** (done) web unit/integration suite (80 tests). Playwright E2E —
+- **Tests:** (done) web unit/integration suite (80 tests at the time; the web suite is now **128
+  tests across 21 files**). Playwright E2E —
   passenger books, driver accepts,
   passenger completion; wrong-account isolation (test #4 — covered at the API
   layer by `rides.test.ts` cross-user 404); loading/error/empty
@@ -352,8 +354,8 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 
 ## Phase 10 — Testing amplification
 
-> **Status: PARTIAL.** The API suite (**170 tests across 9 files**) and the web
-> unit/integration suite (**80 tests across 15 files**) are green in CI; all six
+> **Status: PARTIAL.** The API suite (**182 tests across 10 files**) and the web
+> unit/integration suite (**128 tests across 21 files**) are green in CI; all six
 > required behaviors (requirements §14) are first-class tests. **Playwright E2E
 > has not been introduced** (no config, no dependency) — the remaining scope of
 > this phase.
@@ -368,15 +370,17 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 
 ## Phase 11 — Docker / deployment
 
-> **Status: PARTIAL.** Docker/Compose is **done and shipped** — `docker compose
+> **Status: COMPLETE.** Docker/Compose is **done and shipped** — `docker compose
 > up --build` runs the full web+api+db stack with healthchecks and a complete
 > `.env.example`; verified on Windows. (Migrations and seed are **not** run by
 > Compose on startup - run them manually first, as the Compose header and the
 > "Local development setup" section both instruct.) **Public
 > deployment (Vercel web + Render api + Neon db + the existing Clerk
-> *Development* instance) is decided (ADR-009, ADR-023) and fully planned in
-> `docs/deployment-plan.md`, but NOT executed** - no deployment URL yet; free
-> tier only.
+> *Development* instance) is decided (ADR-009, ADR-023), fully planned in
+> `docs/deployment-plan.md`, and executed** - live on the free tier at
+> <https://dhaka-tesla-pool-demo.vercel.app> (web) and
+> <https://dhaka-tesla-pool-av68.onrender.com> (api, `/health` returns ok),
+> with Neon PostgreSQL 18 behind it.
 
 - **Objective:** `docker compose up` runs everything; public deployment.
 - **Deliverables:** app Dockerfiles, compose wiring (healthchecks; migrations +
@@ -387,17 +391,20 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 - **Dependencies:** Phases 0–10.
 - **Risks:** free-tier cold starts; CORS/cookie config between domains.
 - **Tests:** clean checkout → `docker compose up` → health checks pass;
-  deployed health + demo credentials work. (Local half verified; deployed half
-  pending.)
+  deployed health + demo credentials work. **Both halves verified** — local
+  `docker compose`, and the live deployment at the HTTP level (`/health` ok,
+  `/api` auth gate returning 401). Browser-level sign-in and the full
+  passenger/driver story remain manual checks, scripted in
+  `docs/deployment-plan.md` §17–§18.
 
 ## Phase 12 — Documentation / video preparation
 
-> **Status: PARTIAL.** The root README is now the full PRD checklist (summary,
+> **Status: COMPLETE.** The root README is now the full PRD checklist (summary,
 > features, screenshots, architecture + ERD, stack, structure, env, setup,
 > run/tests, credentials, API overview, decisions/trade-offs, limitations, next
-> steps) with an AI Usage section and a screenshots section. **Outstanding:**
-> the six-minute video (and its link) and a deployment URL (Phase 11). The
-> written "viral-scale" bonus note (requirements §15) is delivered as
+> steps) with an AI Usage section and a screenshots section, plus the live
+> deployment URLs (Phase 11) and the demo video link. The written
+> "viral-scale" bonus note (requirements §15) is delivered as
 > [`docs/scaling-plan.md`](scaling-plan.md). The docs-consistency pass
 > re-grounded all `docs/*.md` against the shipped code.
 

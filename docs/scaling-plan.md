@@ -774,8 +774,8 @@ Key properties of that topology:
 ### 8.1 The current state
 
 - Frontend: `https://dhaka-tesla-pool-demo.vercel.app` (free Vercel domain).
-- API: `https://<render-host>.onrender.com`, reached directly by the browser with
-  a Clerk bearer token.
+- API: `https://dhaka-tesla-pool-av68.onrender.com`, reached directly by the
+  browser with a Clerk bearer token.
 - **No custom domain, no dedicated CDN in front of the API, no WAF.** Vercel
   already provides a CDN for the frontend's static assets; that is the extent of
   current edge capability.
@@ -783,7 +783,7 @@ Key properties of that topology:
 ### 8.2 The production evolution
 
 ```text
-today:    dhaka-tesla-pool-demo.vercel.app      +  <api-host>.onrender.com
+today:    dhaka-tesla-pool-demo.vercel.app  +  dhaka-tesla-pool-av68.onrender.com
 
 later:    app.<custom-domain>   →  CDN-cached web app + static assets
           api.<custom-domain>   →  WAF/TLS/DDoS → load balancer → API instances
@@ -815,7 +815,7 @@ This is the most commonly confused point, so it is worth stating precisely:
 | JS/CSS/fonts/images, the Next.js build output | **Yes** — immutable, content-hashed | Nothing user-specific |
 | The HTML shell | Mostly | Cache with care; Clerk/Next can emit per-request content |
 | `GET /api/zones` | **Yes, briefly** | Identical for everyone; a textbook cache candidate (§12) |
-| `GET /api/me` | **No** | Per-user; caching it risks leaking one user's role/name to another — the exact bug ADR-023 fixed in the client cache |
+| `GET /api/me` | **No** | Per-user; caching it risks leaking one user's role/name to another — the exact bug ADR-024 fixed in the client cache |
 | Ride/pool detail, availability, estimates | **No** | Per-user and highly time-sensitive |
 | `POST /api/rides`, accept, cancel, arrive… | **No** | Non-idempotent mutations |
 
