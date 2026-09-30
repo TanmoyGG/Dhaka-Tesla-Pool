@@ -32,13 +32,16 @@ export interface DemoAccount {
   password: string;
 }
 
-const PASSENGERS: DemoAccount[] = [
+// Exported so the sign-in page's "Auto-fill demo credentials" picker is fed by
+// these exact same identities and passwords — there must be only ONE demo
+// credential list in the codebase, or the two surfaces can silently drift.
+export const DEMO_PASSENGERS: DemoAccount[] = [
   { name: "Nusrat", email: "nusrat@example.com", password: "Nusrat@teslapool" },
   { name: "Rafiq", email: "rafiq@example.com", password: "Rafiq@teslapool" },
   { name: "Shirin", email: "shirin@example.com", password: "Shirin@teslapool" },
 ];
 
-const DRIVERS: DemoAccount[] = [
+export const DEMO_DRIVERS: DemoAccount[] = [
   { name: "Jashim", email: "jashim@example.com", password: "Jashim@teslapool" },
   { name: "Karim", email: "karim@example.com", password: "Karim@teslapool" },
   { name: "Rahim", email: "rahim@example.com", password: "Rahim@teslapool" },
@@ -131,7 +134,7 @@ export function CredentialsModal({
 
         <CredentialGroup
           title="Passengers"
-          accounts={PASSENGERS}
+          accounts={DEMO_PASSENGERS}
           revealed={revealed}
           copied={copied}
           onToggleReveal={toggleReveal}
@@ -139,7 +142,7 @@ export function CredentialsModal({
         />
         <CredentialGroup
           title="Drivers"
-          accounts={DRIVERS}
+          accounts={DEMO_DRIVERS}
           revealed={revealed}
           copied={copied}
           onToggleReveal={toggleReveal}

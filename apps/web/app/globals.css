@@ -610,6 +610,29 @@ p {
   font-size: 0.82rem;
 }
 
+/* ----- Sign-in demo auto-fill (sign-in-demo-autofill.tsx) ----- */
+
+/* Anchor node placed between Clerk's "Continue" button and its "…Sign up"
+   footer. A plain block so the full-width button lines up with the form. */
+.signin-demo-autofill {
+  margin-top: 0.5rem;
+}
+
+/* One picker row: the identity on the left, its Auto-fill action on the right.
+   Mirrors .credentials-field-row's alignment but has no value/mono column,
+   because the picker never shows an email or a password. */
+.credentials-fill-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.credentials-fill-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .credentials-modal-overlay,
   .credentials-modal-card {
