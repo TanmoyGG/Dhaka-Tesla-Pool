@@ -644,21 +644,46 @@ p {
 
 /* The workspace replaces the centered .container inside the signed-in app:
    a full-height grid under the exact header height, never a page that scrolls
-   with its own background scrollbar. Mobile stacks map on top (prominent,
-   ~40vh) over a panel that scrolls internally; desktop puts the panel on the
-   left and gives the map the majority width. */
+   with its own background scrollbar. Mobile stacks map on top over a panel that
+   scrolls internally; desktop puts the panel on the left and gives the map the
+   majority width.
+
+   MOBILE SPLIT RESIZER: the map and panel are two rows of ONE grid with a grip
+   row between them, so the panel is never an overlay — the map is never hidden
+   underneath it, and the map simply gets shorter as the panel grows. The two
+   flexible tracks are sized by the --workspace-*-rows custom properties that
+   `WorkspaceShell` writes from the current snap point, so a stop is an fr ratio
+   rather than a hardcoded pixel height. `minmax(0, …)` on the panel track keeps
+   its internal scroll working when the content is taller than the track; the
+   7.5rem floor on the map track is a last-resort guard so the map can never
+   vanish, even on a very short screen (CSS clamps a max below the min). */
 .workspace {
   display: grid;
   grid-template-columns: 1fr;
-  grid-template-rows: minmax(15rem, 42vh) minmax(0, 1fr);
+  grid-template-rows:
+    minmax(7.5rem, var(--workspace-map-rows, 1fr))
+    auto
+    minmax(0, var(--workspace-panel-rows, 1fr));
   grid-template-areas:
     "map"
+    "grip"
     "panel";
-  gap: 1rem;
+  gap: 0.25rem;
   height: calc(100vh - var(--app-header-height));
   height: calc(100dvh - var(--app-header-height));
   min-height: 0;
   padding: 1rem clamp(1rem, 3vw, 1.5rem) 1.5rem;
+}
+
+/* Snapping animates; free dragging must not, or the divider lags the finger. */
+@media (prefers-reduced-motion: no-preference) {
+  .workspace {
+    transition: grid-template-rows 170ms ease;
+  }
+}
+
+.workspace--resizing {
+  transition: none;
 }
 
 .workspace-panel {
@@ -677,11 +702,64 @@ p {
   min-height: 0;
 }
 
+/* The drag handle between map and panel. Deliberately a real sibling row rather
+   than an overlay: a gesture that starts inside the panel or on the map can
+   never be mistaken for a divider drag, and the panel's own scrolling is left
+   completely untouched. `touch-action: none` claims the vertical gesture so a
+   drag here scrolls the divider instead of the page. */
+.workspace-grip {
+  grid-area: grip;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 1.75rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: row-resize;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* The visible affordance: a short pill in the existing border/accent tokens, so
+   it reads as part of the design system rather than a new control. */
+.workspace-grip::before {
+  content: "";
+  width: 2.75rem;
+  height: 0.25rem;
+  border-radius: 999px;
+  background: var(--border-strong);
+  transition:
+    background-color 140ms ease,
+    width 140ms ease;
+}
+
+.workspace-grip:hover::before {
+  width: 3.25rem;
+  background: var(--accent);
+}
+
+/* Keyboard/AT users get the same affordance as hover, on top of the global
+   :focus-visible outline — the grip must never be an invisible-only target. */
+.workspace-grip:focus-visible::before {
+  width: 3.25rem;
+  background: var(--accent);
+}
+
 @media (min-width: 56rem) {
   .workspace {
     grid-template-columns: minmax(20rem, 26rem) 1fr;
     grid-template-rows: 1fr;
     grid-template-areas: "panel map";
+    gap: 1rem;
+  }
+
+  /* Desktop keeps its two-column layout untouched: the grip has no role here,
+     so it is removed from the grid entirely and takes no track space. */
+  .workspace-grip {
+    display: none;
   }
 }
 

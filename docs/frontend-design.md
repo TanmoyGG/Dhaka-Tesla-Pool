@@ -157,8 +157,9 @@ while keeping the neutral near-black scale. Shipped `globals.css` tokens:
 Standardize on the existing pieces: `.card`, `.btn` (primary/secondary/ghost),
 `.notice`, `.ridelist`, `.dl`, `StatusBadge`, `StatusTimeline`. New primitives
 added only where required: hamburger drawer, completion modal, map layer, the
-live-ride panel. *(The bottom sheet was scoped here but never built — the
-mobile layout is map-top + scrolling panel, §2.4.)* Add motion via a single
+live-ride panel. *(A floating bottom sheet was scoped here but never built — the
+panel is always a sibling grid row, not an overlay; what the mobile workspace
+does have is a draggable map/panel split, §8.)* Add motion via a single
 reusable `FadeIn` wrapper rather than ad-hoc CSS.
 
 ---
@@ -468,13 +469,47 @@ grid switch. The initial view center ≈ 23.79, 90.40, zoom ≈ 12 and tiles fro
 OpenStreetMap. The workspace grid (`WorkspaceShell`) anchors to the exact
 signed-in header height via `--app-header-height` +
 `.site-header:has(.menu-button)` (globals.css); mobile stacks map-top
-(@~40vh) over a scrolling panel, desktop puts the panel left
+(@~50%) over a scrolling panel, desktop puts the panel left
 (`minmax(20rem, 26rem)`) and the map right (majority). Rides and the driver
 workspace both use it.
 Drivers highlight the active pool: `pickupZoneId` plus **`destinationZoneIds`**
 (every distinct member destination — a pool can carry Nusrat to Mohakhali and
 Rafiq to Gulshan 1 at once), fit across all pins. The single-end
 `destinationZoneId` stays the passenger behavior.
+
+**Mobile split resizer (phone/tablet-portrait only).** A fixed 50/50 split left
+the passenger booking form and the driver workspace too short on a phone, so
+the map/panel boundary is user-resizable. Both surfaces share it because it
+lives in `WorkspaceShell`, not in either page.
+
+- **One grid, two rows, never an overlay.** The map, the grip and the panel are
+  three rows of the same `.workspace` grid, so expanding the panel *shrinks the
+  map* instead of covering it, and spatial context is never lost. `.workspace-map`
+  keeps `height: 100%` down to the Leaflet container, so the existing
+  `ResizeObserver → invalidateSize()` (§8) already covers every drag — no second
+  resize path was added.
+- **Snap points, not pixels.** The split is stored as the map's *share* of the
+  map+panel box and converted to an `fr` ratio (`mapFr = share / (1 - share)`,
+  panel pinned to `1fr`), so a stop is correct on any phone height, in either
+  orientation and under font/zoom scaling. Pure geometry lives in
+  `components/workspace/panel-split.ts`.
+- **Stops:** 50/50 (default, and what the layout used before), 70/30 and 80/20.
+  Release always snaps to the nearest stop, so no pixel-perfect dragging is
+  required. A free drag is clamped to 18–72% and a `minmax(7.5rem, …)` floor on
+  the map track guarantees the map can never vanish on a short screen.
+- **Gesture:** pointer events (touch *and* mouse) with `touch-action: none` on
+  the grip, so the vertical drag moves the divider instead of scrolling the page.
+  The grip is a sibling row, so a gesture started in the panel or on the map is
+  never mistaken for a drag; panel scrolling stays fully independent. A tap with
+  no travel toggles 50/50 ↔ 70/30 as a forgiving shortcut.
+- **Accessibility:** the grip is an ARIA window splitter — `role="separator"`,
+  `aria-orientation="horizontal"`, focusable, with `aria-valuenow`/`valuetext`
+  reporting "Map 30%, panel 70%"; arrows step between stops and Home/End jump to
+  the extremes. The visible pill uses existing tokens and lights up on hover and
+  focus, on top of the global `:focus-visible` outline.
+- **Desktop untouched:** at `min-width: 56rem` the grid reverts to two columns
+  and the grip is `display: none`, so it leaves the layout and the tab order
+  alone. No new dependency: this uses only React and CSS.
 
 ---
 
@@ -537,7 +572,9 @@ The MVP is deliberately **not** building:
    3. Workspace skeleton (map + panel/sheet) with map non-blocking.
       **— done (Phase 3, map-only skeleton: `WorkspaceShell` + `MapPane`
       behind `/rides`; desktop panel-split + mobile map-top stacking. The
-      mobile bottom-sheet behavior stays deferred — no gesture work yet.)**
+      mobile bottom-sheet *overlay* stays deferred — no floating sheet, but the
+      map/panel split is now draggable and snaps between 50/50, 70/30 and
+      80/20, §8.)**
    4. Passenger book/live/pay flow.
       **— done (Phase 4 + the redesigns): segmented 1|2|3 seat stepper, route
       swap, live estimate card (FareView verbatim), zone-selection map feedback
