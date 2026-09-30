@@ -5,8 +5,9 @@
 > all at once. **Phases 0–9 are complete**; Phase 10 (Playwright + test
 > amplification) and Phase 11 (public deployment) are open; Phase 12
 > (documentation/video) is nearly complete: the README (incl. 18 screenshots in
-> `docs/Screenshots/`) and AI Usage section are done, with the **video** and a
-> written viral-scale note still outstanding.
+> `docs/Screenshots/`) and AI Usage section are done, and the viral-scale bonus
+> note is delivered as [`docs/scaling-plan.md`](scaling-plan.md); only the
+> **video** is still outstanding.
 > Tests and deliverables per phase are noted so a later engineer can verify
 > each stage without guessing.
 
@@ -395,8 +396,9 @@ Each phase lists: **objective · deliverables · dependencies · risks · tests*
 > features, screenshots, architecture + ERD, stack, structure, env, setup,
 > run/tests, credentials, API overview, decisions/trade-offs, limitations, next
 > steps) with an AI Usage section and a screenshots section. **Outstanding:**
-> the six-minute video (and its link), a deployment URL (Phase 11), and a
-> written "viral-scale" bonus note (requirements §15). The docs-consistency pass
+> the six-minute video (and its link) and a deployment URL (Phase 11). The
+> written "viral-scale" bonus note (requirements §15) is delivered as
+> [`docs/scaling-plan.md`](scaling-plan.md). The docs-consistency pass
 > re-grounded all `docs/*.md` against the shipped code.
 
 - **Objective:** README meets the PRD checklist; six-minute video recorded.

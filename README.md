@@ -472,7 +472,7 @@ Everything below is what the repository actually runs on (from the workspace
 | ORM / DB driver | **Drizzle ORM 0.45 + postgres.js** | Schema, migrations, typed queries, transactions | Lightweight, SQL-native, gives us explicit `SELECT … FOR UPDATE` control |
 | Database | **PostgreSQL 16** | The single source of truth (data + role + invariants) | Real transactions, row locks, partial unique indexes, enums, CHECKs |
 | Auth | **Clerk** (`@clerk/nextjs` web, `@clerk/backend` API) | Sign-in/sign-up/sessions/tokens; API verifies bearer tokens | External identity provider — no passwords/sessions stored in-app (ADR-013) |
-| Testing | **Vitest 4** (+ React Testing Library, jsdom) | 170 API tests (9 files), 80 web tests (15 files) | Fast, TS-native, real concurrent DB integration tests |
+| Testing | **Vitest 4** (+ React Testing Library, jsdom) | 182 API tests (10 files), 128 web tests (21 files) | Fast, TS-native, real concurrent DB integration tests |
 | Infra | **Docker + Docker Compose**, GitHub Actions CI | Reproducible `web + api + db` stack; `postgres:16-alpine` service | PRD requires reproducibility; compose is the fallback if free hosting is unavailable |
 | Linting/type | **ESLint 9**, `typescript-eslint`, `tsc --noEmit` | `npm run lint`, `npm run typecheck` | Both run in CI |
 
@@ -916,7 +916,8 @@ the database.
   deliberately has none.
 - The PRD's "Oi Tesla Goes Viral" bonus analysis (geospatial indexes,
   partition-by-status, eventual notification fan-out) is documented as
-  reasoning in `docs/requirements.md` §15 and `docs/database.md` §7.
+  reasoning in `docs/requirements.md` §15 and `docs/database.md` §7, and worked
+  through in full in [`docs/scaling-plan.md`](docs/scaling-plan.md).
 
 ## Authentication and security
 
@@ -1165,7 +1166,7 @@ interpretation):
 | Architecture diagram | ✅ complete | [Architecture](#architecture) + `docs/architecture.md` |
 | ERD | ✅ complete | [Database / ERD](#database--erd) + `docs/database.md` |
 | Meaningful Git history | ✅ complete | `master` (feature-branch workflow, conventional commits) |
-| Testing | ✅ complete | 170 API + 80 web tests; six required behaviors covered |
+| Testing | ✅ complete | 182 API + 128 web tests; six required behaviors covered |
 | README | ✅ complete | this file |
 | AI usage | ✅ complete | [AI usage](#ai-usage) |
 | Six-minute video | ⏳ pending | [Demo video](#demo-video) |
@@ -1182,6 +1183,7 @@ interpretation):
 - Database design & concurrency strategy: [`docs/database.md`](docs/database.md)
 - Decision record (ADRs): [`docs/decisions.md`](docs/decisions.md)
 - Phased development plan: [`docs/development-plan.md`](docs/development-plan.md)
+- Future scaling plan (PRD bonus "If Oi Tesla Goes Viral"): [`docs/scaling-plan.md`](docs/scaling-plan.md)
 - Frontend design specification: [`docs/frontend-design.md`](docs/frontend-design.md)
 - Screenshots: [`docs/Screenshots/`](docs/Screenshots)
 
